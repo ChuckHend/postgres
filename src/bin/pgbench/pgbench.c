@@ -834,6 +834,7 @@ static void setDoubleValue(PgBenchValue *pv, double dval);
 static bool evaluateExpr(CState *st, PgBenchExpr *expr,
 						 PgBenchValue *retval);
 static ConnectionStateEnum executeMetaCommand(CState *st, pg_time_usec_t *now);
+static void doLogHeader(FILE *logfile);
 static void doLog(TState *thread, CState *st,
 				  StatsData *agg, bool tx_skipped, double latency, double lag);
 static void processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
@@ -4631,6 +4632,35 @@ getResultString(bool tx_skipped, EStatus estatus)
 }
 
 /*
+ * Print the column header line of a log file.
+ *
+ * The columns must match what doLog() prints.
+ */
+static void
+doLogHeader(FILE *logfile)
+{
+	if (agg_interval > 0)
+	{
+		fputs("interval_start num_transactions"
+			  " sum_latency sum_latency_2 min_latency max_latency"
+			  " sum_lag sum_lag_2 min_lag max_lag skipped"
+			  " retried retries"
+			  " serialization_failures deadlock_failures other_sql_failures",
+			  logfile);
+	}
+	else
+	{
+		fputs("client_id transaction_no time script_no time_epoch time_us",
+			  logfile);
+		if (throttle_delay)
+			fputs(" schedule_lag", logfile);
+		if (max_tries != 1)
+			fputs(" retries", logfile);
+	}
+	fputc('\n', logfile);
+}
+
+/*
  * Print log entry after completing one transaction.
  *
  * We print Unix-epoch timestamps in the log, so that entries can be
@@ -7564,6 +7594,13 @@ threadRun(void *arg)
 
 		if (thread->logfile == NULL)
 			pg_fatal("could not open logfile \"%s\": %m", logpath);
+
+		/*
+		 * Only the first worker's log file gets a header, so that the files
+		 * of a multi-worker run can be concatenated into one.
+		 */
+		if (thread->tid == 0)
+			doLogHeader(thread->logfile);
 	}
 
 	/* explicitly initialize the state machines */

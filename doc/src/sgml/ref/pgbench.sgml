@@ -2341,7 +2341,16 @@ END;
   </para>
 
   <para>
-   Each line in a log file describes one transaction.
+   The first line of the first worker's log file is a header line listing
+   the names of the fields described below, separated by spaces.  The log
+   files of the other workers do not have a header line, so the log files of
+   a run can be combined into a single file with a header by concatenating
+   them in order, for example with
+   <literal>cat <replaceable>prefix</replaceable>.<replaceable>nnn</replaceable> <replaceable>prefix</replaceable>.<replaceable>nnn</replaceable>.*</literal>.
+  </para>
+
+  <para>
+   Each other line in a log file describes one transaction.
    It contains the following space-separated fields:
 
    <variablelist>
@@ -2513,8 +2522,9 @@ END;
 
   <para>
    With the <option>--aggregate-interval</option> option, a different
-   format is used for the log files.  Each log line describes one
-   aggregation interval.  It contains the following space-separated
+   format is used for the log files.  As with per-transaction logging, the
+   first worker's log file starts with a header line.  Each other log line
+   describes one aggregation interval.  It contains the following space-separated
    fields:
 
    <variablelist>
@@ -2683,6 +2693,7 @@ END;
 <screen>
 <userinput>pgbench --aggregate-interval=10 --time=20 --client=10 --log --rate=1000 --latency-limit=10 --failures-detailed --max-tries=10 test</userinput>
 
+interval_start num_transactions sum_latency sum_latency_2 min_latency max_latency sum_lag sum_lag_2 min_lag max_lag skipped retried retries serialization_failures deadlock_failures other_sql_failures
 1650260552 5178 26171317 177284491527 1136 44462 2647617 7321113867 0 9866 64 7564 28340 4148 0 0
 1650260562 4808 25573984 220121792172 1171 62083 3037380 9666800914 0 9998 598 7392 26621 4527 0 0
 </screen>

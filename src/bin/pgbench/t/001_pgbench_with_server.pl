@@ -1539,7 +1539,7 @@ sub check_pgbench_logs
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
 
-	my ($dir, $prefix, $nb, $min, $max, $re) = @_;
+	my ($dir, $prefix, $nb, $min, $max, $header, $re) = @_;
 
 	# $prefix is simple enough, thus does not need escaping
 	my @logs = list_files($dir, qr{^$prefix\..*$});
@@ -1554,6 +1554,14 @@ sub check_pgbench_logs
 		my $contents_raw = slurp_file($log);
 
 		my @contents = split(/\n/, $contents_raw);
+
+		# Only the first worker's log file, which has no worker number
+		# suffix, starts with a header line.
+		if ($log =~ /\/$prefix\.\d+$/)
+		{
+			is(shift(@contents), $header, "log header for $log");
+		}
+
 		my $clen = @contents;
 		cmp_ok($clen, '>=', $min,
 			"transaction count for $log ($clen) is above min");
@@ -1586,6 +1594,7 @@ $node->pgbench(
 	"--log-prefix=$bdir/001_pgbench_log_2");
 # The IDs of the clients (1st field) in the logs should be either 0 or 1.
 check_pgbench_logs($bdir, '001_pgbench_log_2', 1, 8, 92,
+	'client_id transaction_no time script_no time_epoch time_us',
 	qr{^[01] \d{1,2} \d+ \d \d+ \d+$});
 
 # Run with different read-only option pattern, 1 client with 10 transactions.
@@ -1596,7 +1605,36 @@ $node->pgbench(
 	"--log-prefix=$bdir/001_pgbench_log_3");
 # The ID of a single client (1st field) should match 0.
 check_pgbench_logs($bdir, '001_pgbench_log_3', 1, 10, 10,
+	'client_id transaction_no time script_no time_epoch time_us',
 	qr{^0 \d{1,2} \d+ \d \d+ \d+$});
+
+# Multiple threads, with the optional schedule_lag and retries columns.
+# Only the first thread's log file has a header.
+$node->pgbench(
+	"-n -S -t 5 -c 2 -j 2 --rate=1000 --max-tries=2 -l",
+	0,
+	[ qr{select only}, qr{processed: 10/10} ],
+	[qr{^$}],
+	'pgbench logs with multiple threads',
+	undef,
+	"--log-prefix=$bdir/001_pgbench_log_4");
+check_pgbench_logs($bdir, '001_pgbench_log_4', 2, 5, 5,
+	'client_id transaction_no time script_no time_epoch time_us schedule_lag retries',
+	qr{^[01] \d \d+ \d \d+ \d+ \d+ \d+$});
+
+# Aggregated logging.  The run is shorter than the aggregation interval, so
+# there may be no complete interval to report.
+$node->pgbench(
+	"-n -S -t 5 --aggregate-interval=1 -l",
+	0,
+	[ qr{select only}, qr{processed: 5/5} ],
+	[qr{^$}],
+	'pgbench aggregated logs',
+	undef,
+	"--log-prefix=$bdir/001_pgbench_log_5");
+check_pgbench_logs($bdir, '001_pgbench_log_5', 1, 0, 1,
+	'interval_start num_transactions sum_latency sum_latency_2 min_latency max_latency sum_lag sum_lag_2 min_lag max_lag skipped retried retries serialization_failures deadlock_failures other_sql_failures',
+	qr{^\d+(?: \d+){15}$});
 
 # abortion of the client if the script contains an incomplete transaction block
 $node->pgbench(

@@ -6,7 +6,7 @@
  * See comments in pg_list.h.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
  */
 #include "postgres.h"
 
+#include "common/int.h"
 #include "nodes/pg_list.h"
 #include "port/pg_bitutils.h"
 #include "utils/memdebug.h"
@@ -205,8 +206,7 @@ enlarge_list(List *list, int min_size)
 	{
 #ifndef DEBUG_LIST_MEMORY_USAGE
 		/* Normally, let repalloc deal with enlargement */
-		list->elements = (ListCell *) repalloc(list->elements,
-											   new_max_len * sizeof(ListCell));
+		list->elements = repalloc_array(list->elements, ListCell, new_max_len);
 #else
 		/*
 		 * repalloc() might enlarge the space in-place, which we don't want
@@ -1692,11 +1692,7 @@ list_int_cmp(const ListCell *p1, const ListCell *p2)
 	int			v1 = lfirst_int(p1);
 	int			v2 = lfirst_int(p2);
 
-	if (v1 < v2)
-		return -1;
-	if (v1 > v2)
-		return 1;
-	return 0;
+	return pg_cmp_s32(v1, v2);
 }
 
 /*
@@ -1708,9 +1704,5 @@ list_oid_cmp(const ListCell *p1, const ListCell *p2)
 	Oid			v1 = lfirst_oid(p1);
 	Oid			v2 = lfirst_oid(p2);
 
-	if (v1 < v2)
-		return -1;
-	if (v1 > v2)
-		return 1;
-	return 0;
+	return pg_cmp_u32(v1, v2);
 }

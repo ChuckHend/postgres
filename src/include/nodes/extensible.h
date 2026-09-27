@@ -4,7 +4,7 @@
  *	  Definitions for extensible nodes and custom scans
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/extensible.h
@@ -15,10 +15,11 @@
 #define EXTENSIBLE_H
 
 #include "access/parallel.h"
-#include "commands/explain.h"
+#include "commands/explain_state.h"
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "nodes/readfuncs.h"
 
 /* maximum length of an extensible node identifier */
 #define EXTNODENAME_MAX_LEN					64
@@ -54,7 +55,7 @@ typedef struct ExtensibleNode
  *
  * nodeRead is a deserialization function for the node type.  It does not need
  * to read type or extnodename; the core system handles those.  It should fetch
- * the next token using pg_strtok() from the current input stream, and then
+ * the next token from the ReadNodeContext using pg_strtok(ctx), and then
  * reconstruct the private fields according to the manner in readfuncs.c.
  *
  * All callbacks are mandatory.
@@ -69,7 +70,8 @@ typedef struct ExtensibleNodeMethods
 							  const struct ExtensibleNode *b);
 	void		(*nodeOut) (struct StringInfoData *str,
 							const struct ExtensibleNode *node);
-	void		(*nodeRead) (struct ExtensibleNode *node);
+	void		(*nodeRead) (ReadNodeContext *ctx,
+							 struct ExtensibleNode *node);
 } ExtensibleNodeMethods;
 
 extern void RegisterExtensibleNodeMethods(const ExtensibleNodeMethods *methods);

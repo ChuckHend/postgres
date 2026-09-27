@@ -4,7 +4,7 @@
  *	  definition of the "language" system catalog (pg_language)
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_language.h
@@ -19,13 +19,15 @@
 #define PG_LANGUAGE_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_language_d.h"
+#include "catalog/pg_language_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_language definition.  cpp turns this into
  *		typedef struct FormData_pg_language
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_language,2612,LanguageRelationId)
 {
 	Oid			oid;			/* oid */
@@ -53,9 +55,11 @@ CATALOG(pg_language,2612,LanguageRelationId)
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* Access privileges */
-	aclitem		lanacl[1] BKI_DEFAULT(_null_);
+	aclitem		lanacl[] BKI_DEFAULT(_null_);
 #endif
 } FormData_pg_language;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_language corresponds to a pointer to a tuple with
@@ -68,5 +72,8 @@ DECLARE_TOAST(pg_language, 4157, 4158);
 
 DECLARE_UNIQUE_INDEX(pg_language_name_index, 2681, LanguageNameIndexId, pg_language, btree(lanname name_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_language_oid_index, 2682, LanguageOidIndexId, pg_language, btree(oid oid_ops));
+
+MAKE_SYSCACHE(LANGNAME, pg_language_name_index, 4);
+MAKE_SYSCACHE(LANGOID, pg_language_oid_index, 4);
 
 #endif							/* PG_LANGUAGE_H */

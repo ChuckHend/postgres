@@ -4,7 +4,7 @@
  *	  Checks, enables or disables page level checksums for an offline
  *	  cluster
  *
- * Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_checksums/pg_checksums.c
@@ -16,16 +16,16 @@
 
 #include <dirent.h>
 #include <limits.h>
-#include <time.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "access/xlog_internal.h"
 #include "common/controldata_utils.h"
-#include "common/file_perm.h"
 #include "common/file_utils.h"
 #include "common/logging.h"
+#include "common/relpath.h"
 #include "fe_utils/option_utils.h"
+#include "fe_utils/version.h"
 #include "getopt_long.h"
 #include "pg_getopt.h"
 #include "storage/bufpage.h"
@@ -50,7 +50,7 @@ typedef enum
 {
 	PG_MODE_CHECK,
 	PG_MODE_DISABLE,
-	PG_MODE_ENABLE
+	PG_MODE_ENABLE,
 } PgChecksumMode;
 
 static PgChecksumMode mode = PG_MODE_CHECK;
@@ -60,8 +60,8 @@ static const char *progname;
 /*
  * Progress status information.
  */
-int64		total_size = 0;
-int64		current_size = 0;
+static int64 total_size = 0;
+static int64 current_size = 0;
 static pg_time_t last_progress_report = 0;
 
 static void
@@ -142,9 +142,9 @@ progress_report(bool finished)
 	/* Calculate current percentage of size done */
 	percent = total_size ? (int) ((current_size) * 100 / total_size) : 0;
 
-	fprintf(stderr, _("%lld/%lld MB (%d%%) computed"),
-			(long long) (current_size / (1024 * 1024)),
-			(long long) (total_size / (1024 * 1024)),
+	fprintf(stderr, _("%" PRId64 "/%" PRId64 " MB (%d%%) computed"),
+			(current_size / (1024 * 1024)),
+			(total_size / (1024 * 1024)),
 			percent);
 
 	/*
@@ -196,8 +196,9 @@ scan_file(const char *fn, int segmentno)
 	for (blockno = 0;; blockno++)
 	{
 		uint16		csum;
-		int			r = read(f, buf.data, BLCKSZ);
+		ssize_t		r;
 
+		r = read(f, buf.data, BLCKSZ);
 		if (r == 0)
 			break;
 		if (r != BLCKSZ)
@@ -206,8 +207,8 @@ scan_file(const char *fn, int segmentno)
 				pg_fatal("could not read block %u in file \"%s\": %m",
 						 blockno, fn);
 			else
-				pg_fatal("could not read block %u in file \"%s\": read %d of %d",
-						 blockno, fn, r, BLCKSZ);
+				pg_fatal("could not read block %u in file \"%s\": read %zd of %zu",
+						 blockno, fn, r, (size_t) BLCKSZ);
 		}
 		blocks_scanned++;
 
@@ -236,7 +237,7 @@ scan_file(const char *fn, int segmentno)
 		}
 		else if (mode == PG_MODE_ENABLE)
 		{
-			int			w;
+			ssize_t		w;
 
 			/*
 			 * Do not rewrite if the checksum is already set to the expected
@@ -262,8 +263,8 @@ scan_file(const char *fn, int segmentno)
 					pg_fatal("could not write block %u in file \"%s\": %m",
 							 blockno, fn);
 				else
-					pg_fatal("could not write block %u in file \"%s\": wrote %d of %d",
-							 blockno, fn, w, BLCKSZ);
+					pg_fatal("could not write block %u in file \"%s\": wrote %zd of %zu",
+							 blockno, fn, w, (size_t) BLCKSZ);
 			}
 		}
 
@@ -329,6 +330,10 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 					strlen(PG_TEMP_FILES_DIR)) == 0)
 			continue;
 
+		/* Skip macOS system files */
+		if (strcmp(de->d_name, ".DS_Store") == 0)
+			continue;
+
 		snprintf(fn, sizeof(fn), "%s/%s", path, de->d_name);
 		if (lstat(fn, &st) < 0)
 			pg_fatal("could not stat file \"%s\": %m", fn);
@@ -384,7 +389,7 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 			 * is valid, resolving the linked locations and dive into them
 			 * directly.
 			 */
-			if (strncmp("pg_tblspc", subdir, strlen("pg_tblspc")) == 0)
+			if (strncmp(PG_TBLSPC_DIR, subdir, strlen(PG_TBLSPC_DIR)) == 0)
 			{
 				char		tblspc_path[MAXPGPATH];
 				struct stat tblspc_st;
@@ -445,6 +450,8 @@ main(int argc, char *argv[])
 	int			c;
 	int			option_index;
 	bool		crc_ok;
+	uint32		major_version;
+	char	   *version_str;
 
 	pg_logging_init(argv[0]);
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_checksums"));
@@ -540,6 +547,20 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 
+	/*
+	 * Retrieve the contents of this cluster's PG_VERSION.  We require
+	 * compatibility with the same major version as the one this tool is
+	 * compiled with.
+	 */
+	major_version = GET_PG_MAJORVERSION_NUM(get_pg_version(DataDir, &version_str));
+	if (major_version != PG_MAJORVERSION_NUM)
+	{
+		pg_log_error("data directory is of wrong version");
+		pg_log_error_detail("File \"%s\" contains \"%s\", which is not compatible with this program's version \"%s\".",
+							"PG_VERSION", version_str, PG_MAJORVERSION);
+		exit(1);
+	}
+
 	/* Read the control file and check compatibility */
 	ControlFile = get_controlfile(DataDir, &crc_ok);
 	if (!crc_ok)
@@ -565,15 +586,30 @@ main(int argc, char *argv[])
 		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
 		pg_fatal("cluster must be shut down");
 
-	if (ControlFile->data_checksum_version == 0 &&
+	/*
+	 * An inprogress state means an online transition was cut short.  A
+	 * standby stopped mid-transition carries either state; a cleanly shut
+	 * down primary can still carry inprogress-off, which a fast shutdown
+	 * during pg_disable_data_checksums() leaves behind, while inprogress-on
+	 * is always resolved by the launcher's exit cleanup.
+	 */
+	if (ControlFile->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON ||
+		ControlFile->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+	{
+		pg_log_error("an online data checksum state transition was interrupted");
+		pg_log_error_hint("Start and cleanly shut down the cluster once to reset the data checksum state, then retry. On a standby, let replication complete the transition first.");
+		exit(1);
+	}
+
+	if (ControlFile->data_checksum_version != PG_DATA_CHECKSUM_VERSION &&
 		mode == PG_MODE_CHECK)
 		pg_fatal("data checksums are not enabled in cluster");
 
-	if (ControlFile->data_checksum_version == 0 &&
+	if (ControlFile->data_checksum_version == PG_DATA_CHECKSUM_OFF &&
 		mode == PG_MODE_DISABLE)
 		pg_fatal("data checksums are already disabled in cluster");
 
-	if (ControlFile->data_checksum_version > 0 &&
+	if (ControlFile->data_checksum_version == PG_DATA_CHECKSUM_VERSION &&
 		mode == PG_MODE_ENABLE)
 		pg_fatal("data checksums are already enabled in cluster");
 
@@ -589,22 +625,22 @@ main(int argc, char *argv[])
 		{
 			total_size = scan_directory(DataDir, "global", true);
 			total_size += scan_directory(DataDir, "base", true);
-			total_size += scan_directory(DataDir, "pg_tblspc", true);
+			total_size += scan_directory(DataDir, PG_TBLSPC_DIR, true);
 		}
 
 		(void) scan_directory(DataDir, "global", false);
 		(void) scan_directory(DataDir, "base", false);
-		(void) scan_directory(DataDir, "pg_tblspc", false);
+		(void) scan_directory(DataDir, PG_TBLSPC_DIR, false);
 
 		if (showprogress)
 			progress_report(true);
 
 		printf(_("Checksum operation completed\n"));
-		printf(_("Files scanned:   %lld\n"), (long long) files_scanned);
-		printf(_("Blocks scanned:  %lld\n"), (long long) blocks_scanned);
+		printf(_("Files scanned:   %" PRId64 "\n"), files_scanned);
+		printf(_("Blocks scanned:  %" PRId64 "\n"), blocks_scanned);
 		if (mode == PG_MODE_CHECK)
 		{
-			printf(_("Bad checksums:  %lld\n"), (long long) badblocks);
+			printf(_("Bad checksums:  %" PRId64 "\n"), badblocks);
 			printf(_("Data checksum version: %u\n"), ControlFile->data_checksum_version);
 
 			if (badblocks > 0)
@@ -612,8 +648,8 @@ main(int argc, char *argv[])
 		}
 		else if (mode == PG_MODE_ENABLE)
 		{
-			printf(_("Files written:  %lld\n"), (long long) files_written);
-			printf(_("Blocks written: %lld\n"), (long long) blocks_written);
+			printf(_("Files written:  %" PRId64 "\n"), files_written);
+			printf(_("Blocks written: %" PRId64 "\n"), blocks_written);
 		}
 	}
 
@@ -625,12 +661,22 @@ main(int argc, char *argv[])
 	if (mode == PG_MODE_ENABLE || mode == PG_MODE_DISABLE)
 	{
 		ControlFile->data_checksum_version =
-			(mode == PG_MODE_ENABLE) ? PG_DATA_CHECKSUM_VERSION : 0;
+			(mode == PG_MODE_ENABLE) ? PG_DATA_CHECKSUM_VERSION : PG_DATA_CHECKSUM_OFF;
+
+		/*
+		 * Mark the state as changed locally, without a WAL record.  Recovery
+		 * then does not let a replayed checkpoint overwrite it, as no record
+		 * could restore the change afterwards.  The watermark is left alone:
+		 * XLOG2_CHECKSUMS records at or below it stay covered, while records
+		 * above it, which this node has not applied yet, still take effect on
+		 * replay no matter when they were written.
+		 */
+		ControlFile->data_checksum_is_local = true;
 
 		if (do_sync)
 		{
 			pg_log_info("syncing data directory");
-			sync_pgdata(DataDir, PG_VERSION_NUM, sync_method);
+			sync_pgdata(DataDir, PG_VERSION_NUM, sync_method, true);
 		}
 
 		pg_log_info("updating control file");
@@ -642,6 +688,12 @@ main(int argc, char *argv[])
 			printf(_("Checksums enabled in cluster\n"));
 		else
 			printf(_("Checksums disabled in cluster\n"));
+
+		printf(_("This change applies to this data directory only.\n"));
+		if (ControlFile->state == DB_SHUTDOWNED_IN_RECOVERY)
+			printf(_("This node appears to be a standby; apply the same change to the primary and all other standbys.\n"));
+		else
+			printf(_("In a replication setup, apply the same change to every node while all are stopped, before restarting any of them.\n"));
 	}
 
 	return 0;

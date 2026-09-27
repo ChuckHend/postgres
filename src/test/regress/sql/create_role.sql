@@ -92,6 +92,13 @@ CREATE ROLE regress_hasprivs CREATEROLE LOGIN INHERIT CONNECTION LIMIT 5;
 
 -- ok, we should be able to modify a role we created
 COMMENT ON ROLE regress_hasprivs IS 'some comment';
+SELECT shobj_description('regress_hasprivs'::regrole, 'pg_authid') IS NOT NULL AS has_comment;
+COMMENT ON ROLE regress_hasprivs IS NULL;
+SELECT shobj_description('regress_hasprivs'::regrole, 'pg_authid') IS NULL AS no_comment;
+COMMENT ON ROLE regress_hasprivs IS 'add the comment back';
+SELECT shobj_description('regress_hasprivs'::regrole, 'pg_authid') IS NOT NULL AS has_comment;
+COMMENT ON ROLE regress_hasprivs IS ''; -- empty string removes the comment, same as NULL
+SELECT shobj_description('regress_hasprivs'::regrole, 'pg_authid') IS NULL AS no_comment;
 ALTER ROLE regress_hasprivs RENAME TO regress_tenant;
 ALTER ROLE regress_tenant NOINHERIT NOLOGIN CONNECTION LIMIT 7;
 
@@ -206,7 +213,8 @@ DROP INDEX tenant_idx;
 DROP TABLE tenant_table;
 DROP VIEW tenant_view;
 DROP SCHEMA regress_tenant2_schema;
-DROP ROLE regress_tenant;
+-- check for duplicated drop
+DROP ROLE regress_tenant, regress_tenant;
 DROP ROLE regress_tenant2;
 DROP ROLE regress_rolecreator;
 DROP ROLE regress_role_admin;

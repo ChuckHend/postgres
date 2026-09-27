@@ -3,7 +3,7 @@
  * constraint.c
  *	  PostgreSQL CONSTRAINT support code.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,13 +14,11 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "access/heapam.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
-#include "utils/builtins.h"
-#include "utils/rel.h"
+#include "utils/fmgrprotos.h"
 #include "utils/snapmgr.h"
 
 
@@ -74,19 +72,18 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 * Get the new data that was inserted/updated.
 	 */
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-		checktid = trigdata->tg_trigslot->tts_tid;
+		slot = trigdata->tg_trigslot;
 	else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-		checktid = trigdata->tg_newslot->tts_tid;
+		slot = trigdata->tg_newslot;
 	else
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"%s\" must be fired for INSERT or UPDATE",
 						funcname)));
-		ItemPointerSetInvalid(&checktid);	/* keep compiler quiet */
+		slot = NULL;			/* keep compiler quiet */
 	}
-
-	slot = table_slot_create(trigdata->tg_relation, NULL);
+	checktid = slot->tts_tid;
 
 	/*
 	 * If the row pointed at by checktid is now dead (ie, inserted and then
@@ -107,22 +104,12 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 * removed.
 	 */
 	tmptid = checktid;
+	if (!table_fetch_tid(trigdata->tg_relation, &tmptid, SnapshotSelf, NULL))
 	{
-		IndexFetchTableData *scan = table_index_fetch_begin(trigdata->tg_relation);
-		bool		call_again = false;
-
-		if (!table_index_fetch_tuple(scan, &tmptid, SnapshotSelf, slot,
-									 &call_again, NULL))
-		{
-			/*
-			 * All rows referenced by the index entry are dead, so skip the
-			 * check.
-			 */
-			ExecDropSingleTupleTableSlot(slot);
-			table_index_fetch_end(scan);
-			return PointerGetDatum(NULL);
-		}
-		table_index_fetch_end(scan);
+		/*
+		 * All rows referenced by the index entry are dead, so skip the check
+		 */
+		return PointerGetDatum(NULL);
 	}
 
 	/*
@@ -169,13 +156,15 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 		/*
 		 * Note: this is not a real insert; it is a check that the index entry
 		 * that has already been inserted is unique.  Passing the tuple's tid
-		 * (i.e. unmodified by table_index_fetch_tuple()) is correct even if
-		 * the row is now dead, because that is the TID the index will know
-		 * about.
+		 * (i.e. unmodified by table_fetch_tid()) is correct even if the row
+		 * is now dead, because that is the TID the index will know about.
 		 */
 		index_insert(indexRel, values, isnull, &checktid,
 					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING,
 					 false, indexInfo);
+
+		/* Cleanup cache possibly initialized by index_insert. */
+		index_insert_cleanup(indexRel, indexInfo);
 	}
 	else
 	{
@@ -196,8 +185,6 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 */
 	if (estate != NULL)
 		FreeExecutorState(estate);
-
-	ExecDropSingleTupleTableSlot(slot);
 
 	index_close(indexRel, RowExclusiveLock);
 

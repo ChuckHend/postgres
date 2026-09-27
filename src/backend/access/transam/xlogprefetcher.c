@@ -3,7 +3,7 @@
  * xlogprefetcher.c
  *		Prefetching support for recovery.
  *
- * Portions Copyright (c) 2022-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2022-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -27,25 +27,24 @@
 
 #include "postgres.h"
 
-#include "access/xlog.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogreader.h"
-#include "access/xlogutils.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"
-#include "utils/fmgrprotos.h"
-#include "utils/timestamp.h"
 #include "funcapi.h"
-#include "pgstat.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
+#include "storage/fd.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
+#include "storage/subsystems.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
+#include "utils/timestamp.h"
+#include "utils/tuplestore.h"
 
 /*
  * Every time we process this much WAL, we'll update the values in
@@ -88,7 +87,7 @@ typedef enum
 {
 	LRQ_NEXT_NO_IO,
 	LRQ_NEXT_IO,
-	LRQ_NEXT_AGAIN
+	LRQ_NEXT_AGAIN,
 } LsnReadQueueNextStatus;
 
 /*
@@ -202,6 +201,14 @@ static LsnReadQueueNextStatus XLogPrefetcherNextBlock(uintptr_t pgsr_private,
 
 static XLogPrefetchStats *SharedStats;
 
+static void XLogPrefetchShmemRequest(void *arg);
+static void XLogPrefetchShmemInit(void *arg);
+
+const ShmemCallbacks XLogPrefetchShmemCallbacks = {
+	.request_fn = XLogPrefetchShmemRequest,
+	.init_fn = XLogPrefetchShmemInit,
+};
+
 static inline LsnReadQueue *
 lrq_alloc(uint32 max_distance,
 		  uint32 max_inflight,
@@ -294,10 +301,25 @@ lrq_complete_lsn(LsnReadQueue *lrq, XLogRecPtr lsn)
 		lrq_prefetch(lrq);
 }
 
-size_t
-XLogPrefetchShmemSize(void)
+static void
+XLogPrefetchShmemRequest(void *arg)
 {
-	return sizeof(XLogPrefetchStats);
+	ShmemRequestStruct(.name = "XLogPrefetchStats",
+					   .size = sizeof(XLogPrefetchStats),
+					   .ptr = (void **) &SharedStats,
+		);
+}
+
+static void
+XLogPrefetchShmemInit(void *arg)
+{
+	pg_atomic_init_u64(&SharedStats->reset_time, GetCurrentTimestamp());
+	pg_atomic_init_u64(&SharedStats->prefetch, 0);
+	pg_atomic_init_u64(&SharedStats->hit, 0);
+	pg_atomic_init_u64(&SharedStats->skip_init, 0);
+	pg_atomic_init_u64(&SharedStats->skip_new, 0);
+	pg_atomic_init_u64(&SharedStats->skip_fpw, 0);
+	pg_atomic_init_u64(&SharedStats->skip_rep, 0);
 }
 
 /*
@@ -315,27 +337,6 @@ XLogPrefetchResetStats(void)
 	pg_atomic_write_u64(&SharedStats->skip_rep, 0);
 }
 
-void
-XLogPrefetchShmemInit(void)
-{
-	bool		found;
-
-	SharedStats = (XLogPrefetchStats *)
-		ShmemInitStruct("XLogPrefetchStats",
-						sizeof(XLogPrefetchStats),
-						&found);
-
-	if (!found)
-	{
-		pg_atomic_init_u64(&SharedStats->reset_time, GetCurrentTimestamp());
-		pg_atomic_init_u64(&SharedStats->prefetch, 0);
-		pg_atomic_init_u64(&SharedStats->hit, 0);
-		pg_atomic_init_u64(&SharedStats->skip_init, 0);
-		pg_atomic_init_u64(&SharedStats->skip_new, 0);
-		pg_atomic_init_u64(&SharedStats->skip_fpw, 0);
-		pg_atomic_init_u64(&SharedStats->skip_rep, 0);
-	}
-}
 
 /*
  * Called when any GUC is changed that affects prefetching.
@@ -366,17 +367,15 @@ XLogPrefetcher *
 XLogPrefetcherAllocate(XLogReaderState *reader)
 {
 	XLogPrefetcher *prefetcher;
-	static HASHCTL hash_table_ctl = {
-		.keysize = sizeof(RelFileLocator),
-		.entrysize = sizeof(XLogPrefetcherFilter)
-	};
+	HASHCTL		ctl;
 
-	prefetcher = palloc0(sizeof(XLogPrefetcher));
-
+	prefetcher = palloc0_object(XLogPrefetcher);
 	prefetcher->reader = reader;
+
+	ctl.keysize = sizeof(RelFileLocator);
+	ctl.entrysize = sizeof(XLogPrefetcherFilter);
 	prefetcher->filter_table = hash_create("XLogPrefetcherFilterTable", 1024,
-										   &hash_table_ctl,
-										   HASH_ELEM | HASH_BLOBS);
+										   &ctl, HASH_ELEM | HASH_BLOBS);
 	dlist_init(&prefetcher->filter_queue);
 
 	SharedStats->wal_distance = 0;
@@ -552,7 +551,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 					elog(XLOGPREFETCHER_DEBUG_LEVEL,
-						 "suppressing all readahead until %X/%X is replayed due to possible TLI change",
+						 "suppressing all readahead until %X/%08X is replayed due to possible TLI change",
 						 LSN_FORMAT_ARGS(record->lsn));
 #endif
 
@@ -585,7 +584,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 					elog(XLOGPREFETCHER_DEBUG_LEVEL,
-						 "suppressing prefetch in database %u until %X/%X is replayed due to raw file copy",
+						 "suppressing prefetch in database %u until %X/%08X is replayed due to raw file copy",
 						 rlocator.dbOid,
 						 LSN_FORMAT_ARGS(record->lsn));
 #endif
@@ -613,7 +612,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 						elog(XLOGPREFETCHER_DEBUG_LEVEL,
-							 "suppressing prefetch in relation %u/%u/%u until %X/%X is replayed, which creates the relation",
+							 "suppressing prefetch in relation %u/%u/%u until %X/%08X is replayed, which creates the relation",
 							 xlrec->rlocator.spcOid,
 							 xlrec->rlocator.dbOid,
 							 xlrec->rlocator.relNumber,
@@ -636,7 +635,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 					elog(XLOGPREFETCHER_DEBUG_LEVEL,
-						 "suppressing prefetch in relation %u/%u/%u from block %u until %X/%X is replayed, which truncates the relation",
+						 "suppressing prefetch in relation %u/%u/%u from block %u until %X/%08X is replayed, which truncates the relation",
 						 xlrec->rlocator.spcOid,
 						 xlrec->rlocator.dbOid,
 						 xlrec->rlocator.relNumber,
@@ -722,7 +721,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			 * same relation (with some scheme to handle invalidations
 			 * safely), but for now we'll call smgropen() every time.
 			 */
-			reln = smgropen(block->rlocator, InvalidBackendId);
+			reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
 
 			/*
 			 * If the relation file doesn't exist on disk, for example because
@@ -735,7 +734,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			{
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 				elog(XLOGPREFETCHER_DEBUG_LEVEL,
-					 "suppressing all prefetch in relation %u/%u/%u until %X/%X is replayed, because the relation does not exist on disk",
+					 "suppressing all prefetch in relation %u/%u/%u until %X/%08X is replayed, because the relation does not exist on disk",
 					 reln->smgr_rlocator.locator.spcOid,
 					 reln->smgr_rlocator.locator.dbOid,
 					 reln->smgr_rlocator.locator.relNumber,
@@ -756,7 +755,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			{
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 				elog(XLOGPREFETCHER_DEBUG_LEVEL,
-					 "suppressing prefetch in relation %u/%u/%u from block %u until %X/%X is replayed, because the relation is too small",
+					 "suppressing prefetch in relation %u/%u/%u from block %u until %X/%08X is replayed, because the relation is too small",
 					 reln->smgr_rlocator.locator.spcOid,
 					 reln->smgr_rlocator.locator.dbOid,
 					 reln->smgr_rlocator.locator.relNumber,
@@ -805,13 +804,14 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 
 		/*
 		 * Several callsites need to be able to read exactly one record
-		 * without any internal readahead.  Examples: xlog.c reading
-		 * checkpoint records with emode set to PANIC, which might otherwise
-		 * cause XLogPageRead() to panic on some future page, and xlog.c
-		 * determining where to start writing WAL next, which depends on the
-		 * contents of the reader's internal buffer after reading one record.
-		 * Therefore, don't even think about prefetching until the first
-		 * record after XLogPrefetcherBeginRead() has been consumed.
+		 * without any internal readahead.  Examples: PerformWalRecovery()
+		 * trying to read the first record that follows a checkpoint has emode
+		 * set to PANIC, which might otherwise cause XLogPageRead() to panic
+		 * on some future page, and FinishWalRecovery() determining where to
+		 * start writing WAL next, which depends on the contents of the
+		 * reader's internal buffer after reading one record. Therefore, don't
+		 * even think about prefetching until the first record after
+		 * XLogPrefetcherBeginRead() has been consumed.
 		 */
 		if (prefetcher->reader->decode_queue_tail &&
 			prefetcher->reader->decode_queue_tail->lsn == prefetcher->begin_ptr)
@@ -934,7 +934,7 @@ XLogPrefetcherIsFiltered(XLogPrefetcher *prefetcher, RelFileLocator rlocator,
 		{
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 			elog(XLOGPREFETCHER_DEBUG_LEVEL,
-				 "prefetch of %u/%u/%u block %u suppressed; filtering until LSN %X/%X is replayed (blocks >= %u filtered)",
+				 "prefetch of %u/%u/%u block %u suppressed; filtering until LSN %X/%08X is replayed (blocks >= %u filtered)",
 				 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber, blockno,
 				 LSN_FORMAT_ARGS(filter->filter_until_replayed),
 				 filter->filter_from_block);
@@ -950,7 +950,7 @@ XLogPrefetcherIsFiltered(XLogPrefetcher *prefetcher, RelFileLocator rlocator,
 		{
 #ifdef XLOGPREFETCHER_DEBUG_LEVEL
 			elog(XLOGPREFETCHER_DEBUG_LEVEL,
-				 "prefetch of %u/%u/%u block %u suppressed; filtering until LSN %X/%X is replayed (whole database)",
+				 "prefetch of %u/%u/%u block %u suppressed; filtering until LSN %X/%08X is replayed (whole database)",
 				 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber, blockno,
 				 LSN_FORMAT_ARGS(filter->filter_until_replayed));
 #endif
@@ -973,7 +973,7 @@ XLogPrefetcherBeginRead(XLogPrefetcher *prefetcher, XLogRecPtr recPtr)
 	/* Book-keeping to avoid readahead on first read. */
 	prefetcher->begin_ptr = recPtr;
 
-	prefetcher->no_readahead_until = 0;
+	prefetcher->no_readahead_until = InvalidXLogRecPtr;
 
 	/* This will forget about any queued up records in the decoder. */
 	XLogBeginRead(prefetcher->reader, recPtr);
@@ -1089,7 +1089,7 @@ check_recovery_prefetch(int *new_value, void **extra, GucSource source)
 #ifndef USE_PREFETCH
 	if (*new_value == RECOVERY_PREFETCH_ON)
 	{
-		GUC_check_errdetail("recovery_prefetch is not supported on platforms that lack posix_fadvise().");
+		GUC_check_errdetail("\"recovery_prefetch\" is not supported on platforms that lack support for issuing read-ahead advice.");
 		return false;
 	}
 #endif

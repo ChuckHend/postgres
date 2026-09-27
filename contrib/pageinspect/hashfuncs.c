@@ -2,7 +2,7 @@
  * hashfuncs.c
  *		Functions to investigate the content of HASH indexes
  *
- * Copyright (c) 2017-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/hashfuncs.c
@@ -12,6 +12,7 @@
 
 #include "access/hash.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
@@ -27,6 +28,7 @@ PG_FUNCTION_INFO_V1(hash_page_items);
 PG_FUNCTION_INFO_V1(hash_bitmap_info);
 PG_FUNCTION_INFO_V1(hash_metapage_info);
 
+#define IS_INDEX(r) ((r)->rd_rel->relkind == RELKIND_INDEX)
 #define IS_HASH(r) ((r)->rd_rel->relam == HASH_AM_OID)
 
 /* ------------------------------------------------
@@ -323,7 +325,7 @@ hash_page_items(PG_FUNCTION_ARGS)
 
 		page = verify_hash_page(raw_page, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
 
-		uargs = palloc(sizeof(struct user_args));
+		uargs = palloc_object(struct user_args);
 
 		uargs->page = page;
 
@@ -402,8 +404,7 @@ hash_bitmap_info(PG_FUNCTION_ARGS)
 	int32		bitmappage,
 				bitmapbit;
 	HeapTuple	tuple;
-	int			i,
-				j;
+	int			j;
 	Datum		values[3];
 	bool		nulls[3] = {0};
 	uint32	   *freep;
@@ -413,9 +414,13 @@ hash_bitmap_info(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to use raw page functions")));
 
-	indexRel = index_open(indexRelid, AccessShareLock);
+	/*
+	 * This uses relation_open() and not index_open().  The latter allows
+	 * partitioned indexes, and these are forbidden here.
+	 */
+	indexRel = relation_open(indexRelid, AccessShareLock);
 
-	if (!IS_HASH(indexRel))
+	if (!IS_INDEX(indexRel) || !IS_HASH(indexRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a %s index",
@@ -434,8 +439,8 @@ hash_bitmap_info(PG_FUNCTION_ARGS)
 	if (ovflblkno >= RelationGetNumberOfBlocks(indexRel))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("block number %lld is out of range for relation \"%s\"",
-						(long long int) ovflblkno, RelationGetRelationName(indexRel))));
+				 errmsg("block number %" PRId64 " is out of range for relation \"%s\"",
+						ovflblkno, RelationGetRelationName(indexRel))));
 
 	/* Read the metapage so we can determine which bitmap page to use */
 	metabuf = _hash_getbuf(indexRel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
@@ -450,7 +455,7 @@ hash_bitmap_info(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid overflow block number %u",
 						(BlockNumber) ovflblkno)));
-	for (i = 0; i < metap->hashm_nmaps; i++)
+	for (uint32 i = 0; i < metap->hashm_nmaps; i++)
 		if (metap->hashm_mapp[i] == ovflblkno)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -484,7 +489,7 @@ hash_bitmap_info(PG_FUNCTION_ARGS)
 	bit = ISSET(freep, bitmapbit) != 0;
 
 	_hash_relbuf(indexRel, mapbuf);
-	index_close(indexRel, AccessShareLock);
+	relation_close(indexRel, AccessShareLock);
 
 	/* Build a tuple descriptor for our result type */
 	if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)

@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test logical replication of 2PC with streaming.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -307,7 +307,7 @@ $node_publisher->start;
 
 # Create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->append_conf(
 	'postgresql.conf', qq(
 max_prepared_transactions = 10
@@ -428,6 +428,49 @@ $node_publisher->wait_for_catchup($appname);
 $result =
   $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM test_tab_2");
 is($result, qq(1), 'transaction is committed on subscriber');
+
+# Test the ability to re-apply a transaction when a parallel apply worker fails
+# to prepare the transaction due to insufficient max_prepared_transactions
+# setting.
+$node_subscriber->append_conf(
+	'postgresql.conf', qq(
+max_prepared_transactions = 0
+debug_logical_replication_streaming = buffered
+));
+$node_subscriber->restart;
+
+$offset = -s $node_subscriber->logfile;
+
+$node_publisher->safe_psql(
+	'postgres', q{
+	BEGIN;
+	INSERT INTO test_tab_2 values(2);
+	PREPARE TRANSACTION 'xact';
+	COMMIT PREPARED 'xact';
+	});
+
+# Confirm the ERROR is reported because max_prepared_transactions is zero
+$node_subscriber->wait_for_log(
+	qr/ERROR: ( [A-Z0-9]+:)? prepared transactions are disabled/, $offset);
+
+# Confirm that the parallel apply worker has encountered an error. The check
+# focuses on the worker type as a keyword, since the error message content may
+# differ based on whether the leader initially detected the parallel apply
+# worker's failure or received a signal from it.
+$node_subscriber->wait_for_log(
+	qr/ERROR: .*logical replication parallel apply worker.*/, $offset);
+
+# Set max_prepared_transactions to correct value to resume the replication
+$node_subscriber->append_conf('postgresql.conf',
+	qq(max_prepared_transactions = 10));
+$node_subscriber->restart;
+
+$node_publisher->wait_for_catchup($appname);
+
+# Check that transaction is committed on subscriber
+$result =
+  $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM test_tab_2");
+is($result, qq(2), 'transaction is committed on subscriber after retrying');
 
 ###############################
 # check all the cleanup

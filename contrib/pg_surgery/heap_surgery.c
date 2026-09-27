@@ -3,7 +3,7 @@
  * heap_surgery.c
  *	  Functions to perform surgery on the damaged heap table.
  *
- * Copyright (c) 2020-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2020-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pg_surgery/heap_surgery.c
@@ -12,24 +12,28 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_am_d.h"
-#include "catalog/pg_proc_d.h"
+#include "catalog/pg_control.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/rel.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pg_surgery",
+					.version = PG_VERSION
+);
 
 /* Options to forcefully change the state of a heap tuple. */
 typedef enum HeapTupleForceOption
 {
 	HEAP_FORCE_KILL,
-	HEAP_FORCE_FREEZE
+	HEAP_FORCE_FREEZE,
 } HeapTupleForceOption;
 
 PG_FUNCTION_INFO_V1(heap_force_kill);
@@ -40,7 +44,7 @@ static Datum heap_force_common(FunctionCallInfo fcinfo,
 							   HeapTupleForceOption heap_force_opt);
 static void sanity_check_tid_array(ArrayType *ta, int *ntids);
 static BlockNumber find_tids_one_page(ItemPointer tids, int ntids,
-									  OffsetNumber *next_start_ptr);
+									  int *next_start_ptr);
 
 /*-------------------------------------------------------------------------
  * heap_force_kill()
@@ -87,7 +91,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 	int			ntids,
 				nblocks;
 	Relation	rel;
-	OffsetNumber curr_start_ptr,
+	int			curr_start_ptr,
 				next_start_ptr;
 	bool		include_this_tid[MaxHeapTuplesPerPage];
 
@@ -95,7 +99,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("recovery is in progress"),
-				 errhint("heap surgery functions cannot be executed during recovery.")));
+				 errhint("Heap surgery functions cannot be executed during recovery.")));
 
 	/* Check inputs. */
 	sanity_check_tid_array(ta, &ntids);
@@ -143,6 +147,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 	{
 		Buffer		buf;
 		Buffer		vmbuf = InvalidBuffer;
+		bool		unlock_vmbuf = false;
 		Page		page;
 		BlockNumber blkno;
 		OffsetNumber curoff;
@@ -225,16 +230,20 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 			}
 
 			/* Mark it for processing. */
-			Assert(offno < MaxHeapTuplesPerPage);
-			include_this_tid[offno] = true;
+			Assert(offno <= MaxHeapTuplesPerPage);
+			include_this_tid[offno - 1] = true;
 		}
 
 		/*
-		 * Before entering the critical section, pin the visibility map page
-		 * if it appears to be necessary.
+		 * Before entering the critical section, pin and lock the visibility
+		 * map page if it appears to be necessary.
 		 */
 		if (heap_force_opt == HEAP_FORCE_KILL && PageIsAllVisible(page))
+		{
 			visibilitymap_pin(rel, blkno, &vmbuf);
+			LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+			unlock_vmbuf = true;
+		}
 
 		/* No ereport(ERROR) from here until all the changes are logged. */
 		START_CRIT_SECTION();
@@ -244,7 +253,7 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 		{
 			ItemId		itemid;
 
-			if (!include_this_tid[curoff])
+			if (!include_this_tid[curoff - 1])
 				continue;
 
 			itemid = PageGetItemId(page, curoff);
@@ -263,10 +272,11 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 				 */
 				if (PageIsAllVisible(page))
 				{
+					if (visibilitymap_clear(rel->rd_locator, blkno, vmbuf,
+											VISIBILITYMAP_VALID_BITS))
+						did_modify_vm = true;
+
 					PageClearAllVisible(page);
-					visibilitymap_clear(rel, blkno, vmbuf,
-										VISIBILITYMAP_VALID_BITS);
-					did_modify_vm = true;
 				}
 			}
 			else
@@ -317,18 +327,29 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 
 			/* XLOG stuff */
 			if (RelationNeedsWAL(rel))
-				log_newpage_buffer(buf, true);
-		}
+			{
+				XLogRecPtr	recptr;
 
-		/* WAL log the VM page if it was modified. */
-		if (did_modify_vm && RelationNeedsWAL(rel))
-			log_newpage_buffer(vmbuf, false);
+				XLogBeginInsert();
+				XLogRegisterBuffer(0, buf, REGBUF_STANDARD | REGBUF_FORCE_IMAGE);
+				/* Include the VM page if it was modified */
+				if (did_modify_vm)
+					XLogRegisterBuffer(1, vmbuf, REGBUF_FORCE_IMAGE);
+				recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+				if (did_modify_vm)
+					PageSetLSN(BufferGetPage(vmbuf), recptr);
+				PageSetLSN(BufferGetPage(buf), recptr);
+			}
+		}
 
 		END_CRIT_SECTION();
 
 		UnlockReleaseBuffer(buf);
 
-		if (vmbuf != InvalidBuffer)
+		if (unlock_vmbuf)
+			LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+
+		if (BufferIsValid(vmbuf))
 			ReleaseBuffer(vmbuf);
 
 		/* Update the current_start_ptr before moving to the next page. */
@@ -353,8 +374,8 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 static int32
 tidcmp(const void *a, const void *b)
 {
-	ItemPointer iptr1 = ((const ItemPointer) a);
-	ItemPointer iptr2 = ((const ItemPointer) b);
+	const ItemPointerData *iptr1 = a;
+	const ItemPointerData *iptr2 = b;
 
 	return ItemPointerCompare(iptr1, iptr2);
 }
@@ -392,7 +413,7 @@ sanity_check_tid_array(ArrayType *ta, int *ntids)
  * ------------------------------------------------------------------------
  */
 static BlockNumber
-find_tids_one_page(ItemPointer tids, int ntids, OffsetNumber *next_start_ptr)
+find_tids_one_page(ItemPointer tids, int ntids, int *next_start_ptr)
 {
 	int			i;
 	BlockNumber prev_blkno,

@@ -3,7 +3,7 @@
  * win32stat.c
  *	  Replacements for <sys/stat.h> functions using GetFileInformationByHandle
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -12,8 +12,6 @@
  *
  *-------------------------------------------------------------------------
  */
-
-#ifdef WIN32
 
 #include "c.h"
 #include "port/win32ntdll.h"
@@ -178,6 +176,11 @@ _pglstat64(const char *name, struct stat *buf)
 				ret = -1;
 			}
 		}
+		else if (size >= sizeof(next))
+		{
+			errno = ENAMETOOLONG;
+			ret = -1;
+		}
 		else
 		{
 			/* It's a junction point, so report it as a symlink. */
@@ -236,7 +239,7 @@ _pgstat64(const char *name, struct stat *buf)
 			}
 			return -1;
 		}
-		if (size >= sizeof(next))
+		else if (size >= sizeof(next))
 		{
 			errno = ENAMETOOLONG;
 			return -1;
@@ -302,5 +305,3 @@ _pgfstat64(int fileno, struct stat *buf)
 	buf->st_nlink = 1;
 	return 0;
 }
-
-#endif							/* WIN32 */

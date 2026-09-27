@@ -4,7 +4,7 @@
  *	  functions for OpenSSL support in the backend.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -27,15 +27,16 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
+#include "common/hashfn.h"
 #include "common/string.h"
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
-#include "tcop/tcopprot.h"
-#include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 /*
  * These SSL-related #includes must come after all system-provided headers.
@@ -44,22 +45,42 @@
  * include <wincrypt.h>, but some other Windows headers do.)
  */
 #include "common/openssl.h"
+#include <openssl/bn.h>
 #include <openssl/conf.h>
 #include <openssl/dh.h>
-#ifndef OPENSSL_NO_ECDH
 #include <openssl/ec.h>
-#endif
 #include <openssl/x509v3.h>
 
+/*
+ * Simplehash for tracking configured hostnames to guard against duplicate
+ * entries.  Each list of hosts is traversed and added to the hash during
+ * parsing and if a duplicate error is detected an error will be thrown.
+ */
+typedef struct
+{
+	uint32		status;
+	const char *hostname;
+} HostCacheEntry;
+static uint32 host_cache_pointer(const char *key);
+#define SH_PREFIX		host_cache
+#define SH_ELEMENT_TYPE	HostCacheEntry
+#define SH_KEY_TYPE		const char *
+#define SH_KEY			hostname
+#define SH_HASH_KEY(tb, key)	host_cache_pointer(key)
+#define SH_EQUAL(tb, a, b)		(pg_strcasecmp(a, b) == 0)
+#define SH_SCOPE				static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
 
 /* default init hook can be overridden by a shared library */
 static void default_openssl_tls_init(SSL_CTX *context, bool isServerStart);
 openssl_tls_init_hook_typ openssl_tls_init_hook = default_openssl_tls_init;
 
-static int	my_sock_read(BIO *h, char *buf, int size);
-static int	my_sock_write(BIO *h, const char *buf, int size);
-static BIO_METHOD *my_BIO_s_socket(void);
-static int	my_SSL_set_fd(Port *port, int fd);
+static int	port_bio_read(BIO *h, char *buf, int size);
+static int	port_bio_write(BIO *h, const char *buf, int size);
+static BIO_METHOD *port_bio_method(void);
+static int	ssl_set_port_bio(Port *port);
 
 static DH  *load_dh_file(char *filename, bool isServerStart);
 static DH  *load_dh_buffer(const char *buffer, size_t len);
@@ -67,22 +88,59 @@ static int	ssl_external_passwd_cb(char *buf, int size, int rwflag, void *userdat
 static int	dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
 static int	verify_cb(int ok, X509_STORE_CTX *ctx);
 static void info_cb(const SSL *ssl, int type, int args);
+static int	alpn_cb(SSL *ssl,
+					const unsigned char **out,
+					unsigned char *outlen,
+					const unsigned char *in,
+					unsigned int inlen,
+					void *userdata);
 static bool initialize_dh(SSL_CTX *context, bool isServerStart);
 static bool initialize_ecdh(SSL_CTX *context, bool isServerStart);
+static const char *SSLerrmessageExt(unsigned long ecode, const char *replacement);
 static const char *SSLerrmessage(unsigned long ecode);
+static bool init_host_context(HostsLine *host, bool isServerStart, bool *hasWarned)
+			pg_attribute_nonnull(3);
+static void host_context_cleanup_cb(void *arg);
+#ifdef HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
+static int	sni_clienthello_cb(SSL *ssl, int *al, void *arg);
+#endif
 
-static char *X509_NAME_to_cstring(X509_NAME *name);
+static char *X509_NAME_to_cstring(const X509_NAME *name);
 
 static SSL_CTX *SSL_context = NULL;
-static bool SSL_initialized = false;
+static MemoryContext SSL_hosts_memcxt = NULL;
+static struct hosts
+{
+	/*
+	 * List of HostsLine structures containing SSL configurations for
+	 * connections with hostnames defined in the SNI extension.
+	 */
+	List	   *sni;
+
+	/* The SSL configuration to use for connections without SNI */
+	HostsLine  *no_sni;
+
+	/*
+	 * The default SSL configuration to use as a fallback in case no hostname
+	 * matches the supplied hostname in the SNI extension.
+	 */
+	HostsLine  *default_host;
+}		   *SSL_hosts;
+
 static bool dummy_ssl_passwd_cb_called = false;
 static bool ssl_is_server_start;
 
 static int	ssl_protocol_version_to_openssl(int v);
 static const char *ssl_protocol_version_to_string(int v);
 
-/* for passing data back from verify_cb() */
-static const char *cert_errdetail;
+struct CallbackErr
+{
+	/*
+	 * Storage for passing certificate verification error logging from the
+	 * callback.
+	 */
+	char	   *cert_errdetail;
+};
 
 /* ------------------------------------------------------------ */
 /*						 Public interface						*/
@@ -91,34 +149,236 @@ static const char *cert_errdetail;
 int
 be_tls_init(bool isServerStart)
 {
-	SSL_CTX    *context;
+	List	   *pg_hosts = NIL;
+	ListCell   *line;
+	MemoryContext oldcxt;
+	MemoryContext host_memcxt = NULL;
+	MemoryContextCallback *host_memcxt_cb;
+	char	   *err_msg = NULL;
+	HostsFileLoadResult res;
+	struct hosts *new_hosts;
+	SSL_CTX    *context = NULL;
 	int			ssl_ver_min = -1;
 	int			ssl_ver_max = -1;
+	host_cache_hash *host_cache = NULL;
+	bool		hasWarned = false;
 
-	/* This stuff need be done only once. */
-	if (!SSL_initialized)
+	/*
+	 * Since we don't know which host we're using until the ClientHello is
+	 * sent, ssl_loaded_verify_locations *always* starts out as false. The
+	 * only place it's set to true is in sni_clienthello_cb().
+	 */
+	ssl_loaded_verify_locations = false;
+
+	host_memcxt = AllocSetContextCreate(CurrentMemoryContext,
+										"hosts file parser context",
+										ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(host_memcxt);
+
+	/* Allocate a tentative replacement for SSL_hosts. */
+	new_hosts = palloc0_object(struct hosts);
+
+	/*
+	 * Register a reset callback for the memory context which is responsible
+	 * for freeing OpenSSL managed allocations upon context deletion.  The
+	 * callback is allocated here to make sure it gets cleaned up along with
+	 * the memory context it's registered for.
+	 */
+	host_memcxt_cb = palloc0_object(MemoryContextCallback);
+	host_memcxt_cb->func = host_context_cleanup_cb;
+	host_memcxt_cb->arg = new_hosts;
+	MemoryContextRegisterResetCallback(host_memcxt, host_memcxt_cb);
+
+	/*
+	 * If ssl_sni is enabled, attempt to load and parse TLS configuration from
+	 * the pg_hosts.conf file with the set of hosts returned as a list.  If
+	 * there are hosts configured they take precedence over the configuration
+	 * in postgresql.conf.  Make sure to allocate the parsed rows in their own
+	 * memory context so that we can delete them easily in case parsing fails.
+	 * If ssl_sni is disabled then set the state accordingly to make sure we
+	 * instead parse the config from postgresql.conf.
+	 *
+	 * The reason for not doing everything in this if-else conditional is that
+	 * we want to use the same processing of postgresql.conf for when ssl_sni
+	 * is off as well as when it's on but the hosts file is missing etc.  Thus
+	 * we set res to the state and continue with a new conditional instead of
+	 * duplicating logic and risk it diverging over time.
+	 */
+	if (ssl_sni)
 	{
-#ifdef HAVE_OPENSSL_INIT_SSL
-		OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
-#else
-		OPENSSL_config(NULL);
-		SSL_library_init();
-		SSL_load_error_strings();
+		/*
+		 * The GUC check hook should have already blocked this but to be on
+		 * the safe side we double-check here.
+		 */
+#ifndef HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
+		ereport(isServerStart ? FATAL : LOG,
+				errcode(ERRCODE_CONFIG_FILE_ERROR),
+				errmsg("ssl_sni is not supported with LibreSSL"));
+		goto error;
 #endif
-		SSL_initialized = true;
+
+		/* Attempt to load configuration from pg_hosts.conf */
+		res = load_hosts(&pg_hosts, &err_msg);
+
+		/*
+		 * pg_hosts.conf is not required to contain configuration, but if it
+		 * does we error out in case it fails to load rather than continue to
+		 * try the postgresql.conf configuration to avoid silently falling
+		 * back on an undesired configuration.
+		 */
+		if (res == HOSTSFILE_LOAD_FAILED)
+		{
+			ereport(isServerStart ? FATAL : LOG,
+					errcode(ERRCODE_CONFIG_FILE_ERROR),
+					errmsg("could not load file \"%s\": %s", HostsFileName,
+						   err_msg ? err_msg : "unknown error"));
+			goto error;
+		}
 	}
+	else
+		res = HOSTSFILE_DISABLED;
+
+	/*
+	 * Loading and parsing the hosts file was successful, create configs for
+	 * each host entry and add to the list of hosts to be checked during
+	 * login.
+	 */
+	if (res == HOSTSFILE_LOAD_OK)
+	{
+		Assert(ssl_sni);
+
+		foreach(line, pg_hosts)
+		{
+			HostsLine  *host = lfirst(line);
+
+			if (!init_host_context(host, isServerStart, &hasWarned))
+				goto error;
+
+			/*
+			 * The hostname in the config will be set to NULL for the default
+			 * host as well as in configs used for non-SNI connections.  Lists
+			 * of hostnames in pg_hosts.conf are not allowed to contain the
+			 * default '*' entry or a '/no_sni/' entry and this is checked
+			 * during parsing.  Thus we can inspect the head of the hostnames
+			 * list for these since they will never be anywhere else.
+			 */
+			if (strcmp(linitial(host->hostnames), "*") == 0)
+			{
+				if (new_hosts->default_host)
+				{
+					ereport(isServerStart ? FATAL : LOG,
+							errcode(ERRCODE_CONFIG_FILE_ERROR),
+							errmsg("multiple default hosts specified"),
+							errcontext("line %d of configuration file \"%s\"",
+									   host->linenumber, host->sourcefile));
+					goto error;
+				}
+
+				new_hosts->default_host = host;
+			}
+			else if (strcmp(linitial(host->hostnames), "/no_sni/") == 0)
+			{
+				if (new_hosts->no_sni)
+				{
+					ereport(isServerStart ? FATAL : LOG,
+							errcode(ERRCODE_CONFIG_FILE_ERROR),
+							errmsg("multiple no_sni hosts specified"),
+							errcontext("line %d of configuration file \"%s\"",
+									   host->linenumber, host->sourcefile));
+					goto error;
+				}
+
+				new_hosts->no_sni = host;
+			}
+			else
+			{
+				/* Check the hostnames for duplicates */
+				if (!host_cache)
+					host_cache = host_cache_create(host_memcxt, 32, NULL);
+
+				foreach_ptr(char, hostname, host->hostnames)
+				{
+					HostCacheEntry *entry;
+					bool		found;
+
+					entry = host_cache_insert(host_cache, hostname, &found);
+					if (found)
+					{
+						ereport(isServerStart ? FATAL : LOG,
+								errcode(ERRCODE_CONFIG_FILE_ERROR),
+								errmsg("multiple entries for host \"%s\" specified",
+									   hostname),
+								errcontext("line %d of configuration file \"%s\"",
+										   host->linenumber, host->sourcefile));
+						goto error;
+					}
+					else
+						entry->hostname = pstrdup(hostname);
+				}
+
+				/*
+				 * At this point we know we have a configuration with a list
+				 * of distinct 1..n hostnames for literal string matching with
+				 * the SNI extension from the user.
+				 */
+				new_hosts->sni = lappend(new_hosts->sni, host);
+			}
+		}
+	}
+
+	/*
+	 * If SNI is disabled, then we load configuration from postgresql.conf. If
+	 * SNI is enabled but the pg_hosts.conf file doesn't exist, or is empty,
+	 * then we also load the config from postgresql.conf.
+	 */
+	else if (res == HOSTSFILE_DISABLED || res == HOSTSFILE_EMPTY || res == HOSTSFILE_MISSING)
+	{
+		HostsLine  *pgconf = palloc0_object(HostsLine);
+
+#ifdef USE_ASSERT_CHECKING
+		if (res == HOSTSFILE_DISABLED)
+			Assert(ssl_sni == false);
+#endif
+
+		pgconf->ssl_cert = ssl_cert_file;
+		pgconf->ssl_key = ssl_key_file;
+		pgconf->ssl_ca = ssl_ca_file;
+		pgconf->ssl_passphrase_cmd = ssl_passphrase_command;
+		pgconf->ssl_passphrase_reload = ssl_passphrase_command_supports_reload;
+
+		if (!init_host_context(pgconf, isServerStart, &hasWarned))
+			goto error;
+
+		/*
+		 * If postgresql.conf is used to configure SSL then by definition it
+		 * will be the default context as we don't have per-host config.
+		 */
+		new_hosts->default_host = pgconf;
+	}
+
+	/*
+	 * Make sure we have at least one configuration loaded to use, without
+	 * that we cannot drive a connection so exit.
+	 */
+	if (new_hosts->sni == NIL && !new_hosts->default_host && !new_hosts->no_sni)
+	{
+		ereport(isServerStart ? FATAL : LOG,
+				errcode(ERRCODE_CONFIG_FILE_ERROR),
+				errmsg("no SSL configurations loaded"),
+		/*- translator: The two %s contain filenames */
+				errhint("If ssl_sni is enabled then add configuration to file \"%s\", else file \"%s\".",
+						HostsFileName, "postgresql.conf"));
+		goto error;
+	}
+
+#ifdef HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
 
 	/*
 	 * Create a new SSL context into which we'll load all the configuration
 	 * settings.  If we fail partway through, we can avoid memory leakage by
 	 * freeing this context; we don't install it as active until the end.
-	 *
-	 * We use SSLv23_method() because it can negotiate use of the highest
-	 * mutually supported protocol version, while alternatives like
-	 * TLSv1_2_method() permit only one specific version.  Note that we don't
-	 * actually allow SSL v2 or v3, only TLS protocols (see below).
 	 */
-	context = SSL_CTX_new(SSLv23_method());
+	context = SSL_CTX_new(TLS_method());
 	if (!context)
 	{
 		ereport(isServerStart ? FATAL : LOG,
@@ -126,66 +386,28 @@ be_tls_init(bool isServerStart)
 						SSLerrmessage(ERR_get_error()))));
 		goto error;
 	}
+#else
+
+	/*
+	 * If the client hello callback isn't supported we want to use the default
+	 * context as the one to drive the handshake so avoid creating a new one
+	 * and use the already existing default one instead.
+	 */
+	context = new_hosts->default_host->ssl_ctx;
+
+	/*
+	 * Since we don't allocate a new SSL_CTX here like we do when SNI has been
+	 * enabled we need to bump the reference count on context to avoid double
+	 * free of the context when using the same cleanup logic across the cases.
+	 */
+	SSL_CTX_up_ref(context);
+#endif
 
 	/*
 	 * Disable OpenSSL's moving-write-buffer sanity check, because it causes
 	 * unnecessary failures in nonblocking send cases.
 	 */
 	SSL_CTX_set_mode(context, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-
-	/*
-	 * Call init hook (usually to set password callback)
-	 */
-	(*openssl_tls_init_hook) (context, isServerStart);
-
-	/* used by the callback */
-	ssl_is_server_start = isServerStart;
-
-	/*
-	 * Load and verify server's certificate and private key
-	 */
-	if (SSL_CTX_use_certificate_chain_file(context, ssl_cert_file) != 1)
-	{
-		ereport(isServerStart ? FATAL : LOG,
-				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("could not load server certificate file \"%s\": %s",
-						ssl_cert_file, SSLerrmessage(ERR_get_error()))));
-		goto error;
-	}
-
-	if (!check_ssl_key_file_permissions(ssl_key_file, isServerStart))
-		goto error;
-
-	/*
-	 * OK, try to load the private key file.
-	 */
-	dummy_ssl_passwd_cb_called = false;
-
-	if (SSL_CTX_use_PrivateKey_file(context,
-									ssl_key_file,
-									SSL_FILETYPE_PEM) != 1)
-	{
-		if (dummy_ssl_passwd_cb_called)
-			ereport(isServerStart ? FATAL : LOG,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("private key file \"%s\" cannot be reloaded because it requires a passphrase",
-							ssl_key_file)));
-		else
-			ereport(isServerStart ? FATAL : LOG,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("could not load private key file \"%s\": %s",
-							ssl_key_file, SSLerrmessage(ERR_get_error()))));
-		goto error;
-	}
-
-	if (SSL_CTX_check_private_key(context) != 1)
-	{
-		ereport(isServerStart ? FATAL : LOG,
-				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("check of private key failed: %s",
-						SSLerrmessage(ERR_get_error()))));
-		goto error;
-	}
 
 	if (ssl_min_protocol_version)
 	{
@@ -244,15 +466,27 @@ be_tls_init(bool isServerStart)
 		if (ssl_ver_min > ssl_ver_max)
 		{
 			ereport(isServerStart ? FATAL : LOG,
-					(errmsg("could not set SSL protocol version range"),
-					 errdetail("\"%s\" cannot be higher than \"%s\"",
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not set SSL protocol version range"),
+					 errdetail("\"%s\" cannot be higher than \"%s\".",
 							   "ssl_min_protocol_version",
 							   "ssl_max_protocol_version")));
 			goto error;
 		}
 	}
 
-	/* disallow SSL session tickets */
+	/*
+	 * Disallow SSL session tickets. OpenSSL use both stateful and stateless
+	 * tickets for TLSv1.3, and stateless ticket for TLSv1.2. SSL_OP_NO_TICKET
+	 * is available since 0.9.8f but only turns off stateless tickets. In
+	 * order to turn off stateful tickets we need SSL_CTX_set_num_tickets,
+	 * which is available since OpenSSL 1.1.1.  LibreSSL 3.5.4 (from OpenBSD
+	 * 7.1) introduced this API for compatibility, but doesn't support session
+	 * tickets at all so it's a no-op there.
+	 */
+#ifdef HAVE_SSL_CTX_SET_NUM_TICKETS
+	SSL_CTX_set_num_tickets(context, 0);
+#endif
 	SSL_CTX_set_options(context, SSL_OP_NO_TICKET);
 
 	/* disallow SSL session caching, too */
@@ -261,14 +495,19 @@ be_tls_init(bool isServerStart)
 	/* disallow SSL compression */
 	SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
 
-#ifdef SSL_OP_NO_RENEGOTIATION
-
 	/*
-	 * Disallow SSL renegotiation, option available since 1.1.0h.  This
-	 * concerns only TLSv1.2 and older protocol versions, as TLSv1.3 has no
-	 * support for renegotiation.
+	 * Disallow SSL renegotiation.  This concerns only TLSv1.2 and older
+	 * protocol versions, as TLSv1.3 has no support for renegotiation.
+	 * SSL_OP_NO_RENEGOTIATION is available in OpenSSL since 1.1.0h (via a
+	 * backport from 1.1.1). SSL_OP_NO_CLIENT_RENEGOTIATION is available in
+	 * LibreSSL since 2.5.1 disallowing all client-initiated renegotiation
+	 * (this is usually on by default).
 	 */
+#ifdef SSL_OP_NO_RENEGOTIATION
 	SSL_CTX_set_options(context, SSL_OP_NO_RENEGOTIATION);
+#endif
+#ifdef SSL_OP_NO_CLIENT_RENEGOTIATION
+	SSL_CTX_set_options(context, SSL_OP_NO_CLIENT_RENEGOTIATION);
 #endif
 
 	/* set up ephemeral DH and ECDH keys */
@@ -277,13 +516,29 @@ be_tls_init(bool isServerStart)
 	if (!initialize_ecdh(context, isServerStart))
 		goto error;
 
-	/* set up the allowed cipher list */
-	if (SSL_CTX_set_cipher_list(context, SSLCipherSuites) != 1)
+	/* set up the allowed cipher list for TLSv1.2 and below */
+	if (SSL_CTX_set_cipher_list(context, SSLCipherList) != 1)
 	{
 		ereport(isServerStart ? FATAL : LOG,
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("could not set the cipher list (no valid ciphers available)")));
+				 errmsg("could not set the TLSv1.2 cipher list (no valid ciphers available)")));
 		goto error;
+	}
+
+	/*
+	 * Set up the allowed cipher suites for TLSv1.3. If the GUC is an empty
+	 * string we leave the allowed suites to be the OpenSSL default value.
+	 */
+	if (SSLCipherSuites[0])
+	{
+		/* set up the allowed cipher suites */
+		if (SSL_CTX_set_ciphersuites(context, SSLCipherSuites) != 1)
+		{
+			ereport(isServerStart ? FATAL : LOG,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not set the TLSv1.3 cipher suites (no valid ciphers available)")));
+			goto error;
+		}
 	}
 
 	/* Let server choose order */
@@ -291,19 +546,219 @@ be_tls_init(bool isServerStart)
 		SSL_CTX_set_options(context, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
 	/*
+	 * Success!  Replace any existing SSL_context and host configurations.
+	 */
+	if (SSL_context)
+	{
+		SSL_CTX_free(SSL_context);
+		SSL_context = NULL;
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+
+	if (SSL_hosts_memcxt)
+		MemoryContextDelete(SSL_hosts_memcxt);
+
+	SSL_hosts_memcxt = host_memcxt;
+	SSL_hosts = new_hosts;
+	SSL_context = context;
+
+	return 0;
+
+	/*
+	 * Clean up by releasing working SSL contexts as well as allocations
+	 * performed during parsing.  Since all our allocations are done in a
+	 * local memory context all we need to do is delete it.
+	 */
+error:
+	if (context)
+		SSL_CTX_free(context);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(host_memcxt);
+	return -1;
+}
+
+/*
+ * host_context_cleanup_cb
+ *
+ * Memory context reset callback for clearing OpenSSL managed resources when
+ * hosts are reloaded and the previous set of configured hosts are freed. As
+ * all hosts are allocated in a single context we don't need to free each host
+ * individually, just resources managed by OpenSSL.
+ */
+static void
+host_context_cleanup_cb(void *arg)
+{
+	struct hosts *hosts = arg;
+
+	foreach_ptr(HostsLine, host, hosts->sni)
+	{
+		if (host->ssl_ctx != NULL)
+			SSL_CTX_free(host->ssl_ctx);
+	}
+
+	if (hosts->no_sni && hosts->no_sni->ssl_ctx)
+		SSL_CTX_free(hosts->no_sni->ssl_ctx);
+
+	if (hosts->default_host && hosts->default_host->ssl_ctx)
+		SSL_CTX_free(hosts->default_host->ssl_ctx);
+}
+
+
+/*
+ * init_host_context
+ *
+ * Creates and initializes an OpenSSL SSL_CTX structure for the host config
+ * passed in the host parameter.  The SSL_CTX will be initialized with cert,
+ * key, CA and CRL; the remaining options are copied from the main context
+ * during connection setup in case this context ends up being used.
+ *
+ * If an ssl init hook has been defined, and ssl_sni is enabled, then issue a
+ * warning since the hook won't be executed.  hasWarned will be is set to true
+ * to indicate that the warning has been issued, and passing it back as true
+ * will omit future warning to avoid flooding the logs.
+ */
+static bool
+init_host_context(HostsLine *host, bool isServerStart, bool *hasWarned)
+{
+	SSL_CTX    *ctx = SSL_CTX_new(TLS_method());
+
+	if (!ctx)
+	{
+		ereport(isServerStart ? FATAL : LOG,
+				(errmsg("could not create SSL context: %s",
+						SSLerrmessage(ERR_get_error()))));
+		goto error;
+	}
+
+	/*
+	 * Call init hook (usually to set password callback) in case SNI hasn't
+	 * been enabled. If SNI is enabled the hook won't operate on the actual
+	 * TLS context used so it cannot function properly; we warn if one has
+	 * been installed.
+	 *
+	 * If SNI is enabled, we set password callback based what was configured.
+	 */
+	if (!ssl_sni)
+		(*openssl_tls_init_hook) (ctx, isServerStart);
+	else
+	{
+		if (openssl_tls_init_hook != default_openssl_tls_init && !*hasWarned)
+		{
+			ereport(WARNING,
+					errcode(ERRCODE_CONFIG_FILE_ERROR),
+					errmsg("SNI is enabled; installed TLS init hook will be ignored"),
+			/*- translator: first %s is a GUC, second %s contains a filename */
+					errhint("TLS init hooks are incompatible with SNI. "
+							"Set \"%s\" to \"off\" to make use of the hook "
+							"that is currently installed, or remove the hook "
+							"and use per-host passphrase commands in \"%s\".",
+							"ssl_sni", HostsFileName));
+			*hasWarned = true;
+		}
+
+		/*
+		 * Set up the password callback, if configured.
+		 */
+		if (isServerStart)
+		{
+			if (host->ssl_passphrase_cmd && host->ssl_passphrase_cmd[0])
+			{
+				SSL_CTX_set_default_passwd_cb(ctx, ssl_external_passwd_cb);
+				SSL_CTX_set_default_passwd_cb_userdata(ctx, host->ssl_passphrase_cmd);
+			}
+		}
+		else
+		{
+			/*
+			 * If ssl_passphrase_reload is true then ssl_passphrase_cmd cannot
+			 * be NULL due to their parsing order, but just in case and to
+			 * self-document the code we replicate the nullness checks.
+			 */
+			if (host->ssl_passphrase_reload &&
+				(host->ssl_passphrase_cmd && host->ssl_passphrase_cmd[0]))
+			{
+				SSL_CTX_set_default_passwd_cb(ctx, ssl_external_passwd_cb);
+				SSL_CTX_set_default_passwd_cb_userdata(ctx, host->ssl_passphrase_cmd);
+			}
+			else
+			{
+				/*
+				 * If reloading and no external command is configured,
+				 * override OpenSSL's default handling of passphrase-protected
+				 * files, because we don't want to prompt for a passphrase in
+				 * an already-running server.
+				 */
+				SSL_CTX_set_default_passwd_cb(ctx, dummy_ssl_passwd_cb);
+			}
+		}
+	}
+
+	/*
+	 * Load and verify server's certificate and private key
+	 */
+	if (SSL_CTX_use_certificate_chain_file(ctx, host->ssl_cert) != 1)
+	{
+		ereport(isServerStart ? FATAL : LOG,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("could not load server certificate file \"%s\": %s",
+						host->ssl_cert, SSLerrmessage(ERR_get_error()))));
+		goto error;
+	}
+
+	if (!check_ssl_key_file_permissions(host->ssl_key, isServerStart))
+		goto error;
+
+
+	/* used by the callback */
+	ssl_is_server_start = isServerStart;
+
+	/*
+	 * OK, try to load the private key file.
+	 */
+	dummy_ssl_passwd_cb_called = false;
+
+	if (SSL_CTX_use_PrivateKey_file(ctx,
+									host->ssl_key,
+									SSL_FILETYPE_PEM) != 1)
+	{
+		if (dummy_ssl_passwd_cb_called)
+			ereport(isServerStart ? FATAL : LOG,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("private key file \"%s\" cannot be reloaded because it requires a passphrase",
+							host->ssl_key)));
+		else
+			ereport(isServerStart ? FATAL : LOG,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not load private key file \"%s\": %s",
+							host->ssl_key, SSLerrmessage(ERR_get_error()))));
+		goto error;
+	}
+
+	if (SSL_CTX_check_private_key(ctx) != 1)
+	{
+		ereport(isServerStart ? FATAL : LOG,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("check of private key failed: %s",
+						SSLerrmessage(ERR_get_error()))));
+		goto error;
+	}
+
+	/*
 	 * Load CA store, so we can verify client certificates if needed.
 	 */
-	if (ssl_ca_file[0])
+	if (host->ssl_ca && host->ssl_ca[0])
 	{
 		STACK_OF(X509_NAME) * root_cert_list;
 
-		if (SSL_CTX_load_verify_locations(context, ssl_ca_file, NULL) != 1 ||
-			(root_cert_list = SSL_load_client_CA_file(ssl_ca_file)) == NULL)
+		if (SSL_CTX_load_verify_locations(ctx, host->ssl_ca, NULL) != 1 ||
+			(root_cert_list = SSL_load_client_CA_file(host->ssl_ca)) == NULL)
 		{
 			ereport(isServerStart ? FATAL : LOG,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("could not load root certificate file \"%s\": %s",
-							ssl_ca_file, SSLerrmessage(ERR_get_error()))));
+							host->ssl_ca, SSLerrmessage(ERR_get_error()))));
 			goto error;
 		}
 
@@ -314,17 +769,7 @@ be_tls_init(bool isServerStart)
 		 * that the SSL context will "own" the root_cert_list and remember to
 		 * free it when no longer needed.
 		 */
-		SSL_CTX_set_client_CA_list(context, root_cert_list);
-
-		/*
-		 * Always ask for SSL client cert, but don't fail if it's not
-		 * presented.  We might fail such connections later, depending on what
-		 * we find in pg_hba.conf.
-		 */
-		SSL_CTX_set_verify(context,
-						   (SSL_VERIFY_PEER |
-							SSL_VERIFY_CLIENT_ONCE),
-						   verify_cb);
+		SSL_CTX_set_client_CA_list(ctx, root_cert_list);
 	}
 
 	/*----------
@@ -334,7 +779,7 @@ be_tls_init(bool isServerStart)
 	 */
 	if (ssl_crl_file[0] || ssl_crl_dir[0])
 	{
-		X509_STORE *cvstore = SSL_CTX_get_cert_store(context);
+		X509_STORE *cvstore = SSL_CTX_get_cert_store(ctx);
 
 		if (cvstore)
 		{
@@ -375,29 +820,13 @@ be_tls_init(bool isServerStart)
 		}
 	}
 
-	/*
-	 * Success!  Replace any existing SSL_context.
-	 */
-	if (SSL_context)
-		SSL_CTX_free(SSL_context);
+	host->ssl_ctx = ctx;
+	return true;
 
-	SSL_context = context;
-
-	/*
-	 * Set flag to remember whether CA store has been loaded into SSL_context.
-	 */
-	if (ssl_ca_file[0])
-		ssl_loaded_verify_locations = true;
-	else
-		ssl_loaded_verify_locations = false;
-
-	return 0;
-
-	/* Clean up by releasing working context. */
 error:
-	if (context)
-		SSL_CTX_free(context);
-	return -1;
+	if (ctx)
+		SSL_CTX_free(ctx);
+	return false;
 }
 
 void
@@ -417,6 +846,7 @@ be_tls_open_server(Port *port)
 	int			waitfor;
 	unsigned long ecode;
 	bool		give_proto_hint;
+	static struct CallbackErr err_context;
 
 	Assert(!port->ssl);
 	Assert(!port->peer);
@@ -432,6 +862,9 @@ be_tls_open_server(Port *port)
 	/* set up debugging/info callback */
 	SSL_CTX_set_info_callback(SSL_context, info_cb);
 
+	/* enable ALPN */
+	SSL_CTX_set_alpn_select_cb(SSL_context, alpn_cb, port);
+
 	if (!(port->ssl = SSL_new(SSL_context)))
 	{
 		ereport(COMMERROR,
@@ -440,7 +873,7 @@ be_tls_open_server(Port *port)
 						SSLerrmessage(ERR_get_error()))));
 		return -1;
 	}
-	if (!my_SSL_set_fd(port, port->sock))
+	if (!ssl_set_port_bio(port))
 	{
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -448,6 +881,42 @@ be_tls_open_server(Port *port)
 						SSLerrmessage(ERR_get_error()))));
 		return -1;
 	}
+
+	/*
+	 * If the underlying TLS library supports the client hello callback we use
+	 * that in order to support host based configuration using the SNI TLS
+	 * extension.  If the user has disabled SNI via the ssl_sni GUC we still
+	 * make use of the callback in order to have consistent handling of
+	 * OpenSSL contexts, except in that case the callback will install the
+	 * default configuration regardless of the hostname sent by the user in
+	 * the handshake.
+	 *
+	 * In case the TLS library does not support the client hello callback, as
+	 * of this writing LibreSSL does not, we need to install the client cert
+	 * verification callback here (if the user configured a CA) since we
+	 * cannot use the OpenSSL context update functionality.
+	 */
+#ifdef HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
+	SSL_CTX_set_client_hello_cb(SSL_context, sni_clienthello_cb, NULL);
+#else
+	if (SSL_hosts->default_host->ssl_ca && SSL_hosts->default_host->ssl_ca[0])
+	{
+		/*
+		 * Always ask for SSL client cert, but don't fail if it's not
+		 * presented.  We might fail such connections later, depending on what
+		 * we find in pg_hba.conf.
+		 */
+		SSL_set_verify(port->ssl,
+					   (SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE),
+					   verify_cb);
+
+		ssl_loaded_verify_locations = true;
+	}
+#endif
+
+	err_context.cert_errdetail = NULL;
+	SSL_set_ex_data(port->ssl, 0, &err_context);
+
 	port->ssl_in_use = true;
 
 aloop:
@@ -460,6 +929,7 @@ aloop:
 	 * per-thread error queue following another call to an OpenSSL I/O
 	 * routine.
 	 */
+	errno = 0;
 	ERR_clear_error();
 	r = SSL_accept(port->ssl);
 	if (r <= 0)
@@ -492,11 +962,11 @@ aloop:
 				else
 					waitfor = WL_SOCKET_WRITEABLE | WL_EXIT_ON_PM_DEATH;
 
-				(void) WaitLatchOrSocket(MyLatch, waitfor, port->sock, 0,
+				(void) WaitLatchOrSocket(NULL, waitfor, port->sock, 0,
 										 WAIT_EVENT_SSL_OPEN_SERVER);
 				goto aloop;
 			case SSL_ERROR_SYSCALL:
-				if (r < 0)
+				if (r < 0 && errno != 0)
 					ereport(COMMERROR,
 							(errcode_for_socket_access(),
 							 errmsg("could not accept SSL connection: %m")));
@@ -532,6 +1002,8 @@ aloop:
 					case SSL_R_TLSV1_ALERT_PROTOCOL_VERSION:
 #ifdef SSL_R_VERSION_TOO_HIGH
 					case SSL_R_VERSION_TOO_HIGH:
+#endif
+#ifdef SSL_R_VERSION_TOO_LOW
 					case SSL_R_VERSION_TOO_LOW:
 #endif
 						give_proto_hint = true;
@@ -544,7 +1016,7 @@ aloop:
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),
 						 errmsg("could not accept SSL connection: %s",
 								SSLerrmessage(ecode)),
-						 cert_errdetail ? errdetail_internal("%s", cert_errdetail) : 0,
+						 err_context.cert_errdetail ? errdetail_internal("%s", err_context.cert_errdetail) : 0,
 						 give_proto_hint ?
 						 errhint("This may indicate that the client does not support any SSL protocol version between %s and %s.",
 								 ssl_min_protocol_version ?
@@ -553,7 +1025,8 @@ aloop:
 								 ssl_max_protocol_version ?
 								 ssl_protocol_version_to_string(ssl_max_protocol_version) :
 								 MAX_OPENSSL_TLS_VERSION) : 0));
-				cert_errdetail = NULL;
+				if (err_context.cert_errdetail)
+					pfree(err_context.cert_errdetail);
 				break;
 			case SSL_ERROR_ZERO_RETURN:
 				ereport(COMMERROR,
@@ -570,6 +1043,32 @@ aloop:
 		return -1;
 	}
 
+	/* Get the protocol selected by ALPN */
+	port->alpn_used = false;
+	{
+		const unsigned char *selected;
+		unsigned int len;
+
+		SSL_get0_alpn_selected(port->ssl, &selected, &len);
+
+		/* If ALPN is used, check that we negotiated the expected protocol */
+		if (selected != NULL)
+		{
+			if (len == strlen(PG_ALPN_PROTOCOL) &&
+				memcmp(selected, PG_ALPN_PROTOCOL, strlen(PG_ALPN_PROTOCOL)) == 0)
+			{
+				port->alpn_used = true;
+			}
+			else
+			{
+				/* shouldn't happen */
+				ereport(COMMERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("received SSL connection request with unexpected ALPN protocol")));
+			}
+		}
+	}
+
 	/* Get client certificate, if available. */
 	port->peer = SSL_get_peer_certificate(port->ssl);
 
@@ -580,26 +1079,28 @@ aloop:
 	if (port->peer != NULL)
 	{
 		int			len;
-		X509_NAME  *x509name = X509_get_subject_name(port->peer);
+		const X509_NAME *x509name = X509_get_subject_name(port->peer);
 		char	   *peer_dn;
 		BIO		   *bio = NULL;
 		BUF_MEM    *bio_buf = NULL;
+		int			index;
 
-		len = X509_NAME_get_text_by_NID(x509name, NID_commonName, NULL, 0);
-		if (len != -1)
+		index = X509_NAME_get_index_by_NID(unconstify(X509_NAME *, x509name), NID_commonName, -1);
+		if (index >= 0)
 		{
+			const X509_NAME_ENTRY *entry;
+			const ASN1_STRING *peer_cn_asn1;
+			const unsigned char *peer_cn_internal;
 			char	   *peer_cn;
 
+			entry = X509_NAME_get_entry(unconstify(X509_NAME *, x509name), index);
+			peer_cn_asn1 = X509_NAME_ENTRY_get_data(entry);
+			len = ASN1_STRING_length(peer_cn_asn1);
+			peer_cn_internal = ASN1_STRING_get0_data(peer_cn_asn1);
+
 			peer_cn = MemoryContextAlloc(TopMemoryContext, len + 1);
-			r = X509_NAME_get_text_by_NID(x509name, NID_commonName, peer_cn,
-										  len + 1);
+			memcpy(peer_cn, peer_cn_internal, len);
 			peer_cn[len] = '\0';
-			if (r != len)
-			{
-				/* shouldn't happen */
-				pfree(peer_cn);
-				return -1;
-			}
 
 			/*
 			 * Reject embedded NULLs in certificate common name to prevent
@@ -732,7 +1233,7 @@ be_tls_read(Port *port, void *ptr, size_t len, int *waitfor)
 			break;
 		case SSL_ERROR_SYSCALL:
 			/* leave it to caller to ereport the value of errno */
-			if (n != -1)
+			if (n != -1 || errno == 0)
 			{
 				errno = ECONNRESET;
 				n = -1;
@@ -763,7 +1264,7 @@ be_tls_read(Port *port, void *ptr, size_t len, int *waitfor)
 }
 
 ssize_t
-be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
+be_tls_write(Port *port, const void *ptr, size_t len, int *waitfor)
 {
 	ssize_t		n;
 	int			err;
@@ -790,8 +1291,14 @@ be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
 			n = -1;
 			break;
 		case SSL_ERROR_SYSCALL:
-			/* leave it to caller to ereport the value of errno */
-			if (n != -1)
+
+			/*
+			 * Leave it to caller to ereport the value of errno.  However, if
+			 * errno is still zero then assume it's a read EOF situation, and
+			 * report ECONNRESET.  (This seems possible because SSL_write can
+			 * also do reads.)
+			 */
+			if (n != -1 || errno == 0)
 			{
 				errno = ECONNRESET;
 				n = -1;
@@ -842,22 +1349,19 @@ be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
  * see sock_read() and sock_write() in OpenSSL's crypto/bio/bss_sock.c.
  */
 
-#ifndef HAVE_BIO_GET_DATA
-#define BIO_get_data(bio) (bio->ptr)
-#define BIO_set_data(bio, data) (bio->ptr = data)
-#endif
-
-static BIO_METHOD *my_bio_methods = NULL;
+static BIO_METHOD *port_bio_method_ptr = NULL;
 
 static int
-my_sock_read(BIO *h, char *buf, int size)
+port_bio_read(BIO *h, char *buf, int size)
 {
 	int			res = 0;
+	Port	   *port = (Port *) BIO_get_data(h);
 
 	if (buf != NULL)
 	{
-		res = secure_raw_read(((Port *) BIO_get_data(h)), buf, size);
+		res = (int) secure_raw_read(port, buf, size);
 		BIO_clear_retry_flags(h);
+		port->last_read_was_eof = res == 0;
 		if (res <= 0)
 		{
 			/* If we were interrupted, tell caller to retry */
@@ -872,11 +1376,11 @@ my_sock_read(BIO *h, char *buf, int size)
 }
 
 static int
-my_sock_write(BIO *h, const char *buf, int size)
+port_bio_write(BIO *h, const char *buf, int size)
 {
 	int			res = 0;
 
-	res = secure_raw_write(((Port *) BIO_get_data(h)), buf, size);
+	res = (int) secure_raw_write(((Port *) BIO_get_data(h)), buf, size);
 	BIO_clear_retry_flags(h);
 	if (res <= 0)
 	{
@@ -890,75 +1394,81 @@ my_sock_write(BIO *h, const char *buf, int size)
 	return res;
 }
 
-static BIO_METHOD *
-my_BIO_s_socket(void)
+static long
+port_bio_ctrl(BIO *h, int cmd, long num, void *ptr)
 {
-	if (!my_bio_methods)
+	long		res;
+	Port	   *port = (Port *) BIO_get_data(h);
+
+	switch (cmd)
 	{
-		BIO_METHOD *biom = (BIO_METHOD *) BIO_s_socket();
-#ifdef HAVE_BIO_METH_NEW
+		case BIO_CTRL_EOF:
+
+			/*
+			 * This should not be needed. port_bio_read already has a way to
+			 * signal EOF to OpenSSL. However, OpenSSL made an undocumented,
+			 * backwards-incompatible change and now expects EOF via BIO_ctrl.
+			 * See https://github.com/openssl/openssl/issues/8208
+			 */
+			res = port->last_read_was_eof;
+			break;
+		case BIO_CTRL_FLUSH:
+			/* libssl expects all BIOs to support BIO_flush. */
+			res = 1;
+			break;
+		default:
+			res = 0;
+			break;
+	}
+
+	return res;
+}
+
+static BIO_METHOD *
+port_bio_method(void)
+{
+	if (!port_bio_method_ptr)
+	{
 		int			my_bio_index;
 
 		my_bio_index = BIO_get_new_index();
 		if (my_bio_index == -1)
 			return NULL;
-		my_bio_index |= (BIO_TYPE_DESCRIPTOR | BIO_TYPE_SOURCE_SINK);
-		my_bio_methods = BIO_meth_new(my_bio_index, "PostgreSQL backend socket");
-		if (!my_bio_methods)
+		my_bio_index |= BIO_TYPE_SOURCE_SINK;
+		port_bio_method_ptr = BIO_meth_new(my_bio_index, "PostgreSQL backend socket");
+		if (!port_bio_method_ptr)
 			return NULL;
-		if (!BIO_meth_set_write(my_bio_methods, my_sock_write) ||
-			!BIO_meth_set_read(my_bio_methods, my_sock_read) ||
-			!BIO_meth_set_gets(my_bio_methods, BIO_meth_get_gets(biom)) ||
-			!BIO_meth_set_puts(my_bio_methods, BIO_meth_get_puts(biom)) ||
-			!BIO_meth_set_ctrl(my_bio_methods, BIO_meth_get_ctrl(biom)) ||
-			!BIO_meth_set_create(my_bio_methods, BIO_meth_get_create(biom)) ||
-			!BIO_meth_set_destroy(my_bio_methods, BIO_meth_get_destroy(biom)) ||
-			!BIO_meth_set_callback_ctrl(my_bio_methods, BIO_meth_get_callback_ctrl(biom)))
+		if (!BIO_meth_set_write(port_bio_method_ptr, port_bio_write) ||
+			!BIO_meth_set_read(port_bio_method_ptr, port_bio_read) ||
+			!BIO_meth_set_ctrl(port_bio_method_ptr, port_bio_ctrl))
 		{
-			BIO_meth_free(my_bio_methods);
-			my_bio_methods = NULL;
+			BIO_meth_free(port_bio_method_ptr);
+			port_bio_method_ptr = NULL;
 			return NULL;
 		}
-#else
-		my_bio_methods = malloc(sizeof(BIO_METHOD));
-		if (!my_bio_methods)
-			return NULL;
-		memcpy(my_bio_methods, biom, sizeof(BIO_METHOD));
-		my_bio_methods->bread = my_sock_read;
-		my_bio_methods->bwrite = my_sock_write;
-#endif
 	}
-	return my_bio_methods;
+	return port_bio_method_ptr;
 }
 
-/* This should exactly match OpenSSL's SSL_set_fd except for using my BIO */
 static int
-my_SSL_set_fd(Port *port, int fd)
+ssl_set_port_bio(Port *port)
 {
-	int			ret = 0;
 	BIO		   *bio;
 	BIO_METHOD *bio_method;
 
-	bio_method = my_BIO_s_socket();
+	bio_method = port_bio_method();
 	if (bio_method == NULL)
-	{
-		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
-		goto err;
-	}
+		return 0;
+
 	bio = BIO_new(bio_method);
-
 	if (bio == NULL)
-	{
-		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
-		goto err;
-	}
-	BIO_set_data(bio, port);
+		return 0;
 
-	BIO_set_fd(bio, fd, BIO_NOCLOSE);
+	BIO_set_data(bio, port);
+	BIO_set_init(bio, 1);
+
 	SSL_set_bio(port->ssl, bio, bio);
-	ret = 1;
-err:
-	return ret;
+	return 1;
 }
 
 /*
@@ -1041,7 +1551,7 @@ load_dh_buffer(const char *buffer, size_t len)
 	BIO		   *bio;
 	DH		   *dh = NULL;
 
-	bio = BIO_new_mem_buf(unconstify(char *, buffer), len);
+	bio = BIO_new_mem_buf(buffer, len);
 	if (bio == NULL)
 		return NULL;
 	dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
@@ -1062,10 +1572,11 @@ ssl_external_passwd_cb(char *buf, int size, int rwflag, void *userdata)
 {
 	/* same prompt as OpenSSL uses internally */
 	const char *prompt = "Enter PEM pass phrase:";
+	const char *cmd = userdata;
 
 	Assert(rwflag == 0);
 
-	return run_ssl_passphrase_command(prompt, ssl_is_server_start, buf, size);
+	return run_ssl_passphrase_command(cmd, prompt, ssl_is_server_start, buf, size);
 }
 
 /*
@@ -1142,6 +1653,8 @@ verify_cb(int ok, X509_STORE_CTX *ctx)
 	const char *errstring;
 	StringInfoData str;
 	X509	   *cert;
+	SSL		   *ssl;
+	struct CallbackErr *cb_err;
 
 	if (ok)
 	{
@@ -1153,6 +1666,13 @@ verify_cb(int ok, X509_STORE_CTX *ctx)
 	depth = X509_STORE_CTX_get_error_depth(ctx);
 	errcode = X509_STORE_CTX_get_error(ctx);
 	errstring = X509_verify_cert_error_string(errcode);
+
+	/*
+	 * Extract the current SSL and CallbackErr object to use for passing error
+	 * detail back from the callback.
+	 */
+	ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+	cb_err = (struct CallbackErr *) SSL_get_ex_data(ssl, 0);
 
 	initStringInfo(&str);
 	appendStringInfo(&str,
@@ -1204,7 +1724,7 @@ verify_cb(int ok, X509_STORE_CTX *ctx)
 	}
 
 	/* Store our detail message to be logged later. */
-	cert_errdetail = str.data;
+	cb_err->cert_errdetail = str.data;
 
 	return ok;
 }
@@ -1256,6 +1776,300 @@ info_cb(const SSL *ssl, int type, int args)
 			break;
 	}
 }
+
+/* See pqcomm.h comments on OpenSSL implementation of ALPN (RFC 7301) */
+static const unsigned char alpn_protos[] = PG_ALPN_PROTOCOL_VECTOR;
+
+/*
+ * Server callback for ALPN negotiation. We use the standard "helper" function
+ * even though currently we only accept one value.
+ */
+static int
+alpn_cb(SSL *ssl,
+		const unsigned char **out,
+		unsigned char *outlen,
+		const unsigned char *in,
+		unsigned int inlen,
+		void *userdata)
+{
+	/*
+	 * Why does OpenSSL provide a helper function that requires a nonconst
+	 * vector when the callback is declared to take a const vector? What are
+	 * we to do with that?
+	 */
+	int			retval;
+
+	Assert(userdata != NULL);
+	Assert(out != NULL);
+	Assert(outlen != NULL);
+	Assert(in != NULL);
+
+	retval = SSL_select_next_proto((unsigned char **) out, outlen,
+								   alpn_protos, sizeof(alpn_protos),
+								   in, inlen);
+	if (*out == NULL || *outlen > sizeof(alpn_protos) || *outlen <= 0)
+		return SSL_TLSEXT_ERR_NOACK;	/* can't happen */
+
+	if (retval == OPENSSL_NPN_NEGOTIATED)
+		return SSL_TLSEXT_ERR_OK;
+	else
+	{
+		/*
+		 * The client doesn't support our protocol.  Reject the connection
+		 * with TLS "no_application_protocol" alert, per RFC 7301.
+		 */
+		return SSL_TLSEXT_ERR_ALERT_FATAL;
+	}
+}
+
+#ifdef HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
+/*
+ * ssl_update_ssl
+ *
+ * Replace certificate/key and CA in an SSL object to match the, via the SNI
+ * extension, selected host configuration for the connection.  The SSL_CTX
+ * object to use should be passed in as ctx.  This function will update the
+ * SSL object in-place.
+ */
+static bool
+ssl_update_ssl(SSL *ssl, HostsLine *host_config)
+{
+	SSL_CTX    *ctx = host_config->ssl_ctx;
+
+	X509	   *cert;
+	EVP_PKEY   *key;
+
+	STACK_OF(X509) * chain;
+
+	Assert(ctx != NULL);
+	/*-
+	 * Make use of the already-loaded certificate chain and key. At first
+	 * glance, SSL_set_SSL_CTX() looks like the easiest way to do this, but
+	 * beware -- it has very odd behavior:
+	 *
+	 *     https://github.com/openssl/openssl/issues/6109
+	 */
+	cert = SSL_CTX_get0_certificate(ctx);
+	key = SSL_CTX_get0_privatekey(ctx);
+
+	Assert(cert && key);
+
+	if (!SSL_CTX_get0_chain_certs(ctx, &chain)
+		|| !SSL_use_cert_and_key(ssl, cert, key, chain, 1 /* override */ )
+		|| !SSL_check_private_key(ssl))
+	{
+		/*
+		 * This shouldn't really be possible, since the inputs came from a
+		 * SSL_CTX that was already populated by OpenSSL.
+		 */
+		ereport(COMMERROR,
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg_internal("could not update certificate chain: %s",
+								SSLerrmessage(ERR_get_error())));
+		return false;
+	}
+
+	if (host_config->ssl_ca && host_config->ssl_ca[0])
+	{
+		/*
+		 * Copy the trust store and list of roots over from the SSL_CTX.
+		 */
+		X509_STORE *ca_store = SSL_CTX_get_cert_store(ctx);
+
+		STACK_OF(X509_NAME) * roots;
+
+		/*
+		 * The trust store appears to be the only setting that this function
+		 * can't override via the (SSL *) pointer directly. Instead, share it
+		 * with the active SSL_CTX (this should always be SSL_context).
+		 */
+		Assert(SSL_context == SSL_get_SSL_CTX(ssl));
+		SSL_CTX_set1_cert_store(SSL_context, ca_store);
+
+		/*
+		 * SSL_set_client_CA_list() will take ownership of its argument, so we
+		 * need to duplicate it.
+		 */
+		if ((roots = SSL_CTX_get_client_CA_list(ctx)) == NULL
+			|| (roots = SSL_dup_CA_list(roots)) == NULL)
+		{
+			ereport(COMMERROR,
+					errcode(ERRCODE_INTERNAL_ERROR),
+					errmsg_internal("could not duplicate SSL_CTX CA list: %s",
+									SSLerrmessage(ERR_get_error())));
+			return false;
+		}
+
+		SSL_set_client_CA_list(ssl, roots);
+
+		/*
+		 * Always ask for SSL client cert, but don't fail if it's not
+		 * presented.  We might fail such connections later, depending on what
+		 * we find in pg_hba.conf.
+		 */
+		SSL_set_verify(ssl,
+					   (SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE),
+					   verify_cb);
+
+		ssl_loaded_verify_locations = true;
+	}
+
+	return true;
+}
+
+/*
+ * sni_clienthello_cb
+ *
+ * Callback for extracting the servername extension from the TLS handshake
+ * during ClientHello.  There is a callback in OpenSSL for the servername
+ * specifically but OpenSSL themselves advice against using it as it is more
+ * dependent on ordering for execution.
+ */
+static int
+sni_clienthello_cb(SSL *ssl, int *al, void *arg)
+{
+	const char *tlsext_hostname;
+	const unsigned char *tlsext;
+	size_t		left,
+				len;
+	HostsLine  *install_config = NULL;
+
+	if (!ssl_sni)
+	{
+		install_config = SSL_hosts->default_host;
+		goto found;
+	}
+
+	if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_server_name, &tlsext, &left))
+	{
+		if (left <= 2)
+		{
+			*al = SSL_AD_DECODE_ERROR;
+			return 0;
+		}
+		len = (*(tlsext++) << 8);
+		len += *(tlsext)++;
+		if (len + 2 != left)
+		{
+			*al = SSL_AD_DECODE_ERROR;
+			return 0;
+		}
+
+		left = len;
+
+		if (left == 0 || *tlsext++ != TLSEXT_NAMETYPE_host_name)
+		{
+			*al = SSL_AD_DECODE_ERROR;
+			return 0;
+		}
+
+		left--;
+
+		/*
+		 * Now we can finally pull out the byte array with the actual
+		 * hostname.
+		 */
+		if (left <= 2)
+		{
+			*al = SSL_AD_DECODE_ERROR;
+			return 0;
+		}
+		len = (*(tlsext++) << 8);
+		len += *(tlsext++);
+		if (len + 2 > left)
+		{
+			*al = SSL_AD_DECODE_ERROR;
+			return 0;
+		}
+		left = len;
+		tlsext_hostname = (const char *) tlsext;
+
+		/*
+		 * We have a requested hostname from the client, match against all
+		 * entries in the pg_hosts configuration and attempt to find a match.
+		 * Matching is done case insensitive as per RFC 952 and RFC 921.
+		 */
+		foreach_ptr(HostsLine, host, SSL_hosts->sni)
+		{
+			foreach_ptr(char, hostname, host->hostnames)
+			{
+				if (strlen(hostname) == len &&
+					pg_strncasecmp(hostname, tlsext_hostname, len) == 0)
+				{
+					install_config = host;
+					goto found;
+				}
+			}
+		}
+
+		/*
+		 * If no host specific match was found, and there is a default config,
+		 * then fall back to using that.
+		 */
+		if (!install_config && SSL_hosts->default_host)
+			install_config = SSL_hosts->default_host;
+	}
+
+	/*
+	 * No hostname TLS extension in the handshake, use the default or no_sni
+	 * configurations if available.
+	 */
+	else
+	{
+		tlsext_hostname = NULL;
+
+		if (SSL_hosts->no_sni)
+			install_config = SSL_hosts->no_sni;
+		else if (SSL_hosts->default_host)
+			install_config = SSL_hosts->default_host;
+		else
+		{
+			/*
+			 * Reaching here means that we didn't get a hostname in the TLS
+			 * extension and the server has been configured to not allow any
+			 * connections without a specified hostname.
+			 *
+			 * The error message for a missing server_name should, according
+			 * to RFC 8446, be missing_extension. This isn't entirely ideal
+			 * since the user won't be able to tell which extension the server
+			 * considered missing.  Sending unrecognized_name would be a more
+			 * helpful error, but for now we stick to the RFC.
+			 */
+			*al = SSL_AD_MISSING_EXTENSION;
+
+			ereport(COMMERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("no hostname provided in callback, and no fallback configured")));
+			return SSL_CLIENT_HELLO_ERROR;
+		}
+	}
+
+	/*
+	 * If we reach here without a context chosen as the session context then
+	 * fail the handshake and terminate the connection.
+	 */
+	if (install_config == NULL)
+	{
+		if (tlsext_hostname)
+			*al = SSL_AD_UNRECOGNIZED_NAME;
+		else
+			*al = SSL_AD_MISSING_EXTENSION;
+		return SSL_CLIENT_HELLO_ERROR;
+	}
+
+found:
+	if (!ssl_update_ssl(ssl, install_config))
+	{
+		*al = SSL_AD_INTERNAL_ERROR;
+		ereport(COMMERROR,
+				errcode(ERRCODE_PROTOCOL_VIOLATION),
+				errmsg("failed to switch to SSL configuration for host, terminating connection"));
+		return SSL_CLIENT_HELLO_ERROR;
+	}
+
+	return SSL_CLIENT_HELLO_SUCCESS;
+}
+#endif							/* HAVE_SSL_CTX_SET_CLIENT_HELLO_CB */
 
 /*
  * Set DH parameters for generating ephemeral DH keys.  The
@@ -1311,34 +2125,47 @@ initialize_dh(SSL_CTX *context, bool isServerStart)
 static bool
 initialize_ecdh(SSL_CTX *context, bool isServerStart)
 {
-#ifndef OPENSSL_NO_ECDH
-	EC_KEY	   *ecdh;
-	int			nid;
-
-	nid = OBJ_sn2nid(SSLECDHCurve);
-	if (!nid)
+	if (SSL_CTX_set1_groups_list(context, SSLECDHCurve) != 1)
 	{
+		/*
+		 * OpenSSL 3.3.0 introduced proper error messages for group parsing
+		 * errors, earlier versions returns "no SSL error reported" which is
+		 * far from helpful. For older versions, we replace with a better
+		 * error message. Injecting the error into the OpenSSL error queue
+		 * need APIs from OpenSSL 3.0.
+		 */
 		ereport(isServerStart ? FATAL : LOG,
-				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("ECDH: unrecognized curve name: %s", SSLECDHCurve)));
+				errcode(ERRCODE_CONFIG_FILE_ERROR),
+				errmsg("could not set group names specified in ssl_groups: %s",
+					   SSLerrmessageExt(ERR_get_error(),
+										_("No valid groups found"))),
+				errhint("Ensure that each group name is spelled correctly and supported by the installed version of OpenSSL."));
 		return false;
 	}
-
-	ecdh = EC_KEY_new_by_curve_name(nid);
-	if (!ecdh)
-	{
-		ereport(isServerStart ? FATAL : LOG,
-				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("ECDH: could not create key")));
-		return false;
-	}
-
-	SSL_CTX_set_options(context, SSL_OP_SINGLE_ECDH_USE);
-	SSL_CTX_set_tmp_ecdh(context, ecdh);
-	EC_KEY_free(ecdh);
-#endif
 
 	return true;
+}
+
+/*
+ * Obtain reason string for passed SSL errcode with replacement
+ *
+ * The error message supplied in replacement will be used in case the error
+ * code from OpenSSL is 0, else the error message from SSLerrmessage() will
+ * be returned.
+ *
+ * Not all versions of OpenSSL place an error on the queue even for failing
+ * operations, which will yield "no SSL error reported" by SSLerrmessage. This
+ * function can be used to ensure that a proper error message is displayed for
+ * versions reporting no error, while using the OpenSSL error via SSLerrmessage
+ * for versions where there is one.
+ */
+static const char *
+SSLerrmessageExt(unsigned long ecode, const char *replacement)
+{
+	if (ecode == 0)
+		return replacement;
+	else
+		return SSLerrmessage(ecode);
 }
 
 /*
@@ -1346,9 +2173,9 @@ initialize_ecdh(SSL_CTX *context, bool isServerStart)
  *
  * ERR_get_error() is used by caller to get errcode to pass here.
  *
- * Some caution is needed here since ERR_reason_error_string will
- * return NULL if it doesn't recognize the error code.  We don't
- * want to return NULL ever.
+ * Some caution is needed here since ERR_reason_error_string will return NULL
+ * if it doesn't recognize the error code, or (in OpenSSL >= 3) if the code
+ * represents a system errno value.  We don't want to return NULL ever.
  */
 static const char *
 SSLerrmessage(unsigned long ecode)
@@ -1361,6 +2188,20 @@ SSLerrmessage(unsigned long ecode)
 	errreason = ERR_reason_error_string(ecode);
 	if (errreason != NULL)
 		return errreason;
+
+	/*
+	 * In OpenSSL 3.0.0 and later, ERR_reason_error_string does not map system
+	 * errno values anymore.  (See OpenSSL source code for the explanation.)
+	 * We can cover that shortcoming with this bit of code.  Older OpenSSL
+	 * versions don't have the ERR_SYSTEM_ERROR macro, but that's okay because
+	 * they don't have the shortcoming either.
+	 */
+#ifdef ERR_SYSTEM_ERROR
+	if (ERR_SYSTEM_ERROR(ecode))
+		return strerror(ERR_GET_REASON(ecode));
+#endif
+
+	/* No choice but to report the numeric ecode */
 	snprintf(errbuf, sizeof(errbuf), _("SSL error code %lu"), ecode);
 	return errbuf;
 }
@@ -1441,7 +2282,12 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
 {
 	X509	   *server_cert;
 	char	   *cert_hash;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MD	   *algo_type;
+	const char *algo_name;
+#else
 	const EVP_MD *algo_type = NULL;
+#endif
 	unsigned char hash[EVP_MAX_MD_SIZE];	/* size for SHA-512 */
 	unsigned int hash_size;
 	int			algo_nid;
@@ -1470,6 +2316,25 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
 	 * (https://tools.ietf.org/html/rfc5929#section-4.1).  If something else
 	 * is used, the same hash as the signature algorithm is used.
 	 */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	switch (algo_nid)
+	{
+		case NID_md5:
+		case NID_sha1:
+			algo_name = "SHA256";
+			break;
+		default:
+			algo_name = OBJ_nid2sn(algo_nid);
+			if (algo_name == NULL)
+				elog(ERROR, "could not find digest for NID %d",
+					 algo_nid);
+			break;
+	}
+
+	algo_type = EVP_MD_fetch(NULL, algo_name, NULL);
+	if (algo_type == NULL)
+		elog(ERROR, "could not fetch digest \"%s\"", algo_name);
+#else
 	switch (algo_nid)
 	{
 		case NID_md5:
@@ -1483,10 +2348,20 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
 					 OBJ_nid2sn(algo_nid));
 			break;
 	}
+#endif
 
 	/* generate and save the certificate hash */
 	if (!X509_digest(server_cert, algo_type, hash, &hash_size))
+	{
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+		EVP_MD_free(algo_type);
+#endif
 		elog(ERROR, "could not generate server certificate hash");
+	}
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MD_free(algo_type);
+#endif
 
 	cert_hash = palloc(hash_size);
 	memcpy(cert_hash, hash, hash_size);
@@ -1500,14 +2375,14 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
  *
  */
 static char *
-X509_NAME_to_cstring(X509_NAME *name)
+X509_NAME_to_cstring(const X509_NAME *name)
 {
 	BIO		   *membuf = BIO_new(BIO_s_mem());
 	int			i,
 				nid,
 				count = X509_NAME_entry_count(name);
-	X509_NAME_ENTRY *e;
-	ASN1_STRING *v;
+	const X509_NAME_ENTRY *e;
+	const ASN1_STRING *v;
 	const char *field_name;
 	size_t		size;
 	char		nullterm;
@@ -1580,21 +2455,25 @@ ssl_protocol_version_to_openssl(int v)
 		case PG_TLS_ANY:
 			return 0;
 		case PG_TLS1_VERSION:
+#ifndef OPENSSL_NO_TLS1
 			return TLS1_VERSION;
+#else
+			break;
+#endif
 		case PG_TLS1_1_VERSION:
-#ifdef TLS1_1_VERSION
+#ifndef OPENSSL_NO_TLS1_1
 			return TLS1_1_VERSION;
 #else
 			break;
 #endif
 		case PG_TLS1_2_VERSION:
-#ifdef TLS1_2_VERSION
+#ifndef OPENSSL_NO_TLS1_2
 			return TLS1_2_VERSION;
 #else
 			break;
 #endif
 		case PG_TLS1_3_VERSION:
-#ifdef TLS1_3_VERSION
+#ifndef OPENSSL_NO_TLS1_3
 			return TLS1_3_VERSION;
 #else
 			break;
@@ -1627,6 +2506,20 @@ ssl_protocol_version_to_string(int v)
 	return "(unrecognized)";
 }
 
+static uint32
+host_cache_pointer(const char *key)
+{
+	uint32		hash;
+	char	   *lkey = pstrdup(key);
+	int			len = strlen(key);
+
+	for (int i = 0; i < len; i++)
+		lkey[i] = pg_tolower(lkey[i]);
+
+	hash = string_hash((const void *) lkey, len);
+	pfree(lkey);
+	return hash;
+}
 
 static void
 default_openssl_tls_init(SSL_CTX *context, bool isServerStart)
@@ -1634,12 +2527,18 @@ default_openssl_tls_init(SSL_CTX *context, bool isServerStart)
 	if (isServerStart)
 	{
 		if (ssl_passphrase_command[0])
+		{
 			SSL_CTX_set_default_passwd_cb(context, ssl_external_passwd_cb);
+			SSL_CTX_set_default_passwd_cb_userdata(context, ssl_passphrase_command);
+		}
 	}
 	else
 	{
 		if (ssl_passphrase_command[0] && ssl_passphrase_command_supports_reload)
+		{
 			SSL_CTX_set_default_passwd_cb(context, ssl_external_passwd_cb);
+			SSL_CTX_set_default_passwd_cb_userdata(context, ssl_passphrase_command);
+		}
 		else
 
 			/*

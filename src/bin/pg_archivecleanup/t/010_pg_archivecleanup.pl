@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -36,7 +36,7 @@ sub create_files
 {
 	foreach my $fn (map { $_->{name} } @_)
 	{
-		open my $file, '>', "$tempdir/$fn";
+		open my $file, '>', "$tempdir/$fn" or die $!;
 
 		print $file 'CONTENT';
 		close $file;
@@ -85,10 +85,11 @@ command_fails_like(
 
 	my $stderr;
 	my $oldestkeptwalfile = '00000001000000370000000E';
-	my $result =
-	  IPC::Run::run [ 'pg_archivecleanup', '-d', '-n', $tempdir,
-		$oldestkeptwalfile ],
-	  '2>', \$stderr;
+	my $result = IPC::Run::run [
+		'pg_archivecleanup', '--debug', '--dry-run', $tempdir,
+		$oldestkeptwalfile
+	  ],
+	  '2>' => \$stderr;
 	ok($result, "pg_archivecleanup dry run: exit code 0");
 
 	for my $walpair (@walfiles_verbose)

@@ -6,7 +6,7 @@
  *	  changes should be made with care.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/gist.h
@@ -17,9 +17,11 @@
 #define GIST_H
 
 #include "access/itup.h"
+#include "access/stratnum.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
+#include "nodes/primnodes.h"
 #include "storage/block.h"
 #include "storage/bufpage.h"
 #include "utils/relcache.h"
@@ -38,15 +40,16 @@
 #define GIST_FETCH_PROC					9
 #define GIST_OPTIONS_PROC				10
 #define GIST_SORTSUPPORT_PROC			11
-#define GISTNProcs					11
+#define GIST_TRANSLATE_CMPTYPE_PROC		12
+#define GISTNProcs					12
 
 /*
  * Page opaque data in a GiST index page.
  */
 #define F_LEAF				(1 << 0)	/* leaf page */
 #define F_DELETED			(1 << 1)	/* the page has been deleted */
-#define F_TUPLES_DELETED	(1 << 2)	/* some tuples on the page were
-										 * deleted */
+#define F_TUPLES_DELETED	(1 << 2)	/* old-style VACUUM FULL flag
+										 * (deprecated) */
 #define F_FOLLOW_RIGHT		(1 << 3)	/* page to the right has no downlink */
 #define F_HAS_GARBAGE		(1 << 4)	/* some tuples on the page are dead,
 										 * but not deleted yet */
@@ -171,10 +174,6 @@ typedef struct GISTENTRY
 
 #define GistPageIsDeleted(page) ( GistPageGetOpaque(page)->flags & F_DELETED)
 
-#define GistTuplesDeleted(page) ( GistPageGetOpaque(page)->flags & F_TUPLES_DELETED)
-#define GistMarkTuplesDeleted(page) ( GistPageGetOpaque(page)->flags |= F_TUPLES_DELETED)
-#define GistClearTuplesDeleted(page)	( GistPageGetOpaque(page)->flags &= ~F_TUPLES_DELETED)
-
 #define GistPageHasGarbage(page) ( GistPageGetOpaque(page)->flags & F_HAS_GARBAGE)
 #define GistMarkPageHasGarbage(page) ( GistPageGetOpaque(page)->flags |= F_HAS_GARBAGE)
 #define GistClearPageHasGarbage(page)	( GistPageGetOpaque(page)->flags &= ~F_HAS_GARBAGE)
@@ -183,8 +182,8 @@ typedef struct GISTENTRY
 #define GistMarkFollowRight(page) ( GistPageGetOpaque(page)->flags |= F_FOLLOW_RIGHT)
 #define GistClearFollowRight(page)	( GistPageGetOpaque(page)->flags &= ~F_FOLLOW_RIGHT)
 
-#define GistPageGetNSN(page) ( PageXLogRecPtrGet(GistPageGetOpaque(page)->nsn))
-#define GistPageSetNSN(page, val) ( PageXLogRecPtrSet(GistPageGetOpaque(page)->nsn, val))
+#define GistPageGetNSN(page) ( PageXLogRecPtrGet(&GistPageGetOpaque(page)->nsn))
+#define GistPageSetNSN(page, val) ( PageXLogRecPtrSet(&GistPageGetOpaque(page)->nsn, val))
 
 
 /*
@@ -244,5 +243,7 @@ typedef struct
 #define gistentryinit(e, k, r, pg, o, l) \
 	do { (e).key = (k); (e).rel = (r); (e).page = (pg); \
 		 (e).offset = (o); (e).leafkey = (l); } while (0)
+
+extern StrategyNumber gisttranslatecmptype(CompareType cmptype, Oid opfamily);
 
 #endif							/* GIST_H */

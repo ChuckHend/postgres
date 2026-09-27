@@ -3,7 +3,7 @@
  * pg_rewind.c
  *	  Synchronizes a PostgreSQL data directory to a new timeline
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -37,7 +37,8 @@ static void usage(const char *progname);
 static void perform_rewind(filemap_t *filemap, rewind_source *source,
 						   XLogRecPtr chkptrec,
 						   TimeLineID chkpttli,
-						   XLogRecPtr chkptredo);
+						   XLogRecPtr chkptredo,
+						   XLogRecPtr divergerec);
 
 static void createBackupLabel(XLogRecPtr startpoint, TimeLineID starttli,
 							  XLogRecPtr checkpointloc);
@@ -60,21 +61,21 @@ static ControlFileData ControlFile_target;
 static ControlFileData ControlFile_source;
 static ControlFileData ControlFile_source_after;
 
-const char *progname;
+static const char *progname;
 int			WalSegSz;
 
 /* Configuration options */
 char	   *datadir_target = NULL;
-char	   *datadir_source = NULL;
-char	   *connstr_source = NULL;
-char	   *restore_command = NULL;
-char	   *config_file = NULL;
+static char *datadir_source = NULL;
+static char *connstr_source = NULL;
+static char *restore_command = NULL;
+static char *config_file = NULL;
 
 static bool debug = false;
 bool		showprogress = false;
 bool		dry_run = false;
 bool		do_sync = true;
-bool		restore_wal = false;
+static bool restore_wal = false;
 DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 
 /* Target history */
@@ -94,7 +95,7 @@ usage(const char *progname)
 	printf(_("%s resynchronizes a PostgreSQL cluster with another copy of the cluster.\n\n"), progname);
 	printf(_("Usage:\n  %s [OPTION]...\n\n"), progname);
 	printf(_("Options:\n"));
-	printf(_("  -c, --restore-target-wal       use restore_command in target configuration to\n"
+	printf(_("  -c, --restore-target-wal       use \"restore_command\" in target configuration to\n"
 			 "                                 retrieve WAL files from archives\n"));
 	printf(_("  -D, --target-pgdata=DIRECTORY  existing data directory to modify\n"));
 	printf(_("      --source-pgdata=DIRECTORY  source data directory to synchronize with\n"));
@@ -144,9 +145,11 @@ main(int argc, char **argv)
 	XLogRecPtr	chkptrec;
 	TimeLineID	chkpttli;
 	XLogRecPtr	chkptredo;
+	uint32		chkptdatachecksums;
 	TimeLineID	source_tli;
 	TimeLineID	target_tli;
 	XLogRecPtr	target_wal_endrec;
+	XLogSegNo	last_common_segno;
 	size_t		size;
 	char	   *buffer;
 	bool		no_ensure_shutdown = false;
@@ -299,10 +302,14 @@ main(int argc, char **argv)
 
 	atexit(disconnect_atexit);
 
-	/*
-	 * Ok, we have all the options and we're ready to start. First, connect to
-	 * remote server.
-	 */
+	/* Ok, we have all the options and we're ready to start. */
+	if (dry_run)
+	{
+		pg_log_info("executing in dry-run mode");
+		pg_log_info_detail("The target directory will not be modified.");
+	}
+
+	/* First, connect to remote server. */
 	if (connstr_source)
 	{
 		conn = PQconnectdb(connstr_source);
@@ -328,7 +335,7 @@ main(int argc, char **argv)
 	 * need to make sure by themselves that the target cluster is in a clean
 	 * state.
 	 */
-	buffer = slurpFile(datadir_target, "global/pg_control", &size);
+	buffer = slurpFile(datadir_target, XLOG_CONTROL_FILE, &size);
 	digestControlFile(&ControlFile_target, buffer, size);
 	pg_free(buffer);
 
@@ -338,12 +345,12 @@ main(int argc, char **argv)
 	{
 		ensureCleanShutdown(argv[0]);
 
-		buffer = slurpFile(datadir_target, "global/pg_control", &size);
+		buffer = slurpFile(datadir_target, XLOG_CONTROL_FILE, &size);
 		digestControlFile(&ControlFile_target, buffer, size);
 		pg_free(buffer);
 	}
 
-	buffer = source->fetch_file(source, "global/pg_control", &size);
+	buffer = source->fetch_file(source, XLOG_CONTROL_FILE, &size);
 	digestControlFile(&ControlFile_source, buffer, size);
 	pg_free(buffer);
 
@@ -374,7 +381,7 @@ main(int argc, char **argv)
 	{
 		pg_log_info("source and target cluster are on the same timeline");
 		rewind_needed = false;
-		target_wal_endrec = 0;
+		target_wal_endrec = InvalidXLogRecPtr;
 	}
 	else
 	{
@@ -393,9 +400,15 @@ main(int argc, char **argv)
 								   targetHistory, targetNentries,
 								   &divergerec, &lastcommontliIndex);
 
-		pg_log_info("servers diverged at WAL location %X/%X on timeline %u",
+		pg_log_info("servers diverged at WAL location %X/%08X on timeline %u",
 					LSN_FORMAT_ARGS(divergerec),
 					targetHistory[lastcommontliIndex].tli);
+
+		/*
+		 * Convert the divergence LSN to a segment number, that will be used
+		 * to decide how WAL segments should be processed.
+		 */
+		XLByteToSeg(divergerec, last_common_segno, ControlFile_target.xlog_seg_size);
 
 		/*
 		 * Don't need the source history anymore. The target history is still
@@ -451,14 +464,59 @@ main(int argc, char **argv)
 		pg_log_info("no rewind required");
 		if (writerecoveryconf && !dry_run)
 			WriteRecoveryConfig(conn, datadir_target,
-								GenerateRecoveryConfig(conn, NULL));
+								GenerateRecoveryConfig(conn, NULL,
+													   GetDbnameFromConnectionOptions(connstr_source)));
 		exit(0);
 	}
 
+	/* Initialize hashtable that tracks WAL files protected from removal */
+	keepwal_init();
+
 	findLastCheckpoint(datadir_target, divergerec, lastcommontliIndex,
-					   &chkptrec, &chkpttli, &chkptredo, restore_command);
-	pg_log_info("rewinding from last common checkpoint at %X/%X on timeline %u",
+					   &chkptrec, &chkpttli, &chkptredo, &chkptdatachecksums,
+					   restore_command);
+	pg_log_info("rewinding from last common checkpoint at %X/%08X on timeline %u",
 				LSN_FORMAT_ARGS(chkptrec), chkpttli);
+
+	/*
+	 * Replay on the rewound server resumes from the last common checkpoint
+	 * and adopts the data checksum state recorded there, not the state in the
+	 * control file installed from the source.  If checksums were enabled at
+	 * the divergence point but the source runs without them, the rewound
+	 * server would verify checksums while the blocks copied from the source
+	 * have none.  The control files cannot reveal this: an offline disable on
+	 * the source after the divergence leaves both of them saying "off".
+	 *
+	 * Only the fully enabled state needs checking.  An in-progress state at
+	 * the divergence point means a transition was still running there, and
+	 * all of its page rewrites are logged after that point, so replay brings
+	 * the rewound server to whatever state the copied WAL ends in.
+	 */
+	if (chkptdatachecksums == PG_DATA_CHECKSUM_VERSION &&
+		ControlFile_source.data_checksum_version != PG_DATA_CHECKSUM_VERSION)
+	{
+		pg_log_error("data checksums were enabled at the point of divergence but are disabled on the source server");
+		pg_log_error_detail("Blocks copied from the source would have no checksums, but the rewound server would resume with checksum verification enabled.");
+		pg_log_error_hint("Either enable data checksums on the source server or recreate the target server from a base backup.");
+		exit(1);
+	}
+
+	/*
+	 * The same comparison is needed against the target: every block the
+	 * rewind does not copy keeps the target's content.  The control files
+	 * cannot reveal this case either, in the other direction: a standby's
+	 * checkpoints are written by its upstream primary, so a standby whose
+	 * checksums were disabled offline still has "on" checkpoints in its WAL,
+	 * while both control files may agree.
+	 */
+	if (chkptdatachecksums == PG_DATA_CHECKSUM_VERSION &&
+		ControlFile_target.data_checksum_version != PG_DATA_CHECKSUM_VERSION)
+	{
+		pg_log_error("data checksums were enabled at the point of divergence but are disabled on the target server");
+		pg_log_error_detail("Blocks kept from the target would have no checksums, but the rewound server would resume with checksum verification enabled.");
+		pg_log_error_hint("Either enable data checksums on the target server with pg_checksums or recreate the target server from a base backup.");
+		exit(1);
+	}
 
 	/* Initialize the hash table to track the status of each file */
 	filehash_init();
@@ -488,7 +546,7 @@ main(int argc, char **argv)
 	 * We have collected all information we need from both systems. Decide
 	 * what to do with each file.
 	 */
-	filemap = decide_file_actions();
+	filemap = decide_file_actions(last_common_segno);
 	if (showprogress)
 		calculate_totals(filemap);
 
@@ -501,9 +559,9 @@ main(int argc, char **argv)
 	 */
 	if (showprogress)
 	{
-		pg_log_info("need to copy %lu MB (total source directory size is %lu MB)",
-					(unsigned long) (filemap->fetch_size / (1024 * 1024)),
-					(unsigned long) (filemap->total_size / (1024 * 1024)));
+		pg_log_info("need to copy %" PRIu64 " MB (total source directory size is %" PRIu64 " MB)",
+					filemap->fetch_size / (1024 * 1024),
+					filemap->total_size / (1024 * 1024));
 
 		fetch_size = filemap->fetch_size;
 		fetch_done = 0;
@@ -516,7 +574,8 @@ main(int argc, char **argv)
 	 * This is the point of no return. Once we start copying things, there is
 	 * no turning back!
 	 */
-	perform_rewind(filemap, source, chkptrec, chkpttli, chkptredo);
+	perform_rewind(filemap, source, chkptrec, chkpttli, chkptredo,
+				   divergerec);
 
 	if (showprogress)
 		pg_log_info("syncing target data directory");
@@ -525,7 +584,8 @@ main(int argc, char **argv)
 	/* Also update the standby configuration, if requested. */
 	if (writerecoveryconf && !dry_run)
 		WriteRecoveryConfig(conn, datadir_target,
-							GenerateRecoveryConfig(conn, NULL));
+							GenerateRecoveryConfig(conn, NULL,
+												   GetDbnameFromConnectionOptions(connstr_source)));
 
 	/* don't need the source connection anymore */
 	source->destroy(source);
@@ -550,7 +610,8 @@ static void
 perform_rewind(filemap_t *filemap, rewind_source *source,
 			   XLogRecPtr chkptrec,
 			   TimeLineID chkpttli,
-			   XLogRecPtr chkptredo)
+			   XLogRecPtr chkptredo,
+			   XLogRecPtr divergerec)
 {
 	XLogRecPtr	endrec;
 	TimeLineID	endtli;
@@ -631,7 +692,7 @@ perform_rewind(filemap_t *filemap, rewind_source *source,
 	 * Fetch the control file from the source last. This ensures that the
 	 * minRecoveryPoint is up-to-date.
 	 */
-	buffer = source->fetch_file(source, "global/pg_control", &size);
+	buffer = source->fetch_file(source, XLOG_CONTROL_FILE, &size);
 	digestControlFile(&ControlFile_source_after, buffer, size);
 	pg_free(buffer);
 
@@ -722,6 +783,32 @@ perform_rewind(filemap_t *filemap, rewind_source *source,
 	ControlFile_new.minRecoveryPoint = endrec;
 	ControlFile_new.minRecoveryPointTLI = endtli;
 	ControlFile_new.state = DB_IN_ARCHIVE_RECOVERY;
+
+	/*
+	 * Keep the target's own data checksum state.  Most of the data directory
+	 * is still the target's: only blocks it changed since the divergence were
+	 * copied from the source, so the source's state says nothing about the
+	 * pages that stay.  Replay from the last common checkpoint applies any
+	 * WAL-logged transition the target has not seen (the watermark tells them
+	 * apart), which converges the rewound server to the source's state
+	 * whenever the WAL carries it.
+	 */
+	ControlFile_new.data_checksum_version = ControlFile_target.data_checksum_version;
+	ControlFile_new.data_checksum_lsn = ControlFile_target.data_checksum_lsn;
+	ControlFile_new.data_checksum_is_local = ControlFile_target.data_checksum_is_local;
+
+	/*
+	 * The watermark is only meaningful within the history the node replays.
+	 * Records at or below the divergence point are common to both histories
+	 * and stay covered, but a watermark above it was set by a transition
+	 * record on the target's own abandoned fork: numerically it can cover
+	 * transition records the source wrote after the divergence, and replay
+	 * would skip them as already applied.  Clamp it to the divergence point,
+	 * so that every transition record on the source's history takes effect.
+	 */
+	if (ControlFile_new.data_checksum_lsn > divergerec)
+		ControlFile_new.data_checksum_lsn = divergerec;
+
 	if (!dry_run)
 		update_controlfile(datadir_target, &ControlFile_new, do_sync);
 }
@@ -752,6 +839,55 @@ sanityChecks(void)
 		!ControlFile_target.wal_log_hints)
 	{
 		pg_fatal("target server needs to use either data checksums or \"wal_log_hints = on\"");
+	}
+
+	/*
+	 * The rewound target keeps its control file fields from the source, but
+	 * every block the rewind does not copy keeps the target's content.  If
+	 * checksums are enabled on the target and disabled on the source, the
+	 * result would claim enabled checksums while the blocks copied from the
+	 * source have none, and the target would fail checksum verification as
+	 * soon as it reads them.  Refuse that combination, and refuse an
+	 * interrupted online transition on either side, same as pg_checksums.
+	 *
+	 * The opposite mismatch is allowed: recovery under the backup label
+	 * written by pg_rewind adopts the checksum state as of the divergence
+	 * point, so a target whose own checkpoints carry no checksums stays
+	 * without them, or converges through the replayed WAL if the source
+	 * enabled them online.  Only warn about it, so that an offline change on
+	 * the source is not overlooked.
+	 *
+	 * That reasoning does not hold when the target is a standby, whose
+	 * checkpoints were written by its upstream primary; see the checks after
+	 * findLastCheckpoint().
+	 */
+	if (ControlFile_target.data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON ||
+		ControlFile_target.data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+	{
+		pg_log_error("an online data checksum state transition was interrupted on the target server");
+		pg_log_error_hint("Start the server and shut it down cleanly to reset the state, then retry; on a standby, let replication complete the transition first.");
+		exit(1);
+	}
+	if (ControlFile_source.data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON ||
+		ControlFile_source.data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+	{
+		pg_log_error("an online data checksum state transition is incomplete on the source server");
+		pg_log_error_hint("Let the transition complete, or reset the state with a clean restart, then retry.");
+		exit(1);
+	}
+	if (ControlFile_target.data_checksum_version == PG_DATA_CHECKSUM_VERSION &&
+		ControlFile_source.data_checksum_version == PG_DATA_CHECKSUM_OFF)
+	{
+		pg_log_error("data checksums are enabled on the target server but disabled on the source server");
+		pg_log_error_detail("Blocks copied from the source would have no checksums, and the target would fail checksum verification after the rewind.");
+		pg_log_error_hint("Either disable data checksums on the target server or enable them on the source server, then retry.");
+		exit(1);
+	}
+	if (ControlFile_target.data_checksum_version == PG_DATA_CHECKSUM_OFF &&
+		ControlFile_source.data_checksum_version == PG_DATA_CHECKSUM_VERSION)
+	{
+		pg_log_warning("data checksums are disabled on the target server but enabled on the source server");
+		pg_log_warning_detail("The rewound server will keep data checksums disabled unless the source server enabled them online after the point of divergence.");
 	}
 
 	/*
@@ -838,9 +974,9 @@ progress_report(bool finished)
 static XLogRecPtr
 MinXLogRecPtr(XLogRecPtr a, XLogRecPtr b)
 {
-	if (XLogRecPtrIsInvalid(a))
+	if (!XLogRecPtrIsValid(a))
 		return b;
-	else if (XLogRecPtrIsInvalid(b))
+	else if (!XLogRecPtrIsValid(b))
 		return a;
 	else
 		return Min(a, b);
@@ -860,7 +996,7 @@ getTimelineHistory(TimeLineID tli, bool is_source, int *nentries)
 	 */
 	if (tli == 1)
 	{
-		history = (TimeLineHistoryEntry *) pg_malloc(sizeof(TimeLineHistoryEntry));
+		history = pg_malloc_object(TimeLineHistoryEntry);
 		history->tli = tli;
 		history->begin = history->end = InvalidXLogRecPtr;
 		*nentries = 1;
@@ -882,6 +1018,7 @@ getTimelineHistory(TimeLineID tli, bool is_source, int *nentries)
 		pg_free(histfile);
 	}
 
+	/* In debugging mode, print what we read */
 	if (debug)
 	{
 		int			i;
@@ -891,15 +1028,12 @@ getTimelineHistory(TimeLineID tli, bool is_source, int *nentries)
 		else
 			pg_log_debug("Target timeline history:");
 
-		/*
-		 * Print the target timeline history.
-		 */
-		for (i = 0; i < targetNentries; i++)
+		for (i = 0; i < *nentries; i++)
 		{
 			TimeLineHistoryEntry *entry;
 
 			entry = &history[i];
-			pg_log_debug("%u: %X/%X - %X/%X", entry->tli,
+			pg_log_debug("%u: %X/%08X - %X/%08X", entry->tli,
 						 LSN_FORMAT_ARGS(entry->begin),
 						 LSN_FORMAT_ARGS(entry->end));
 		}
@@ -978,8 +1112,8 @@ createBackupLabel(XLogRecPtr startpoint, TimeLineID starttli, XLogRecPtr checkpo
 	strftime(strfbuf, sizeof(strfbuf), "%Y-%m-%d %H:%M:%S %Z", tmp);
 
 	len = snprintf(buf, sizeof(buf),
-				   "START WAL LOCATION: %X/%X (file %s)\n"
-				   "CHECKPOINT LOCATION: %X/%X\n"
+				   "START WAL LOCATION: %X/%08X (file %s)\n"
+				   "CHECKPOINT LOCATION: %X/%08X\n"
 				   "BACKUP METHOD: pg_rewind\n"
 				   "BACKUP FROM: standby\n"
 				   "START TIME: %s\n",
@@ -1006,7 +1140,7 @@ checkControlFile(ControlFileData *ControlFile)
 
 	/* Calculate CRC */
 	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, (char *) ControlFile, offsetof(ControlFileData, crc));
+	COMP_CRC32C(crc, ControlFile, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
 
 	/* And simply compare it */
@@ -1023,8 +1157,8 @@ digestControlFile(ControlFileData *ControlFile, const char *content,
 				  size_t size)
 {
 	if (size != PG_CONTROL_FILE_SIZE)
-		pg_fatal("unexpected control file size %d, expected %d",
-				 (int) size, PG_CONTROL_FILE_SIZE);
+		pg_fatal("unexpected control file size %zu, expected %d",
+				 size, PG_CONTROL_FILE_SIZE);
 
 	memcpy(ControlFile, content, sizeof(ControlFileData));
 
@@ -1055,8 +1189,7 @@ static void
 getRestoreCommand(const char *argv0)
 {
 	int			rc;
-	char		postgres_exec_path[MAXPGPATH],
-				cmd_output[MAXPGPATH];
+	char		postgres_exec_path[MAXPGPATH];
 	PQExpBuffer postgres_cmd;
 
 	if (!restore_wal)
@@ -1105,17 +1238,16 @@ getRestoreCommand(const char *argv0)
 	/* add -C switch, for restore_command */
 	appendPQExpBufferStr(postgres_cmd, " -C restore_command");
 
-	if (!pipe_read_line(postgres_cmd->data, cmd_output, sizeof(cmd_output)))
-		exit(1);
+	restore_command = pipe_read_line(postgres_cmd->data);
+	if (restore_command == NULL)
+		pg_fatal("could not read \"restore_command\" from target cluster");
 
-	(void) pg_strip_crlf(cmd_output);
+	(void) pg_strip_crlf(restore_command);
 
-	if (strcmp(cmd_output, "") == 0)
-		pg_fatal("restore_command is not set in the target cluster");
+	if (strcmp(restore_command, "") == 0)
+		pg_fatal("\"restore_command\" is not set in the target cluster");
 
-	restore_command = pg_strdup(cmd_output);
-
-	pg_log_debug("using for rewind restore_command = \'%s\'",
+	pg_log_debug("using for rewind \"restore_command = \'%s\'\"",
 				 restore_command);
 
 	destroyPQExpBuffer(postgres_cmd);
@@ -1130,7 +1262,6 @@ static void
 ensureCleanShutdown(const char *argv0)
 {
 	int			ret;
-#define MAXCMDLEN (2 * MAXPGPATH)
 	char		exec_path[MAXPGPATH];
 	PQExpBuffer postgres_cmd;
 

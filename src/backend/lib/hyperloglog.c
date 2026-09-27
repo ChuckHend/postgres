@@ -3,7 +3,7 @@
  * hyperloglog.c
  *	  HyperLogLog cardinality estimator
  *
- * Portions Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2014-2026, PostgreSQL Global Development Group
  *
  * Based on Hideaki Ohno's C++ implementation.  This is probably not ideally
  * suited to estimating the cardinality of very large sets;  in particular, we
@@ -158,7 +158,7 @@ freeHyperLogLog(hyperLogLogState *cState)
  * Adds element to the estimator, from caller-supplied hash.
  *
  * It is critical that the hash value passed be an actual hash value, typically
- * generated using hash_any().  The algorithm relies on a specific bit-pattern
+ * generated using hash_bytes().  The algorithm relies on a specific bit-pattern
  * observable in conjunction with stochastic averaging.  There must be a
  * uniform distribution of bits in hash values for each distinct original value
  * observed.
@@ -187,9 +187,8 @@ estimateHyperLogLog(hyperLogLogState *cState)
 {
 	double		result;
 	double		sum = 0.0;
-	int			i;
 
-	for (i = 0; i < cState->nRegisters; i++)
+	for (Size i = 0; i < cState->nRegisters; i++)
 	{
 		sum += 1.0 / pow(2.0, cState->hashesArr[i]);
 	}
@@ -202,7 +201,7 @@ estimateHyperLogLog(hyperLogLogState *cState)
 		/* Small range correction */
 		int			zero_count = 0;
 
-		for (i = 0; i < cState->nRegisters; i++)
+		for (Size i = 0; i < cState->nRegisters; i++)
 		{
 			if (cState->hashesArr[i] == 0)
 				zero_count++;
@@ -228,7 +227,7 @@ estimateHyperLogLog(hyperLogLogState *cState)
  * starting from the first, reading from most significant to least significant
  * bits.
  *
- * Example (when considering fist 10 bits of x):
+ * Example (when considering first 10 bits of x):
  *
  * rho(x = 0b1000000000)   returns 1
  * rho(x = 0b0010000000)   returns 3

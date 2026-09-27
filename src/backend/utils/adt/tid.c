@@ -3,7 +3,7 @@
  * tid.c
  *	  Functions for the built-in type tuple id
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,11 +17,10 @@
  */
 #include "postgres.h"
 
-#include <math.h>
 #include <limits.h>
 
-#include "access/heapam.h"
 #include "access/sysattr.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -30,7 +29,7 @@
 #include "miscadmin.h"
 #include "parser/parsetree.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -42,7 +41,7 @@
 #define DELIM			','
 #define NTIDARGS		2
 
-static ItemPointer currtid_for_view(Relation viewrel, ItemPointer tid);
+static ItemPointer currtid_for_view(Relation viewrel, const ItemPointerData *tid);
 
 /* ----------------------------------------------------------------
  *		tidin
@@ -74,7 +73,7 @@ tidin(PG_FUNCTION_ARGS)
 
 	errno = 0;
 	cvt = strtoul(coord[0], &badp, 10);
-	if (errno || *badp != DELIM)
+	if (badp == coord[0] || errno || *badp != DELIM)
 		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s: \"%s\"",
@@ -84,7 +83,7 @@ tidin(PG_FUNCTION_ARGS)
 	/*
 	 * Cope with possibility that unsigned long is wider than BlockNumber, in
 	 * which case strtoul will not raise an error for some values that are out
-	 * of the range of BlockNumber.  (See similar code in oidin().)
+	 * of the range of BlockNumber.  (See similar code in uint32in_subr().)
 	 */
 #if SIZEOF_LONG > 4
 	if (cvt != (unsigned long) blockNumber &&
@@ -96,15 +95,14 @@ tidin(PG_FUNCTION_ARGS)
 #endif
 
 	cvt = strtoul(coord[1], &badp, 10);
-	if (errno || *badp != RDELIM ||
-		cvt > USHRT_MAX)
+	if (badp == coord[1] || errno || *badp != RDELIM || cvt > USHRT_MAX)
 		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s: \"%s\"",
 						"tid", str)));
 	offsetNumber = (OffsetNumber) cvt;
 
-	result = (ItemPointer) palloc(sizeof(ItemPointerData));
+	result = (ItemPointer) palloc_object(ItemPointerData);
 
 	ItemPointerSet(result, blockNumber, offsetNumber);
 
@@ -146,7 +144,7 @@ tidrecv(PG_FUNCTION_ARGS)
 	blockNumber = pq_getmsgint(buf, sizeof(blockNumber));
 	offsetNumber = pq_getmsgint(buf, sizeof(offsetNumber));
 
-	result = (ItemPointer) palloc(sizeof(ItemPointerData));
+	result = (ItemPointer) palloc_object(ItemPointerData);
 
 	ItemPointerSet(result, blockNumber, offsetNumber);
 
@@ -280,6 +278,35 @@ hashtidextended(PG_FUNCTION_ARGS)
 							 seed);
 }
 
+/*
+ * Extract the block number from a TID
+ *
+ * Returns int8 because BlockNumber is uint32, which exceeds the range of int4.
+ */
+Datum
+tid_block(PG_FUNCTION_ARGS)
+{
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(0);
+
+	/* need to use NoCheck, as tidin allows InvalidBlockNumber */
+	PG_RETURN_INT64((int64) ItemPointerGetBlockNumberNoCheck(tid));
+}
+
+/*
+ * Extract the offset number from a TID
+ *
+ * Returns int4 because OffsetNumber is uint16, which exceeds the range of
+ * int2.
+ */
+Datum
+tid_offset(PG_FUNCTION_ARGS)
+{
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(0);
+
+	/* need to use NoCheck, as tidin allows InvalidOffsetNumber */
+	PG_RETURN_INT32((int32) ItemPointerGetOffsetNumberNoCheck(tid));
+}
+
 
 /*
  *	Functions to get latest tid of a specified tuple.
@@ -293,14 +320,14 @@ hashtidextended(PG_FUNCTION_ARGS)
  *		relation "rel".
  */
 static ItemPointer
-currtid_internal(Relation rel, ItemPointer tid)
+currtid_internal(Relation rel, const ItemPointerData *tid)
 {
 	ItemPointer result;
 	AclResult	aclresult;
 	Snapshot	snapshot;
 	TableScanDesc scan;
 
-	result = (ItemPointer) palloc(sizeof(ItemPointerData));
+	result = (ItemPointer) palloc_object(ItemPointerData);
 
 	aclresult = pg_class_aclcheck(RelationGetRelid(rel), GetUserId(),
 								  ACL_SELECT);
@@ -312,9 +339,11 @@ currtid_internal(Relation rel, ItemPointer tid)
 		return currtid_for_view(rel, tid);
 
 	if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
-		elog(ERROR, "cannot look at latest visible tid for relation \"%s.%s\"",
-			 get_namespace_name(RelationGetNamespace(rel)),
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot look at latest visible tid for relation \"%s.%s\"",
+					   get_namespace_name(RelationGetNamespace(rel)),
+					   RelationGetRelationName(rel)));
 
 	ItemPointerCopy(tid, result);
 
@@ -333,7 +362,7 @@ currtid_internal(Relation rel, ItemPointer tid)
  *		correspond to the CTID of a base relation.
  */
 static ItemPointer
-currtid_for_view(Relation viewrel, ItemPointer tid)
+currtid_for_view(Relation viewrel, const ItemPointerData *tid)
 {
 	TupleDesc	att = RelationGetDescr(viewrel);
 	RuleLock   *rulelock;
@@ -349,16 +378,22 @@ currtid_for_view(Relation viewrel, ItemPointer tid)
 		if (strcmp(NameStr(attr->attname), "ctid") == 0)
 		{
 			if (attr->atttypid != TIDOID)
-				elog(ERROR, "ctid isn't of type TID");
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("ctid isn't of type TID"));
 			tididx = i;
 			break;
 		}
 	}
 	if (tididx < 0)
-		elog(ERROR, "currtid cannot handle views with no CTID");
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("currtid cannot handle views with no CTID"));
 	rulelock = viewrel->rd_rules;
 	if (!rulelock)
-		elog(ERROR, "the view has no rules");
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("the view has no rules"));
 	for (i = 0; i < rulelock->numLocks; i++)
 	{
 		rewrite = rulelock->rules[i];
@@ -368,7 +403,9 @@ currtid_for_view(Relation viewrel, ItemPointer tid)
 			TargetEntry *tle;
 
 			if (list_length(rewrite->actions) != 1)
-				elog(ERROR, "only one select rule is allowed in views");
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("only one select rule is allowed in views"));
 			query = (Query *) linitial(rewrite->actions);
 			tle = get_tle_by_resno(query->targetList, tididx + 1);
 			if (tle && tle->expr && IsA(tle->expr, Var))

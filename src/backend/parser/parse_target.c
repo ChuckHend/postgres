@@ -3,7 +3,7 @@
  * parse_target.c
  *	  handle target lists
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,15 +14,14 @@
  */
 #include "postgres.h"
 
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_expr.h"
-#include "parser/parse_func.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
@@ -30,7 +29,6 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/typcache.h"
 
 static void markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 								 Var *var, int levelsup);
@@ -421,6 +419,9 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 				tle->resorigcol = ste->resorigcol;
 			}
 			break;
+		case RTE_GROUP:
+			/* We couldn't get here: the RTE_GROUP RTE has not been added */
+			break;
 	}
 }
 
@@ -437,6 +438,7 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
  * pstate		parse state
  * expr			expression to be modified
  * exprKind		indicates which type of statement we're dealing with
+ *				(EXPR_KIND_INSERT_TARGET or EXPR_KIND_UPDATE_TARGET)
  * colname		target column name (ie, name of attribute to be assigned to)
  * attrno		target attribute number
  * indirection	subscripts/field names for target column, if any
@@ -470,7 +472,8 @@ transformAssignedExpr(ParseState *pstate,
 	 * set p_expr_kind here because we can parse subscripts without going
 	 * through transformExpr().
 	 */
-	Assert(exprKind != EXPR_KIND_NONE);
+	Assert(exprKind == EXPR_KIND_INSERT_TARGET ||
+		   exprKind == EXPR_KIND_UPDATE_TARGET);
 	sv_expr_kind = pstate->p_expr_kind;
 	pstate->p_expr_kind = exprKind;
 
@@ -529,7 +532,7 @@ transformAssignedExpr(ParseState *pstate,
 	{
 		Node	   *colVar;
 
-		if (pstate->p_is_insert)
+		if (exprKind == EXPR_KIND_INSERT_TARGET)
 		{
 			/*
 			 * The command is INSERT INTO table (col.something) ... so there
@@ -821,7 +824,16 @@ transformAssignmentIndirection(ParseState *pstate,
 			fstore->fieldnums = list_make1_int(attnum);
 			fstore->resulttype = baseTypeId;
 
-			/* If target is a domain, apply constraints */
+			/*
+			 * If target is a domain, apply constraints.  Notice that this
+			 * isn't totally right: the expression tree we build would check
+			 * the domain's constraints on a composite value with only this
+			 * one field populated or updated, possibly leading to an unwanted
+			 * failure.  The rewriter will merge together any subfield
+			 * assignments to the same table column, resulting in the domain's
+			 * constraints being checked only once after we've assigned to all
+			 * the fields that the INSERT or UPDATE means to.
+			 */
 			if (baseTypeId != targetTypeId)
 				return coerce_to_domain((Node *) fstore,
 										baseTypeId, baseTypeMod,
@@ -967,7 +979,12 @@ transformAssignmentSubscripts(ParseState *pstate,
 
 	result = (Node *) sbsref;
 
-	/* If target was a domain over container, need to coerce up to the domain */
+	/*
+	 * If target was a domain over container, need to coerce up to the domain.
+	 * As in transformAssignmentIndirection, this coercion is premature if the
+	 * query assigns to multiple elements of the container; but we'll fix that
+	 * during query rewrite.
+	 */
 	if (containerType != targetTypeId)
 	{
 		Oid			resulttype = exprType(result);
@@ -1430,7 +1447,7 @@ ExpandRowReference(ParseState *pstate, Node *expr,
 		Var		   *var = (Var *) expr;
 		ParseNamespaceItem *nsitem;
 
-		nsitem = GetNSItemByRangeTablePosn(pstate, var->varno, var->varlevelsup);
+		nsitem = GetNSItemByVar(pstate, var);
 		return ExpandSingleTable(pstate, nsitem, var->varlevelsup, var->location, make_target_entry);
 	}
 
@@ -1534,8 +1551,8 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 				   *lvar;
 		int			i;
 
-		expandRTE(rte, var->varno, 0, var->location, false,
-				  &names, &vars);
+		expandRTE(rte, var->varno, 0, var->varreturningtype,
+				  var->location, false, &names, &vars);
 
 		tupleDesc = CreateTemplateTupleDesc(list_length(vars));
 		i = 1;
@@ -1554,6 +1571,8 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 			i++;
 		}
 		Assert(lname == NULL && lvar == NULL);	/* lists same length? */
+
+		TupleDescFinalize(tupleDesc);
 
 		return tupleDesc;
 	}
@@ -1594,10 +1613,9 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					 * subselect must have that outer level as parent.
 					 */
 					ParseState	mypstate = {0};
-					Index		levelsup;
 
 					/* this loop must work, since GetRTEByRangeTablePosn did */
-					for (levelsup = 0; levelsup < netlevelsup; levelsup++)
+					for (int level = 0; level < netlevelsup; level++)
 						pstate = pstate->parentParseState;
 					mypstate.parentParseState = pstate;
 					mypstate.p_rtable = rte->subquery->rtable;
@@ -1652,12 +1670,11 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 					 * could be an outer CTE (compare SUBQUERY case above).
 					 */
 					ParseState	mypstate = {0};
-					Index		levelsup;
 
 					/* this loop must work, since GetCTEForRTE did */
-					for (levelsup = 0;
-						 levelsup < rte->ctelevelsup + netlevelsup;
-						 levelsup++)
+					for (Index level = 0;
+						 level < rte->ctelevelsup + netlevelsup;
+						 level++)
 						pstate = pstate->parentParseState;
 					mypstate.parentParseState = pstate;
 					mypstate.p_rtable = ((Query *) cte->ctequery)->rtable;
@@ -1667,6 +1684,12 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 				}
 				/* else fall through to inspect the expression */
 			}
+			break;
+		case RTE_GROUP:
+
+			/*
+			 * We couldn't get here: the RTE_GROUP RTE has not been added.
+			 */
 			break;
 	}
 
@@ -1697,22 +1720,6 @@ FigureColname(Node *node)
 		return name;
 	/* default result if we can't guess anything */
 	return "?column?";
-}
-
-/*
- * FigureIndexColname -
- *	  choose the name for an expression column in an index
- *
- * This is actually just like FigureColname, except we return NULL if
- * we can't pick a good name.
- */
-char *
-FigureIndexColname(Node *node)
-{
-	char	   *name = NULL;
-
-	(void) FigureColnameInternal(node, &name);
-	return name;
 }
 
 /*
@@ -1806,6 +1813,10 @@ FigureColnameInternal(Node *node, char **name)
 		case T_GroupingFunc:
 			/* make GROUPING() act like a regular function */
 			*name = "grouping";
+			return 2;
+		case T_MergeSupportFunc:
+			/* make MERGE_ACTION() act like a regular function */
+			*name = "merge_action";
 			return 2;
 		case T_SubLink:
 			switch (((SubLink *) node)->subLinkType)
@@ -1989,6 +2000,25 @@ FigureColnameInternal(Node *node, char **name)
 			/* make JSON_ARRAYAGG act like a regular function */
 			*name = "json_arrayagg";
 			return 2;
+		case T_JsonFuncExpr:
+			/* make SQL/JSON functions act like a regular function */
+			switch (((JsonFuncExpr *) node)->op)
+			{
+				case JSON_EXISTS_OP:
+					*name = "json_exists";
+					return 2;
+				case JSON_QUERY_OP:
+					*name = "json_query";
+					return 2;
+				case JSON_VALUE_OP:
+					*name = "json_value";
+					return 2;
+					/* JSON_TABLE_OP can't happen here. */
+				default:
+					elog(ERROR, "unrecognized JsonExpr op: %d",
+						 (int) ((JsonFuncExpr *) node)->op);
+			}
+			break;
 		default:
 			break;
 	}

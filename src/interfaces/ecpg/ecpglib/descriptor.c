@@ -1,4 +1,5 @@
-/* dynamic SQL support routines
+/*
+ * dynamic SQL support routines
  *
  * src/interfaces/ecpg/ecpglib/descriptor.c
  */
@@ -113,7 +114,7 @@ get_int_item(int lineno, void *var, enum ECPGttype vartype, int value)
 			*(short *) var = (short) value;
 			break;
 		case ECPGt_int:
-			*(int *) var = (int) value;
+			*(int *) var = value;
 			break;
 		case ECPGt_long:
 			*(long *) var = (long) value;
@@ -198,7 +199,7 @@ get_char_item(int lineno, void *var, enum ECPGttype vartype, char *value, int va
 		case ECPGt_char:
 		case ECPGt_unsigned_char:
 		case ECPGt_string:
-			strncpy((char *) var, value, varcharsize);
+			strncpy(var, value, varcharsize);
 			break;
 		case ECPGt_varchar:
 			{
@@ -231,7 +232,7 @@ get_char_item(int lineno, void *var, enum ECPGttype vartype, char *value, int va
 				}
 
 bool
-ECPGget_desc(int lineno, const char *desc_name, int index,...)
+ECPGget_desc(int lineno, const char *desc_name, int index, ...)
 {
 	va_list		args;
 	PGresult   *ECPGresult;
@@ -240,8 +241,9 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 				act_tuple;
 	struct variable data_var;
 	struct sqlca_t *sqlca = ECPGget_sqlca();
+	bool		alloc_failed = (sqlca == NULL);
 
-	if (sqlca == NULL)
+	if (alloc_failed)
 	{
 		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
 				   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
@@ -435,7 +437,7 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 				/* allocate storage if needed */
 				if (arrsize == 0 && *(void **) var == NULL)
 				{
-					void	   *mem = (void *) ecpg_auto_alloc(offset * ntuples, lineno);
+					void	   *mem = ecpg_auto_alloc(offset * ntuples, lineno);
 
 					if (!mem)
 					{
@@ -475,6 +477,16 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 		memset(&stmt, 0, sizeof stmt);
 		stmt.lineno = lineno;
 
+		/* desperate try to guess something sensible */
+		stmt.connection = ecpg_get_connection(NULL);
+		if (stmt.connection == NULL)
+		{
+			ecpg_raise(lineno, ECPG_NO_CONN, ECPG_SQLSTATE_CONNECTION_DOES_NOT_EXIST,
+					   ecpg_gettext("NULL"));
+			va_end(args);
+			return false;
+		}
+
 		/* Make sure we do NOT honor the locale for numeric input */
 		/* since the database gives the standard decimal point */
 		/* (see comments in execute.c) */
@@ -490,15 +502,20 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 		Assert(ecpg_clocale);
 		stmt.oldlocale = uselocale(ecpg_clocale);
 #else
-#ifdef HAVE__CONFIGTHREADLOCALE
+#ifdef WIN32
 		stmt.oldthreadlocale = _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
 #endif
-		stmt.oldlocale = ecpg_strdup(setlocale(LC_NUMERIC, NULL), lineno);
+		stmt.oldlocale = ecpg_strdup(setlocale(LC_NUMERIC, NULL),
+									 lineno, &alloc_failed);
+		if (alloc_failed)
+		{
+			va_end(args);
+			return false;
+		}
+
 		setlocale(LC_NUMERIC, "C");
 #endif
 
-		/* desperate try to guess something sensible */
-		stmt.connection = ecpg_get_connection(NULL);
 		ecpg_store_result(ECPGresult, index, &stmt, &data_var);
 
 #ifdef HAVE_USELOCALE
@@ -510,9 +527,9 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 			setlocale(LC_NUMERIC, stmt.oldlocale);
 			ecpg_free(stmt.oldlocale);
 		}
-#ifdef HAVE__CONFIGTHREADLOCALE
+#ifdef WIN32
 		if (stmt.oldthreadlocale != -1)
-			(void) _configthreadlocale(stmt.oldthreadlocale);
+			_configthreadlocale(stmt.oldthreadlocale);
 #endif
 #endif
 	}
@@ -540,7 +557,7 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 		/* allocate storage if needed */
 		if (data_var.ind_arrsize == 0 && data_var.ind_value == NULL)
 		{
-			void	   *mem = (void *) ecpg_auto_alloc(data_var.ind_offset * ntuples, lineno);
+			void	   *mem = ecpg_auto_alloc(data_var.ind_offset * ntuples, lineno);
 
 			if (!mem)
 			{
@@ -597,12 +614,12 @@ set_desc_attr(struct descriptor_item *desc_item, struct variable *var,
 	}
 
 	ecpg_free(desc_item->data); /* free() takes care of a potential NULL value */
-	desc_item->data = (char *) tobeinserted;
+	desc_item->data = tobeinserted;
 }
 
 
 bool
-ECPGset_desc(int lineno, const char *desc_name, int index,...)
+ECPGset_desc(int lineno, const char *desc_name, int index, ...)
 {
 	va_list		args;
 	struct descriptor *desc;
@@ -844,7 +861,7 @@ ecpg_find_desc(int line, const char *name)
 }
 
 bool
-ECPGdescribe(int line, int compat, bool input, const char *connection_name, const char *stmt_name,...)
+ECPGdescribe(int line, int compat, bool input, const char *connection_name, const char *stmt_name, ...)
 {
 	bool		ret = false;
 	struct connection *con;

@@ -3,7 +3,7 @@
  * dependencies.c
  *	  POSTGRES functional dependencies
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,22 +14,14 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "access/sysattr.h"
-#include "catalog/pg_operator.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
-#include "lib/stringinfo.h"
 #include "nodes/nodeFuncs.h"
-#include "nodes/nodes.h"
-#include "nodes/pathnodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "statistics/extended_stats_internal.h"
-#include "statistics/statistics.h"
-#include "utils/bytea.h"
 #include "utils/fmgroids.h"
-#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/selfuncs.h"
@@ -78,7 +70,7 @@ static bool dependency_is_fully_matched(MVDependency *dependency,
 static bool dependency_is_compatible_clause(Node *clause, Index relid,
 											AttrNumber *attnum);
 static bool dependency_is_compatible_expression(Node *clause, Index relid,
-												List *statlist, Node **expr);
+												List *statlist, Node **stat_expr_p);
 static MVDependency *find_strongest_dependency(MVDependencies **dependencies,
 											   int ndependencies, Bitmapset *attnums);
 static Selectivity clauselist_apply_dependencies(PlannerInfo *root, List *clauses,
@@ -144,8 +136,9 @@ generate_dependencies_recurse(DependencyGenerator state, int index,
 			 */
 			if (!match)
 			{
-				state->dependencies = (AttrNumber *) repalloc(state->dependencies,
-															  state->k * (state->ndependencies + 1) * sizeof(AttrNumber));
+				state->dependencies = repalloc_array(state->dependencies,
+													 AttrNumber,
+													 state->k * (state->ndependencies + 1));
 				memcpy(&state->dependencies[(state->k * state->ndependencies)],
 					   current, state->k * sizeof(AttrNumber));
 				state->ndependencies++;
@@ -158,7 +151,7 @@ generate_dependencies_recurse(DependencyGenerator state, int index,
 static void
 generate_dependencies(DependencyGenerator state)
 {
-	AttrNumber *current = (AttrNumber *) palloc0(sizeof(AttrNumber) * state->k);
+	AttrNumber *current = palloc0_array(AttrNumber, state->k);
 
 	generate_dependencies_recurse(state, 0, 0, current);
 
@@ -179,8 +172,8 @@ DependencyGenerator_init(int n, int k)
 	Assert((n >= k) && (k > 0));
 
 	/* allocate the DependencyGenerator state */
-	state = (DependencyGenerator) palloc0(sizeof(DependencyGeneratorData));
-	state->dependencies = (AttrNumber *) palloc(k * sizeof(AttrNumber));
+	state = palloc0_object(DependencyGeneratorData);
+	state->dependencies = palloc_array(AttrNumber, k);
 
 	state->ndependencies = 0;
 	state->current = 0;
@@ -245,7 +238,7 @@ dependency_degree(StatsBuildData *data, int k, AttrNumber *dependency)
 	 * Translate the array of indexes to regular attnums for the dependency
 	 * (we will need this to identify the columns in StatsBuildData).
 	 */
-	attnums_dep = (AttrNumber *) palloc(k * sizeof(AttrNumber));
+	attnums_dep = palloc_array(AttrNumber, k);
 	for (i = 0; i < k; i++)
 		attnums_dep[i] = data->attnums[dependency[i]];
 
@@ -410,8 +403,7 @@ statext_dependencies_build(StatsBuildData *data)
 			/* initialize the list of dependencies */
 			if (dependencies == NULL)
 			{
-				dependencies
-					= (MVDependencies *) palloc0(sizeof(MVDependencies));
+				dependencies = palloc0_object(MVDependencies);
 
 				dependencies->magic = STATS_DEPS_MAGIC;
 				dependencies->type = STATS_DEPS_TYPE_BASIC;
@@ -445,7 +437,6 @@ statext_dependencies_build(StatsBuildData *data)
 bytea *
 statext_dependencies_serialize(MVDependencies *dependencies)
 {
-	int			i;
 	bytea	   *output;
 	char	   *tmp;
 	Size		len;
@@ -454,7 +445,7 @@ statext_dependencies_serialize(MVDependencies *dependencies)
 	len = VARHDRSZ + SizeOfHeader;
 
 	/* and also include space for the actual attribute numbers and degrees */
-	for (i = 0; i < dependencies->ndeps; i++)
+	for (uint32 i = 0; i < dependencies->ndeps; i++)
 		len += SizeOfItem(dependencies->deps[i]->nattributes);
 
 	output = (bytea *) palloc0(len);
@@ -471,7 +462,7 @@ statext_dependencies_serialize(MVDependencies *dependencies)
 	tmp += sizeof(uint32);
 
 	/* store number of attributes and attribute numbers for each dependency */
-	for (i = 0; i < dependencies->ndeps; i++)
+	for (uint32 i = 0; i < dependencies->ndeps; i++)
 	{
 		MVDependency *d = dependencies->deps[i];
 
@@ -500,7 +491,6 @@ statext_dependencies_serialize(MVDependencies *dependencies)
 MVDependencies *
 statext_dependencies_deserialize(bytea *data)
 {
-	int			i;
 	Size		min_expected_size;
 	MVDependencies *dependencies;
 	char	   *tmp;
@@ -513,7 +503,7 @@ statext_dependencies_deserialize(bytea *data)
 			 VARSIZE_ANY_EXHDR(data), SizeOfHeader);
 
 	/* read the MVDependencies header */
-	dependencies = (MVDependencies *) palloc0(sizeof(MVDependencies));
+	dependencies = palloc0_object(MVDependencies);
 
 	/* initialize pointer to the data part (skip the varlena header) */
 	tmp = VARDATA_ANY(data);
@@ -538,7 +528,7 @@ statext_dependencies_deserialize(bytea *data)
 		elog(ERROR, "invalid zero-length item array in MVDependencies");
 
 	/* what minimum bytea size do we expect for those parameters */
-	min_expected_size = SizeOfItem(dependencies->ndeps);
+	min_expected_size = MinSizeOfItems(dependencies->ndeps);
 
 	if (VARSIZE_ANY_EXHDR(data) < min_expected_size)
 		elog(ERROR, "invalid dependencies size %zu (expected at least %zu)",
@@ -548,7 +538,7 @@ statext_dependencies_deserialize(bytea *data)
 	dependencies = repalloc(dependencies, offsetof(MVDependencies, deps)
 							+ (dependencies->ndeps * sizeof(MVDependency *)));
 
-	for (i = 0; i < dependencies->ndeps; i++)
+	for (uint32 i = 0; i < dependencies->ndeps; i++)
 	{
 		double		degree;
 		AttrNumber	k;
@@ -586,6 +576,82 @@ statext_dependencies_deserialize(bytea *data)
 	Assert(tmp == ((char *) data + VARSIZE_ANY(data)));
 
 	return dependencies;
+}
+
+/*
+ * Free allocations of a MVDependencies.
+ */
+void
+statext_dependencies_free(MVDependencies *dependencies)
+{
+	for (uint32 i = 0; i < dependencies->ndeps; i++)
+		pfree(dependencies->deps[i]);
+	pfree(dependencies);
+}
+
+/*
+ * Validate a set of MVDependencies against the extended statistics object
+ * definition.
+ *
+ * Every MVDependencies must be checked to ensure that the attnums in the
+ * attributes list correspond to attnums/expressions defined by the
+ * extended statistics object.
+ *
+ * Positive attnums are attributes which must be found in the stxkeys, while
+ * negative attnums correspond to an expression number, no attribute number
+ * can be below (0 - numexprs).
+ */
+bool
+statext_dependencies_validate(const MVDependencies *dependencies,
+							  const int2vector *stxkeys,
+							  int numexprs, int elevel)
+{
+	int			attnum_expr_lowbound = 0 - numexprs;
+
+	/* Scan through each dependency entry */
+	for (uint32 i = 0; i < dependencies->ndeps; i++)
+	{
+		const MVDependency *dep = dependencies->deps[i];
+
+		/*
+		 * Cross-check each attribute in a dependency entry with the extended
+		 * stats object definition.
+		 */
+		for (int j = 0; j < dep->nattributes; j++)
+		{
+			AttrNumber	attnum = dep->attributes[j];
+			bool		ok = false;
+
+			if (attnum > 0)
+			{
+				/* attribute number in stxkeys */
+				for (int k = 0; k < stxkeys->dim1; k++)
+				{
+					if (attnum == stxkeys->values[k])
+					{
+						ok = true;
+						break;
+					}
+				}
+			}
+			else if ((attnum < 0) && (attnum >= attnum_expr_lowbound))
+			{
+				/* attribute number for an expression */
+				ok = true;
+			}
+
+			if (!ok)
+			{
+				ereport(elevel,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("could not validate \"%s\" object: invalid attribute number %d found",
+								"pg_dependencies", attnum)));
+				return false;
+			}
+		}
+	}
+
+	return true;
 }
 
 /*
@@ -643,91 +709,6 @@ statext_dependencies_load(Oid mvoid, bool inh)
 	ReleaseSysCache(htup);
 
 	return result;
-}
-
-/*
- * pg_dependencies_in		- input routine for type pg_dependencies.
- *
- * pg_dependencies is real enough to be a table column, but it has no operations
- * of its own, and disallows input too
- */
-Datum
-pg_dependencies_in(PG_FUNCTION_ARGS)
-{
-	/*
-	 * pg_node_list stores the data in binary form and parsing text input is
-	 * not needed, so disallow this.
-	 */
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cannot accept a value of type %s", "pg_dependencies")));
-
-	PG_RETURN_VOID();			/* keep compiler quiet */
-}
-
-/*
- * pg_dependencies		- output routine for type pg_dependencies.
- */
-Datum
-pg_dependencies_out(PG_FUNCTION_ARGS)
-{
-	bytea	   *data = PG_GETARG_BYTEA_PP(0);
-	MVDependencies *dependencies = statext_dependencies_deserialize(data);
-	int			i,
-				j;
-	StringInfoData str;
-
-	initStringInfo(&str);
-	appendStringInfoChar(&str, '{');
-
-	for (i = 0; i < dependencies->ndeps; i++)
-	{
-		MVDependency *dependency = dependencies->deps[i];
-
-		if (i > 0)
-			appendStringInfoString(&str, ", ");
-
-		appendStringInfoChar(&str, '"');
-		for (j = 0; j < dependency->nattributes; j++)
-		{
-			if (j == dependency->nattributes - 1)
-				appendStringInfoString(&str, " => ");
-			else if (j > 0)
-				appendStringInfoString(&str, ", ");
-
-			appendStringInfo(&str, "%d", dependency->attributes[j]);
-		}
-		appendStringInfo(&str, "\": %f", dependency->degree);
-	}
-
-	appendStringInfoChar(&str, '}');
-
-	PG_RETURN_CSTRING(str.data);
-}
-
-/*
- * pg_dependencies_recv		- binary input routine for type pg_dependencies.
- */
-Datum
-pg_dependencies_recv(PG_FUNCTION_ARGS)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cannot accept a value of type %s", "pg_dependencies")));
-
-	PG_RETURN_VOID();			/* keep compiler quiet */
-}
-
-/*
- * pg_dependencies_send		- binary output routine for type pg_dependencies.
- *
- * Functional dependencies are serialized in a bytea value (although the type
- * is named differently), so let's just send that.
- */
-Datum
-pg_dependencies_send(PG_FUNCTION_ARGS)
-{
-	return byteasend(fcinfo);
 }
 
 /*
@@ -796,7 +777,7 @@ dependency_is_compatible_clause(Node *clause, Index relid, AttrNumber *attnum)
 	}
 	else if (IsA(clause, ScalarArrayOpExpr))
 	{
-		/* If it's an scalar array operator, check for Var IN Const. */
+		/* If it's a scalar array operator, check for Var IN Const. */
 		ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) clause;
 
 		/*
@@ -878,7 +859,7 @@ dependency_is_compatible_clause(Node *clause, Index relid, AttrNumber *attnum)
 		 * A boolean expression "x" can be interpreted as "x = true", so
 		 * proceed with seeing if it's a suitable Var.
 		 */
-		clause_expr = (Node *) clause;
+		clause_expr = clause;
 	}
 
 	/*
@@ -931,8 +912,6 @@ static MVDependency *
 find_strongest_dependency(MVDependencies **dependencies, int ndependencies,
 						  Bitmapset *attnums)
 {
-	int			i,
-				j;
 	MVDependency *strongest = NULL;
 
 	/* number of attnums in clauses */
@@ -943,9 +922,9 @@ find_strongest_dependency(MVDependencies **dependencies, int ndependencies,
 	 * fully-matched dependencies. We do the cheap checks first, before
 	 * matching it against the attnums.
 	 */
-	for (i = 0; i < ndependencies; i++)
+	for (int i = 0; i < ndependencies; i++)
 	{
-		for (j = 0; j < dependencies[i]->ndeps; j++)
+		for (uint32 j = 0; j < dependencies[i]->ndeps; j++)
 		{
 			MVDependency *dependency = dependencies[i]->deps[j];
 
@@ -1052,7 +1031,7 @@ clauselist_apply_dependencies(PlannerInfo *root, List *clauses,
 	 * and mark all the corresponding clauses as estimated.
 	 */
 	nattrs = bms_num_members(attnums);
-	attr_sel = (Selectivity *) palloc(sizeof(Selectivity) * nattrs);
+	attr_sel = palloc_array(Selectivity, nattrs);
 
 	attidx = 0;
 	i = -1;
@@ -1164,10 +1143,10 @@ clauselist_apply_dependencies(PlannerInfo *root, List *clauses,
  *
  * Similar to dependency_is_compatible_clause, but doesn't enforce that the
  * expression is a simple Var.  On success, return the matching statistics
- * expression into *expr.
+ * expression into *stat_expr_p.
  */
 static bool
-dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, Node **expr)
+dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, Node **stat_expr_p)
 {
 	ListCell   *lc,
 			   *lc2;
@@ -1191,17 +1170,17 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 	if (is_opclause(clause))
 	{
 		/* If it's an opclause, check for Var = Const or Const = Var. */
-		OpExpr	   *expr = (OpExpr *) clause;
+		OpExpr	   *opexpr = (OpExpr *) clause;
 
 		/* Only expressions with two arguments are candidates. */
-		if (list_length(expr->args) != 2)
+		if (list_length(opexpr->args) != 2)
 			return false;
 
 		/* Make sure non-selected argument is a pseudoconstant. */
-		if (is_pseudo_constant_clause(lsecond(expr->args)))
-			clause_expr = linitial(expr->args);
-		else if (is_pseudo_constant_clause(linitial(expr->args)))
-			clause_expr = lsecond(expr->args);
+		if (is_pseudo_constant_clause(lsecond(opexpr->args)))
+			clause_expr = linitial(opexpr->args);
+		else if (is_pseudo_constant_clause(linitial(opexpr->args)))
+			clause_expr = lsecond(opexpr->args);
 		else
 			return false;
 
@@ -1217,14 +1196,14 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 		 * selectivity functions, and to be more consistent with decisions
 		 * elsewhere in the planner.
 		 */
-		if (get_oprrest(expr->opno) != F_EQSEL)
+		if (get_oprrest(opexpr->opno) != F_EQSEL)
 			return false;
 
 		/* OK to proceed with checking "var" */
 	}
 	else if (IsA(clause, ScalarArrayOpExpr))
 	{
-		/* If it's an scalar array operator, check for Var IN Const. */
+		/* If it's a scalar array operator, check for Var IN Const. */
 		ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) clause;
 
 		/*
@@ -1266,7 +1245,7 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 		BoolExpr   *bool_expr = (BoolExpr *) clause;
 
 		/* start with no expression (we'll use the first match) */
-		*expr = NULL;
+		*stat_expr_p = NULL;
 
 		foreach(lc, bool_expr->args)
 		{
@@ -1280,11 +1259,11 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 													 statlist, &or_expr))
 				return false;
 
-			if (*expr == NULL)
-				*expr = or_expr;
+			if (*stat_expr_p == NULL)
+				*stat_expr_p = or_expr;
 
 			/* ensure all the expressions are the same */
-			if (!equal(or_expr, *expr))
+			if (!equal(or_expr, *stat_expr_p))
 				return false;
 		}
 
@@ -1305,7 +1284,7 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 		 * A boolean expression "x" can be interpreted as "x = true", so
 		 * proceed with seeing if it's a suitable Var.
 		 */
-		clause_expr = (Node *) clause;
+		clause_expr = clause;
 	}
 
 	/*
@@ -1332,7 +1311,7 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 
 			if (equal(clause_expr, stat_expr))
 			{
-				*expr = stat_expr;
+				*stat_expr_p = stat_expr;
 				return true;
 			}
 		}
@@ -1387,7 +1366,6 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	int			total_ndeps;
 	MVDependency **dependencies;
 	int			ndependencies;
-	int			i;
 	AttrNumber	attnum_offset;
 	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 
@@ -1399,8 +1377,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	if (!has_stats_of_kind(rel->statlist, STATS_EXT_DEPENDENCIES))
 		return 1.0;
 
-	list_attnums = (AttrNumber *) palloc(sizeof(AttrNumber) *
-										 list_length(clauses));
+	list_attnums = palloc_array(AttrNumber, list_length(clauses));
 
 	/*
 	 * We allocate space as if every clause was a unique expression, although
@@ -1408,7 +1385,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	 * we'll translate to attnums, and there might be duplicates. But it's
 	 * easier and cheaper to just do one allocation than repalloc later.
 	 */
-	unique_exprs = (Node **) palloc(sizeof(Node *) * list_length(clauses));
+	unique_exprs = palloc_array(Node *, list_length(clauses));
 	unique_exprs_cnt = 0;
 
 	/*
@@ -1458,7 +1435,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 				Assert(expr != NULL);
 
 				/* If the expression is duplicate, use the same attnum. */
-				for (i = 0; i < unique_exprs_cnt; i++)
+				for (int i = 0; i < unique_exprs_cnt; i++)
 				{
 					if (equal(unique_exprs[i], expr))
 					{
@@ -1501,7 +1478,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	 * Now that we know how many expressions there are, we can offset the
 	 * values just enough to build the bitmapset.
 	 */
-	for (i = 0; i < list_length(clauses); i++)
+	for (int i = 0; i < list_length(clauses); i++)
 	{
 		AttrNumber	attnum;
 
@@ -1561,8 +1538,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	 * make it just the right size, but it's likely wasteful anyway thanks to
 	 * moving the freed chunks to freelists etc.
 	 */
-	func_dependencies = (MVDependencies **) palloc(sizeof(MVDependencies *) *
-												   list_length(rel->statlist));
+	func_dependencies = palloc_array(MVDependencies *, list_length(rel->statlist));
 	nfunc_dependencies = 0;
 	total_ndeps = 0;
 
@@ -1607,7 +1583,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 
 		/* count matching expressions */
 		nexprs = 0;
-		for (i = 0; i < unique_exprs_cnt; i++)
+		for (int i = 0; i < unique_exprs_cnt; i++)
 		{
 			ListCell   *lc;
 
@@ -1658,15 +1634,14 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 		 */
 		if (unique_exprs_cnt > 0 || stat->exprs != NIL)
 		{
-			int			ndeps = 0;
+			uint32		ndeps = 0;
 
-			for (i = 0; i < deps->ndeps; i++)
+			for (uint32 i = 0; i < deps->ndeps; i++)
 			{
 				bool		skip = false;
 				MVDependency *dep = deps->deps[i];
-				int			j;
 
-				for (j = 0; j < dep->nattributes; j++)
+				for (int j = 0; j < dep->nattributes; j++)
 				{
 					int			idx;
 					Node	   *expr;
@@ -1785,8 +1760,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	 * Work out which dependencies we can apply, starting with the
 	 * widest/strongest ones, and proceeding to smaller/weaker ones.
 	 */
-	dependencies = (MVDependency **) palloc(sizeof(MVDependency *) *
-											total_ndeps);
+	dependencies = palloc_array(MVDependency *, total_ndeps);
 	ndependencies = 0;
 
 	while (true)
@@ -1818,7 +1792,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 										   list_attnums, estimatedclauses);
 
 	/* free deserialized functional dependencies (and then the array) */
-	for (i = 0; i < nfunc_dependencies; i++)
+	for (int i = 0; i < nfunc_dependencies; i++)
 		pfree(func_dependencies[i]);
 
 	pfree(dependencies);

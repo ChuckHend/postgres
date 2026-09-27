@@ -3,7 +3,7 @@
  * plsample.c
  *	  Handler for the PL/Sample procedural language
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,6 +22,7 @@
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -128,7 +129,7 @@ plsample_func_handler(PG_FUNCTION_ARGS)
 	if (isnull)
 		elog(ERROR, "could not find source text of function \"%s\"",
 			 proname);
-	source = DatumGetCString(DirectFunctionCall1(textout, ret));
+	source = TextDatumGetCString(ret);
 	ereport(NOTICE,
 			(errmsg("source text of function \"%s\": %s",
 					proname, source)));
@@ -141,7 +142,7 @@ plsample_func_handler(PG_FUNCTION_ARGS)
 									 "PL/Sample function",
 									 ALLOCSET_SMALL_SIZES);
 
-	arg_out_func = (FmgrInfo *) palloc0(fcinfo->nargs * sizeof(FmgrInfo));
+	arg_out_func = palloc0_array(FmgrInfo, fcinfo->nargs);
 	numargs = get_func_arg_info(pl_tuple, &argtypes, &argnames, &argmodes);
 
 	/*
@@ -220,8 +221,7 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 		elog(ERROR, "not called by trigger manager");
 
 	/* Connect to the SPI manager */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "could not connect to SPI manager");
+	SPI_connect();
 
 	rc = SPI_register_trigger_data(trigdata);
 	Assert(rc >= 0);
@@ -245,7 +245,7 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 	if (isnull)
 		elog(ERROR, "could not find source text of function \"%s\"",
 			 proname);
-	source = DatumGetCString(DirectFunctionCall1(textout, ret));
+	source = TextDatumGetCString(ret);
 	ereport(NOTICE,
 			(errmsg("source text of function \"%s\": %s",
 					proname, source)));
@@ -337,7 +337,7 @@ plsample_trigger_handler(PG_FUNCTION_ARGS)
 		 */
 		for (int i = 0; i < trigdata->tg_trigger->tgnargs; i++)
 			ereport(NOTICE,
-					(errmsg("trigger arg[%i]: %s", i,
+					(errmsg("trigger arg[%d]: %s", i,
 							trigdata->tg_trigger->tgargs[i])));
 	}
 	PG_CATCH();

@@ -3,7 +3,7 @@
  * pg_proc.h
  *	  definition of the "procedure" system catalog (pg_proc)
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_proc.h
@@ -19,7 +19,7 @@
 
 #include "catalog/genbki.h"
 #include "catalog/objectaddress.h"
-#include "catalog/pg_proc_d.h"
+#include "catalog/pg_proc_d.h"	/* IWYU pragma: export */
 #include "nodes/pg_list.h"
 
 /* ----------------
@@ -27,6 +27,8 @@
  *		typedef struct FormData_pg_proc
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,ProcedureRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	Oid			oid;			/* oid */
@@ -61,7 +63,7 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 	/* security definer */
 	bool		prosecdef BKI_DEFAULT(f);
 
-	/* is it a leak-proof function? */
+	/* is it a leakproof function? */
 	bool		proleakproof BKI_DEFAULT(f);
 
 	/* strict with respect to NULLs? */
@@ -97,19 +99,19 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 #ifdef CATALOG_VARLEN
 
 	/* all param types (NULL if IN only) */
-	Oid			proallargtypes[1] BKI_DEFAULT(_null_) BKI_LOOKUP(pg_type);
+	Oid			proallargtypes[] BKI_DEFAULT(_null_) BKI_LOOKUP(pg_type);
 
 	/* parameter modes (NULL if IN only) */
-	char		proargmodes[1] BKI_DEFAULT(_null_);
+	char		proargmodes[] BKI_DEFAULT(_null_);
 
 	/* parameter names (NULL if no names) */
-	text		proargnames[1] BKI_DEFAULT(_null_);
+	text		proargnames[] BKI_DEFAULT(_null_);
 
 	/* list of expression trees for argument defaults (NULL if none) */
 	pg_node_tree proargdefaults BKI_DEFAULT(_null_);
 
 	/* types for which to apply transforms */
-	Oid			protrftypes[1] BKI_DEFAULT(_null_) BKI_LOOKUP(pg_type);
+	Oid			protrftypes[] BKI_DEFAULT(_null_) BKI_LOOKUP(pg_type);
 
 	/* procedure source text */
 	text		prosrc BKI_FORCE_NOT_NULL;
@@ -121,12 +123,14 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 	pg_node_tree prosqlbody BKI_DEFAULT(_null_);
 
 	/* procedure-local GUC settings */
-	text		proconfig[1] BKI_DEFAULT(_null_);
+	text		proconfig[] BKI_DEFAULT(_null_);
 
 	/* access permissions */
-	aclitem		proacl[1] BKI_DEFAULT(_null_);
+	aclitem		proacl[] BKI_DEFAULT(_null_);
 #endif
 } FormData_pg_proc;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_proc corresponds to a pointer to a tuple with
@@ -139,6 +143,9 @@ DECLARE_TOAST(pg_proc, 2836, 2837);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_proc_oid_index, 2690, ProcedureOidIndexId, pg_proc, btree(oid oid_ops));
 DECLARE_UNIQUE_INDEX(pg_proc_proname_args_nsp_index, 2691, ProcedureNameArgsNspIndexId, pg_proc, btree(proname name_ops, proargtypes oidvector_ops, pronamespace oid_ops));
+
+MAKE_SYSCACHE(PROCOID, pg_proc_oid_index, 128);
+MAKE_SYSCACHE(PROCNAMEARGSNSP, pg_proc_proname_args_nsp_index, 128);
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 
@@ -208,6 +215,7 @@ extern ObjectAddress ProcedureCreate(const char *procedureName,
 									 Datum parameterNames,
 									 List *parameterDefaults,
 									 Datum trftypes,
+									 List *trfoids,
 									 Datum proconfig,
 									 Oid prosupport,
 									 float4 procost,

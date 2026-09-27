@@ -2,7 +2,7 @@
  * tablesync.c
  *	  PostgreSQL logical replication: initial table data synchronization
  *
- * Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/tablesync.c
@@ -107,61 +107,26 @@
 #include "replication/logicallauncher.h"
 #include "replication/logicalrelation.h"
 #include "replication/logicalworker.h"
+#include "replication/origin.h"
+#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/worker_internal.h"
-#include "replication/slot.h"
-#include "replication/origin.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/usercontext.h"
+#include "utils/wait_event.h"
 
-static bool table_states_valid = false;
-static List *table_states_not_ready = NIL;
-static bool FetchTableStates(bool *started_tx);
+List	   *table_states_not_ready = NIL;
 
 static StringInfo copybuf = NULL;
-
-/*
- * Exit routine for synchronization worker.
- */
-static void
-pg_attribute_noreturn()
-finish_sync_worker(void)
-{
-	/*
-	 * Commit any outstanding transaction. This is the usual case, unless
-	 * there was nothing to do for the table.
-	 */
-	if (IsTransactionState())
-	{
-		CommitTransactionCommand();
-		pgstat_report_stat(true);
-	}
-
-	/* And flush all writes. */
-	XLogFlush(GetXLogWriteRecPtr());
-
-	StartTransactionCommand();
-	ereport(LOG,
-			(errmsg("logical replication table synchronization worker for subscription \"%s\", table \"%s\" has finished",
-					MySubscription->name,
-					get_rel_name(MyLogicalRepWorker->relid))));
-	CommitTransactionCommand();
-
-	/* Find the leader apply worker and signal it. */
-	logicalrep_worker_wakeup(MyLogicalRepWorker->subid, InvalidOid);
-
-	/* Stop gracefully */
-	proc_exit(0);
-}
 
 /*
  * Wait until the relation sync state is set in the catalog to the expected
@@ -174,7 +139,7 @@ finish_sync_worker(void)
  * CATCHUP state to SYNCDONE.
  */
 static bool
-wait_for_relation_state_change(Oid relid, char expected_state)
+wait_for_table_state_change(Oid relid, char expected_state)
 {
 	char		state;
 
@@ -197,7 +162,8 @@ wait_for_relation_state_change(Oid relid, char expected_state)
 
 		/* Check if the sync worker is still running and bail if not. */
 		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
-		worker = logicalrep_worker_find(MyLogicalRepWorker->subid, relid,
+		worker = logicalrep_worker_find(WORKERTYPE_TABLESYNC,
+										MyLogicalRepWorker->subid, relid,
 										false);
 		LWLockRelease(LogicalRepWorkerLock);
 		if (!worker)
@@ -244,8 +210,9 @@ wait_for_worker_state_change(char expected_state)
 		 * waiting.
 		 */
 		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
-		worker = logicalrep_worker_find(MyLogicalRepWorker->subid,
-										InvalidOid, false);
+		worker = logicalrep_worker_find(WORKERTYPE_APPLY,
+										MyLogicalRepWorker->subid, InvalidOid,
+										false);
 		if (worker && worker->proc)
 			logicalrep_worker_wakeup_ptr(worker);
 		LWLockRelease(LogicalRepWorkerLock);
@@ -268,15 +235,6 @@ wait_for_worker_state_change(char expected_state)
 }
 
 /*
- * Callback from syscache invalidation.
- */
-void
-invalidate_syncing_table_states(Datum arg, int cacheid, uint32 hashvalue)
-{
-	table_states_valid = false;
-}
-
-/*
  * Handle table synchronization cooperation from the synchronization
  * worker.
  *
@@ -284,8 +242,8 @@ invalidate_syncing_table_states(Datum arg, int cacheid, uint32 hashvalue)
  * predetermined synchronization point in the WAL stream, mark the table as
  * SYNCDONE and finish.
  */
-static void
-process_syncing_tables_for_sync(XLogRecPtr current_lsn)
+void
+ProcessSyncingTablesForSync(XLogRecPtr current_lsn)
 {
 	SpinLockAcquire(&MyLogicalRepWorker->relmutex);
 
@@ -310,7 +268,8 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 		UpdateSubscriptionRelState(MyLogicalRepWorker->subid,
 								   MyLogicalRepWorker->relid,
 								   MyLogicalRepWorker->relstate,
-								   MyLogicalRepWorker->relstate_lsn);
+								   MyLogicalRepWorker->relstate_lsn,
+								   false);
 
 		/*
 		 * End streaming so that LogRepWorkerWalRcvConn can be used to drop
@@ -342,9 +301,9 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 
 		/*
 		 * Start a new transaction to clean up the tablesync origin tracking.
-		 * This transaction will be ended within the finish_sync_worker().
-		 * Now, even, if we fail to remove this here, the apply worker will
-		 * ensure to clean it up afterward.
+		 * This transaction will be ended within the FinishSyncWorker(). Now,
+		 * even, if we fail to remove this here, the apply worker will ensure
+		 * to clean it up afterward.
 		 *
 		 * We need to do this after the table state is set to SYNCDONE.
 		 * Otherwise, if an error occurs while performing the database
@@ -366,9 +325,7 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 		 * This is needed to allow the origin to be dropped.
 		 */
 		replorigin_session_reset();
-		replorigin_session_origin = InvalidRepOriginId;
-		replorigin_session_origin_lsn = InvalidXLogRecPtr;
-		replorigin_session_origin_timestamp = 0;
+		replorigin_xact_clear(true);
 
 		/*
 		 * Drop the tablesync's origin tracking if exists.
@@ -380,7 +337,7 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 		 */
 		replorigin_drop_by_name(originname, true, false);
 
-		finish_sync_worker();
+		FinishSyncWorker();
 	}
 	else
 		SpinLockRelease(&MyLogicalRepWorker->relmutex);
@@ -407,8 +364,8 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
  * If the synchronization position is reached (SYNCDONE), then the table can
  * be marked as READY and is no longer tracked.
  */
-static void
-process_syncing_tables_for_apply(XLogRecPtr current_lsn)
+void
+ProcessSyncingTablesForApply(XLogRecPtr current_lsn)
 {
 	struct tablesync_start_time_mapping
 	{
@@ -417,13 +374,14 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 	};
 	static HTAB *last_start_times = NULL;
 	ListCell   *lc;
-	bool		started_tx = false;
+	bool		started_tx;
 	bool		should_exit = false;
+	Relation	rel = NULL;
 
 	Assert(!IsTransactionState());
 
 	/* We need up-to-date sync state info for subscription tables here. */
-	FetchTableStates(&started_tx);
+	FetchRelationStates(NULL, NULL, &started_tx);
 
 	/*
 	 * Prepare a hash table for tracking last start times of workers, to avoid
@@ -457,6 +415,14 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 	{
 		SubscriptionRelState *rstate = (SubscriptionRelState *) lfirst(lc);
 
+		if (!started_tx)
+		{
+			StartTransactionCommand();
+			started_tx = true;
+		}
+
+		Assert(get_rel_relkind(rstate->relid) != RELKIND_SEQUENCE);
+
 		if (rstate->state == SUBREL_STATE_SYNCDONE)
 		{
 			/*
@@ -470,11 +436,6 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 
 				rstate->state = SUBREL_STATE_READY;
 				rstate->lsn = current_lsn;
-				if (!started_tx)
-				{
-					StartTransactionCommand();
-					started_tx = true;
-				}
 
 				/*
 				 * Remove the tablesync origin tracking if exists.
@@ -486,7 +447,17 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 				 * worker to remove the origin tracking as if there is any
 				 * error while dropping we won't restart it to drop the
 				 * origin. So passing missing_ok = true.
+				 *
+				 * Lock the subscription and origin in the same order as we
+				 * are doing during DDL commands to avoid deadlocks. See
+				 * AlterSubscription_refresh.
 				 */
+				LockSharedObject(SubscriptionRelationId, MyLogicalRepWorker->subid,
+								 0, AccessShareLock);
+
+				if (!rel)
+					rel = table_open(SubscriptionRelRelationId, RowExclusiveLock);
+
 				ReplicationOriginNameForLogicalRep(MyLogicalRepWorker->subid,
 												   rstate->relid,
 												   originname,
@@ -498,7 +469,7 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 				 */
 				UpdateSubscriptionRelState(MyLogicalRepWorker->subid,
 										   rstate->relid, rstate->state,
-										   rstate->lsn);
+										   rstate->lsn, true);
 			}
 		}
 		else
@@ -510,7 +481,8 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 			 */
 			LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
 
-			syncworker = logicalrep_worker_find(MyLogicalRepWorker->subid,
+			syncworker = logicalrep_worker_find(WORKERTYPE_TABLESYNC,
+												MyLogicalRepWorker->subid,
 												rstate->relid, false);
 
 			if (syncworker)
@@ -541,18 +513,35 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 					/* Now safe to release the LWLock */
 					LWLockRelease(LogicalRepWorkerLock);
 
+					if (started_tx)
+					{
+						/*
+						 * We must commit the existing transaction to release
+						 * the existing locks before entering a busy loop.
+						 * This is required to avoid any undetected deadlocks
+						 * due to any existing lock as deadlock detector won't
+						 * be able to detect the waits on the latch.
+						 *
+						 * Also close any tables prior to the commit.
+						 */
+						if (rel)
+						{
+							table_close(rel, NoLock);
+							rel = NULL;
+						}
+						CommitTransactionCommand();
+						pgstat_report_stat(false);
+					}
+
 					/*
 					 * Enter busy loop and wait for synchronization worker to
 					 * reach expected state (or die trying).
 					 */
-					if (!started_tx)
-					{
-						StartTransactionCommand();
-						started_tx = true;
-					}
+					StartTransactionCommand();
+					started_tx = true;
 
-					wait_for_relation_state_change(rstate->relid,
-												   SUBREL_STATE_SYNCDONE);
+					wait_for_table_state_change(rstate->relid,
+												SUBREL_STATE_SYNCDONE);
 				}
 				else
 					LWLockRelease(LogicalRepWorkerLock);
@@ -566,40 +555,27 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 				 */
 				int			nsyncworkers =
 					logicalrep_sync_worker_count(MyLogicalRepWorker->subid);
+				struct tablesync_start_time_mapping *hentry;
+				bool		found;
 
 				/* Now safe to release the LWLock */
 				LWLockRelease(LogicalRepWorkerLock);
 
-				/*
-				 * If there are free sync worker slot(s), start a new sync
-				 * worker for the table.
-				 */
-				if (nsyncworkers < max_sync_workers_per_subscription)
-				{
-					TimestampTz now = GetCurrentTimestamp();
-					struct tablesync_start_time_mapping *hentry;
-					bool		found;
+				hentry = hash_search(last_start_times, &rstate->relid,
+									 HASH_ENTER, &found);
+				if (!found)
+					hentry->last_start_time = 0;
 
-					hentry = hash_search(last_start_times, &rstate->relid,
-										 HASH_ENTER, &found);
-
-					if (!found ||
-						TimestampDifferenceExceeds(hentry->last_start_time, now,
-												   wal_retrieve_retry_interval))
-					{
-						logicalrep_worker_launch(WORKERTYPE_TABLESYNC,
-												 MyLogicalRepWorker->dbid,
-												 MySubscription->oid,
-												 MySubscription->name,
-												 MyLogicalRepWorker->userid,
-												 rstate->relid,
-												 DSM_HANDLE_INVALID);
-						hentry->last_start_time = now;
-					}
-				}
+				launch_sync_worker(WORKERTYPE_TABLESYNC, nsyncworkers,
+								   rstate->relid, &hentry->last_start_time);
 			}
 		}
 	}
+
+	/* Close table if opened */
+	if (rel)
+		table_close(rel, NoLock);
+
 
 	if (started_tx)
 	{
@@ -640,37 +616,6 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 		ApplyLauncherForgetWorkerStartTime(MySubscription->oid);
 
 		proc_exit(0);
-	}
-}
-
-/*
- * Process possible state change(s) of tables that are being synchronized.
- */
-void
-process_syncing_tables(XLogRecPtr current_lsn)
-{
-	switch (MyLogicalRepWorker->type)
-	{
-		case WORKERTYPE_PARALLEL_APPLY:
-
-			/*
-			 * Skip for parallel apply workers because they only operate on
-			 * tables that are in a READY state. See pa_can_start() and
-			 * should_apply_changes_for_rel().
-			 */
-			break;
-
-		case WORKERTYPE_TABLESYNC:
-			process_syncing_tables_for_sync(current_lsn);
-			break;
-
-		case WORKERTYPE_APPLY:
-			process_syncing_tables_for_apply(current_lsn);
-			break;
-
-		case WORKERTYPE_UNKNOWN:
-			/* Should never happen. */
-			elog(ERROR, "Unknown worker type");
 	}
 }
 
@@ -743,7 +688,7 @@ copy_read_data(void *outbuf, int minread, int maxread)
 				if (avail > maxread)
 					avail = maxread;
 				memcpy(outbuf, &copybuf->data[copybuf->cursor], avail);
-				outbuf = (void *) ((char *) outbuf + avail);
+				outbuf = (char *) outbuf + avail;
 				copybuf->cursor += avail;
 				maxread -= avail;
 				bytesread += avail;
@@ -770,23 +715,27 @@ copy_read_data(void *outbuf, int minread, int maxread)
 
 /*
  * Get information about remote relation in similar fashion the RELATION
- * message provides during replication. This function also returns the relation
- * qualifications to be used in the COPY command.
+ * message provides during replication.
+ *
+ * This function also returns (a) the relation qualifications to be used in
+ * the COPY command, and (b) whether the remote relation has published any
+ * generated column.
  */
 static void
-fetch_remote_table_info(char *nspname, char *relname,
-						LogicalRepRelation *lrel, List **qual)
+fetch_remote_table_info(char *nspname, char *relname, LogicalRepRelation *lrel,
+						List **qual, bool *gencol_published)
 {
 	WalRcvExecResult *res;
 	StringInfoData cmd;
 	TupleTableSlot *slot;
 	Oid			tableRow[] = {OIDOID, CHAROID, CHAROID};
-	Oid			attrRow[] = {INT2OID, TEXTOID, OIDOID, BOOLOID};
+	Oid			attrRow[] = {INT2OID, TEXTOID, OIDOID, BOOLOID, BOOLOID};
 	Oid			qualRow[] = {TEXTOID};
 	bool		isnull;
 	int			natt;
-	ListCell   *lc;
+	StringInfo	pub_names = NULL;
 	Bitmapset  *included_cols = NULL;
+	int			server_version = walrcv_server_version(LogRepWorkerWalRcvConn);
 
 	lrel->nspname = nspname;
 	lrel->relname = relname;
@@ -834,37 +783,50 @@ fetch_remote_table_info(char *nspname, char *relname,
 	 * We need to do this before fetching info about column names and types,
 	 * so that we can skip columns that should not be replicated.
 	 */
-	if (walrcv_server_version(LogRepWorkerWalRcvConn) >= 150000)
+	if (server_version >= 150000)
 	{
 		WalRcvExecResult *pubres;
 		TupleTableSlot *tslot;
 		Oid			attrsRow[] = {INT2VECTOROID};
-		StringInfoData pub_names;
 
-		initStringInfo(&pub_names);
-		foreach(lc, MySubscription->publications)
-		{
-			if (foreach_current_index(lc) > 0)
-				appendStringInfoString(&pub_names, ", ");
-			appendStringInfoString(&pub_names, quote_literal_cstr(strVal(lfirst(lc))));
-		}
+		/* Build the pub_names comma-separated string. */
+		pub_names = makeStringInfo();
+		GetPublicationsStr(MySubscription->publications, pub_names, true);
 
 		/*
 		 * Fetch info about column lists for the relation (from all the
 		 * publications).
 		 */
 		resetStringInfo(&cmd);
-		appendStringInfo(&cmd,
-						 "SELECT DISTINCT"
-						 "  (CASE WHEN (array_length(gpt.attrs, 1) = c.relnatts)"
-						 "   THEN NULL ELSE gpt.attrs END)"
-						 "  FROM pg_publication p,"
-						 "  LATERAL pg_get_publication_tables(p.pubname) gpt,"
-						 "  pg_class c"
-						 " WHERE gpt.relid = %u AND c.oid = gpt.relid"
-						 "   AND p.pubname IN ( %s )",
-						 lrel->remoteid,
-						 pub_names.data);
+
+		if (server_version >= 190000)
+		{
+			/*
+			 * We can pass both publication names and relid to
+			 * pg_get_publication_tables() since version 19.
+			 */
+			appendStringInfo(&cmd,
+							 "SELECT DISTINCT"
+							 "  (CASE WHEN (array_length(gpt.attrs, 1) = c.relnatts)"
+							 "   THEN NULL ELSE gpt.attrs END)"
+							 "  FROM pg_get_publication_tables(ARRAY[%s], %u) gpt,"
+							 "  pg_class c"
+							 " WHERE c.oid = gpt.relid",
+							 pub_names->data,
+							 lrel->remoteid);
+		}
+		else
+			appendStringInfo(&cmd,
+							 "SELECT DISTINCT"
+							 "  (CASE WHEN (array_length(gpt.attrs, 1) = c.relnatts)"
+							 "   THEN NULL ELSE gpt.attrs END)"
+							 "  FROM pg_publication p,"
+							 "  LATERAL pg_get_publication_tables(p.pubname) gpt,"
+							 "  pg_class c"
+							 " WHERE gpt.relid = %u AND c.oid = gpt.relid"
+							 "   AND p.pubname IN ( %s )",
+							 lrel->remoteid,
+							 pub_names->data);
 
 		pubres = walrcv_exec(LogRepWorkerWalRcvConn, cmd.data,
 							 lengthof(attrsRow), attrsRow);
@@ -878,7 +840,7 @@ fetch_remote_table_info(char *nspname, char *relname,
 		/*
 		 * We don't support the case where the column list is different for
 		 * the same table when combining publications. See comments atop
-		 * fetch_table_list. So there should be only one row returned.
+		 * fetch_relation_list. So there should be only one row returned.
 		 * Although we already checked this when creating the subscription, we
 		 * still need to check here in case the column list was changed after
 		 * creating the subscription and before the sync worker is started.
@@ -919,19 +881,23 @@ fetch_remote_table_info(char *nspname, char *relname,
 		ExecDropSingleTupleTableSlot(tslot);
 
 		walrcv_clear_result(pubres);
-
-		pfree(pub_names.data);
 	}
 
 	/*
 	 * Now fetch column names and types.
 	 */
 	resetStringInfo(&cmd);
+	appendStringInfoString(&cmd,
+						   "SELECT a.attnum,"
+						   "       a.attname,"
+						   "       a.atttypid,"
+						   "       a.attnum = ANY(i.indkey)");
+
+	/* Generated columns can be replicated since version 18. */
+	if (server_version >= 180000)
+		appendStringInfoString(&cmd, ", a.attgenerated != ''");
+
 	appendStringInfo(&cmd,
-					 "SELECT a.attnum,"
-					 "       a.attname,"
-					 "       a.atttypid,"
-					 "       a.attnum = ANY(i.indkey)"
 					 "  FROM pg_catalog.pg_attribute a"
 					 "  LEFT JOIN pg_catalog.pg_index i"
 					 "       ON (i.indexrelid = pg_get_replica_identity_index(%u))"
@@ -940,11 +906,11 @@ fetch_remote_table_info(char *nspname, char *relname,
 					 "   AND a.attrelid = %u"
 					 " ORDER BY a.attnum",
 					 lrel->remoteid,
-					 (walrcv_server_version(LogRepWorkerWalRcvConn) >= 120000 ?
+					 (server_version >= 120000 && server_version < 180000 ?
 					  "AND a.attgenerated = ''" : ""),
 					 lrel->remoteid);
 	res = walrcv_exec(LogRepWorkerWalRcvConn, cmd.data,
-					  lengthof(attrRow), attrRow);
+					  server_version >= 180000 ? lengthof(attrRow) : lengthof(attrRow) - 1, attrRow);
 
 	if (res->status != WALRCV_OK_TUPLES)
 		ereport(ERROR,
@@ -953,8 +919,8 @@ fetch_remote_table_info(char *nspname, char *relname,
 						nspname, relname, res->err)));
 
 	/* We don't know the number of rows coming, so allocate enough space. */
-	lrel->attnames = palloc0(MaxTupleAttributeNumber * sizeof(char *));
-	lrel->atttyps = palloc0(MaxTupleAttributeNumber * sizeof(Oid));
+	lrel->attnames = palloc0_array(char *, MaxTupleAttributeNumber);
+	lrel->atttyps = palloc0_array(Oid, MaxTupleAttributeNumber);
 	lrel->attkeys = NULL;
 
 	/*
@@ -988,6 +954,13 @@ fetch_remote_table_info(char *nspname, char *relname,
 		if (DatumGetBool(slot_getattr(slot, 4, &isnull)))
 			lrel->attkeys = bms_add_member(lrel->attkeys, natt);
 
+		/* Remember if the remote table has published any generated column. */
+		if (server_version >= 180000 && !(*gencol_published))
+		{
+			*gencol_published = DatumGetBool(slot_getattr(slot, 5, &isnull));
+			Assert(!isnull);
+		}
+
 		/* Should never happen. */
 		if (++natt >= MaxTupleAttributeNumber)
 			elog(ERROR, "too many columns in remote table \"%s.%s\"",
@@ -1020,32 +993,35 @@ fetch_remote_table_info(char *nspname, char *relname,
 	 * 3) one of the subscribed publications is declared as TABLES IN SCHEMA
 	 * that includes this relation
 	 */
-	if (walrcv_server_version(LogRepWorkerWalRcvConn) >= 150000)
+	if (server_version >= 150000)
 	{
-		StringInfoData pub_names;
-
-		/* Build the pubname list. */
-		initStringInfo(&pub_names);
-		foreach(lc, MySubscription->publications)
-		{
-			char	   *pubname = strVal(lfirst(lc));
-
-			if (foreach_current_index(lc) > 0)
-				appendStringInfoString(&pub_names, ", ");
-
-			appendStringInfoString(&pub_names, quote_literal_cstr(pubname));
-		}
+		/* Reuse the already-built pub_names. */
+		Assert(pub_names != NULL);
 
 		/* Check for row filters. */
 		resetStringInfo(&cmd);
-		appendStringInfo(&cmd,
-						 "SELECT DISTINCT pg_get_expr(gpt.qual, gpt.relid)"
-						 "  FROM pg_publication p,"
-						 "  LATERAL pg_get_publication_tables(p.pubname) gpt"
-						 " WHERE gpt.relid = %u"
-						 "   AND p.pubname IN ( %s )",
-						 lrel->remoteid,
-						 pub_names.data);
+
+		if (server_version >= 190000)
+		{
+			/*
+			 * We can pass both publication names and relid to
+			 * pg_get_publication_tables() since version 19.
+			 */
+			appendStringInfo(&cmd,
+							 "SELECT DISTINCT pg_get_expr(gpt.qual, gpt.relid)"
+							 "  FROM pg_get_publication_tables(ARRAY[%s], %u) gpt",
+							 pub_names->data,
+							 lrel->remoteid);
+		}
+		else
+			appendStringInfo(&cmd,
+							 "SELECT DISTINCT pg_get_expr(gpt.qual, gpt.relid)"
+							 "  FROM pg_publication p,"
+							 "  LATERAL pg_get_publication_tables(p.pubname) gpt"
+							 " WHERE gpt.relid = %u"
+							 "   AND p.pubname IN ( %s )",
+							 lrel->remoteid,
+							 pub_names->data);
 
 		res = walrcv_exec(LogRepWorkerWalRcvConn, cmd.data, 1, qualRow);
 
@@ -1084,6 +1060,7 @@ fetch_remote_table_info(char *nspname, char *relname,
 		ExecDropSingleTupleTableSlot(slot);
 
 		walrcv_clear_result(res);
+		destroyStringInfo(pub_names);
 	}
 
 	pfree(cmd.data);
@@ -1106,10 +1083,13 @@ copy_table(Relation rel)
 	List	   *attnamelist;
 	ParseState *pstate;
 	List	   *options = NIL;
+	bool		gencol_published = false;
+	int			server_version = walrcv_server_version(LogRepWorkerWalRcvConn);
 
 	/* Get the publisher relation info. */
 	fetch_remote_table_info(get_namespace_name(RelationGetNamespace(rel)),
-							RelationGetRelationName(rel), &lrel, &qual);
+							RelationGetRelationName(rel), &lrel, &qual,
+							&gencol_published);
 
 	/* Put the relation into relmap. */
 	logicalrep_relmap_update(&lrel);
@@ -1121,33 +1101,52 @@ copy_table(Relation rel)
 	/* Start copy on the publisher. */
 	initStringInfo(&cmd);
 
-	/* Regular table with no row filter */
-	if (lrel.relkind == RELKIND_RELATION && qual == NIL)
+	/*
+	 * Regular or partitioned table with no row filter or generated columns.
+	 *
+	 * "COPY table TO" on a partitioned table is supported since v19.
+	 */
+	if ((lrel.relkind == RELKIND_RELATION ||
+		 (lrel.relkind == RELKIND_PARTITIONED_TABLE && server_version >= 190000)) &&
+		qual == NIL && !gencol_published)
 	{
-		appendStringInfo(&cmd, "COPY %s (",
+		appendStringInfo(&cmd, "COPY %s",
 						 quote_qualified_identifier(lrel.nspname, lrel.relname));
 
-		/*
-		 * XXX Do we need to list the columns in all cases? Maybe we're
-		 * replicating all columns?
-		 */
-		for (int i = 0; i < lrel.natts; i++)
+		/* If the table has columns, then specify the columns */
+		if (lrel.natts)
 		{
-			if (i > 0)
-				appendStringInfoString(&cmd, ", ");
+			appendStringInfoString(&cmd, " (");
 
-			appendStringInfoString(&cmd, quote_identifier(lrel.attnames[i]));
+			/*
+			 * XXX Do we need to list the columns in all cases? Maybe we're
+			 * replicating all columns?
+			 */
+			for (int i = 0; i < lrel.natts; i++)
+			{
+				if (i > 0)
+					appendStringInfoString(&cmd, ", ");
+
+				appendStringInfoString(&cmd, quote_identifier(lrel.attnames[i]));
+			}
+
+			appendStringInfoChar(&cmd, ')');
 		}
 
-		appendStringInfoString(&cmd, ") TO STDOUT");
+		appendStringInfoString(&cmd, " TO STDOUT");
 	}
 	else
 	{
 		/*
 		 * For non-tables and tables with row filters, we need to do COPY
-		 * (SELECT ...), but we can't just do SELECT * because we need to not
-		 * copy generated columns. For tables with any row filters, build a
-		 * SELECT query with OR'ed row filters for COPY.
+		 * (SELECT ...), but we can't just do SELECT * because we may need to
+		 * copy only subset of columns including generated columns. For tables
+		 * with any row filters, build a SELECT query with OR'ed row filters
+		 * for COPY.
+		 *
+		 * We also need to use this same COPY (SELECT ...) syntax when
+		 * generated columns are published, because copy of generated columns
+		 * is not supported by the normal COPY.
 		 */
 		appendStringInfoString(&cmd, "COPY (SELECT ");
 		for (int i = 0; i < lrel.natts; i++)
@@ -1189,8 +1188,7 @@ copy_table(Relation rel)
 	 * Prior to v16, initial table synchronization will use text format even
 	 * if the binary option is enabled for a subscription.
 	 */
-	if (walrcv_server_version(LogRepWorkerWalRcvConn) >= 160000 &&
-		MySubscription->binary)
+	if (server_version >= 160000 && MySubscription->binary)
 	{
 		appendStringInfoString(&cmd, " WITH (FORMAT binary)");
 		options = list_make1(makeDefElem("format",
@@ -1217,6 +1215,7 @@ copy_table(Relation rel)
 
 	/* Do the copy */
 	(void) CopyFrom(cstate);
+	EndCopyFrom(cstate);
 
 	logicalrep_rel_close(relmapentry, NoLock);
 }
@@ -1265,7 +1264,7 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	AclResult	aclresult;
 	WalRcvExecResult *res;
 	char		originname[NAMEDATALEN];
-	RepOriginId originid;
+	ReplOriginId originid;
 	UserContext ucxt;
 	bool		must_use_password;
 	bool		run_as_owner;
@@ -1275,13 +1274,11 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	relstate = GetSubscriptionRelState(MyLogicalRepWorker->subid,
 									   MyLogicalRepWorker->relid,
 									   &relstate_lsn);
+	CommitTransactionCommand();
 
 	/* Is the use of a password mandatory? */
 	must_use_password = MySubscription->passwordrequired &&
-		!superuser_arg(MySubscription->owner);
-
-	/* Note that the superuser_arg call can access the DB */
-	CommitTransactionCommand();
+		!MySubscription->ownersuperuser;
 
 	SpinLockAcquire(&MyLogicalRepWorker->relmutex);
 	MyLogicalRepWorker->relstate = relstate;
@@ -1297,7 +1294,7 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 		case SUBREL_STATE_SYNCDONE:
 		case SUBREL_STATE_READY:
 		case SUBREL_STATE_UNKNOWN:
-			finish_sync_worker();	/* doesn't return */
+			FinishSyncWorker(); /* doesn't return */
 	}
 
 	/* Calculate the name of the tablesync slot. */
@@ -1313,13 +1310,14 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	 * so that synchronous replication can distinguish them.
 	 */
 	LogRepWorkerWalRcvConn =
-		walrcv_connect(MySubscription->conninfo, true,
+		walrcv_connect(MySubscriptionConninfo, true, true,
 					   must_use_password,
 					   slotname, &err);
 	if (LogRepWorkerWalRcvConn == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not connect to the publisher: %s", err)));
+				 errmsg("table synchronization worker for subscription \"%s\" could not connect to the publisher: %s",
+						MySubscription->name, err)));
 
 	Assert(MyLogicalRepWorker->relstate == SUBREL_STATE_INIT ||
 		   MyLogicalRepWorker->relstate == SUBREL_STATE_DATASYNC ||
@@ -1360,7 +1358,7 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 		 */
 		originid = replorigin_by_name(originname, false);
 		replorigin_session_setup(originid, 0);
-		replorigin_session_origin = originid;
+		replorigin_xact_state.origin = originid;
 		*origin_startpos = replorigin_session_get_progress(false);
 
 		CommitTransactionCommand();
@@ -1373,12 +1371,27 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	MyLogicalRepWorker->relstate_lsn = InvalidXLogRecPtr;
 	SpinLockRelease(&MyLogicalRepWorker->relmutex);
 
-	/* Update the state and make it visible to others. */
+	/*
+	 * Update the state, create the replication origin, and make them visible
+	 * to others.
+	 */
 	StartTransactionCommand();
 	UpdateSubscriptionRelState(MyLogicalRepWorker->subid,
 							   MyLogicalRepWorker->relid,
 							   MyLogicalRepWorker->relstate,
-							   MyLogicalRepWorker->relstate_lsn);
+							   MyLogicalRepWorker->relstate_lsn,
+							   false);
+
+	/*
+	 * Create the replication origin in a separate transaction from the one
+	 * that sets up the origin in shared memory. This prevents the risk that
+	 * changes to the origin in shared memory cannot be rolled back if the
+	 * transaction aborts.
+	 */
+	originid = replorigin_by_name(originname, true);
+	if (!OidIsValid(originid))
+		originid = replorigin_create(originname);
+
 	CommitTransactionCommand();
 	pgstat_report_stat(true);
 
@@ -1414,44 +1427,29 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	 */
 	walrcv_create_slot(LogRepWorkerWalRcvConn,
 					   slotname, false /* permanent */ , false /* two_phase */ ,
+					   MySubscription->failover,
 					   CRS_USE_SNAPSHOT, origin_startpos);
 
 	/*
-	 * Setup replication origin tracking. The purpose of doing this before the
-	 * copy is to avoid doing the copy again due to any error in setting up
-	 * origin tracking.
+	 * Advance the origin to the LSN got from walrcv_create_slot and then set
+	 * up the origin. The advancement is WAL logged for the purpose of
+	 * recovery. Locks are to prevent the replication origin from vanishing
+	 * while advancing.
+	 *
+	 * The purpose of doing these before the copy is to avoid doing the copy
+	 * again due to any error in advancing or setting up origin tracking.
 	 */
-	originid = replorigin_by_name(originname, true);
-	if (!OidIsValid(originid))
-	{
-		/*
-		 * Origin tracking does not exist, so create it now.
-		 *
-		 * Then advance to the LSN got from walrcv_create_slot. This is WAL
-		 * logged for the purpose of recovery. Locks are to prevent the
-		 * replication origin from vanishing while advancing.
-		 */
-		originid = replorigin_create(originname);
+	LockRelationOid(ReplicationOriginRelationId, RowExclusiveLock);
+	replorigin_advance(originid, *origin_startpos, InvalidXLogRecPtr,
+					   true /* go backward */ , true /* WAL log */ );
+	UnlockRelationOid(ReplicationOriginRelationId, RowExclusiveLock);
 
-		LockRelationOid(ReplicationOriginRelationId, RowExclusiveLock);
-		replorigin_advance(originid, *origin_startpos, InvalidXLogRecPtr,
-						   true /* go backward */ , true /* WAL log */ );
-		UnlockRelationOid(ReplicationOriginRelationId, RowExclusiveLock);
-
-		replorigin_session_setup(originid, 0);
-		replorigin_session_origin = originid;
-	}
-	else
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("replication origin \"%s\" already exists",
-						originname)));
-	}
+	replorigin_session_setup(originid, 0);
+	replorigin_xact_state.origin = originid;
 
 	/*
-	 * Make sure that the copy command runs as the table owner, unless the
-	 * user has opted out of that behaviour.
+	 * If the user did not opt to run as the owner of the subscription
+	 * ('run_as_owner'), then copy the table as the owner of the table.
 	 */
 	run_as_owner = MySubscription->runasowner;
 	if (!run_as_owner)
@@ -1510,14 +1508,15 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	UpdateSubscriptionRelState(MyLogicalRepWorker->subid,
 							   MyLogicalRepWorker->relid,
 							   SUBREL_STATE_FINISHEDCOPY,
-							   MyLogicalRepWorker->relstate_lsn);
+							   MyLogicalRepWorker->relstate_lsn,
+							   false);
 
 	CommitTransactionCommand();
 
 copy_table_done:
 
 	elog(DEBUG1,
-		 "LogicalRepSyncTableStart: '%s' origin_startpos lsn %X/%X",
+		 "LogicalRepSyncTableStart: '%s' origin_startpos lsn %X/%08X",
 		 originname, LSN_FORMAT_ARGS(*origin_startpos));
 
 	/*
@@ -1534,67 +1533,6 @@ copy_table_done:
 	 */
 	wait_for_worker_state_change(SUBREL_STATE_CATCHUP);
 	return slotname;
-}
-
-/*
- * Common code to fetch the up-to-date sync state info into the static lists.
- *
- * Returns true if subscription has 1 or more tables, else false.
- *
- * Note: If this function started the transaction (indicated by the parameter)
- * then it is the caller's responsibility to commit it.
- */
-static bool
-FetchTableStates(bool *started_tx)
-{
-	static bool has_subrels = false;
-
-	*started_tx = false;
-
-	if (!table_states_valid)
-	{
-		MemoryContext oldctx;
-		List	   *rstates;
-		ListCell   *lc;
-		SubscriptionRelState *rstate;
-
-		/* Clean the old lists. */
-		list_free_deep(table_states_not_ready);
-		table_states_not_ready = NIL;
-
-		if (!IsTransactionState())
-		{
-			StartTransactionCommand();
-			*started_tx = true;
-		}
-
-		/* Fetch all non-ready tables. */
-		rstates = GetSubscriptionRelations(MySubscription->oid, true);
-
-		/* Allocate the tracking info in a permanent memory context. */
-		oldctx = MemoryContextSwitchTo(CacheMemoryContext);
-		foreach(lc, rstates)
-		{
-			rstate = palloc(sizeof(SubscriptionRelState));
-			memcpy(rstate, lfirst(lc), sizeof(SubscriptionRelState));
-			table_states_not_ready = lappend(table_states_not_ready, rstate);
-		}
-		MemoryContextSwitchTo(oldctx);
-
-		/*
-		 * Does the subscription have tables?
-		 *
-		 * If there were not-READY relations found then we know it does. But
-		 * if table_states_not_ready was empty we still need to check again to
-		 * see if there are 0 tables.
-		 */
-		has_subrels = (table_states_not_ready != NIL) ||
-			HasSubscriptionRelations(MySubscription->oid);
-
-		table_states_valid = true;
-	}
-
-	return has_subrels;
 }
 
 /*
@@ -1629,7 +1567,7 @@ start_table_sync(XLogRecPtr *origin_startpos, char **slotname)
 			 * idle state.
 			 */
 			AbortOutOfAnyTransaction();
-			pgstat_report_subscription_error(MySubscription->oid, false);
+			pgstat_report_subscription_error(MySubscription->oid);
 
 			PG_RE_THROW();
 		}
@@ -1648,7 +1586,7 @@ start_table_sync(XLogRecPtr *origin_startpos, char **slotname)
  * and starts streaming to catchup with apply worker.
  */
 static void
-run_tablesync_worker()
+run_tablesync_worker(void)
 {
 	char		originname[NAMEDATALEN];
 	XLogRecPtr	origin_startpos = InvalidXLogRecPtr;
@@ -1674,7 +1612,7 @@ run_tablesync_worker()
 
 /* Logical Replication Tablesync worker entry point */
 void
-TablesyncWorkerMain(Datum main_arg)
+TableSyncWorkerMain(Datum main_arg)
 {
 	int			worker_slot = DatumGetInt32(main_arg);
 
@@ -1682,7 +1620,7 @@ TablesyncWorkerMain(Datum main_arg)
 
 	run_tablesync_worker();
 
-	finish_sync_worker();
+	FinishSyncWorker();
 }
 
 /*
@@ -1696,11 +1634,11 @@ TablesyncWorkerMain(Datum main_arg)
 bool
 AllTablesyncsReady(void)
 {
-	bool		started_tx = false;
-	bool		has_subrels = false;
+	bool		started_tx;
+	bool		has_tables;
 
 	/* We need up-to-date sync state info for subscription tables here. */
-	has_subrels = FetchTableStates(&started_tx);
+	FetchRelationStates(&has_tables, NULL, &started_tx);
 
 	if (started_tx)
 	{
@@ -1712,7 +1650,33 @@ AllTablesyncsReady(void)
 	 * Return false when there are no tables in subscription or not all tables
 	 * are in ready state; true otherwise.
 	 */
-	return has_subrels && (table_states_not_ready == NIL);
+	return has_tables && (table_states_not_ready == NIL);
+}
+
+/*
+ * Return whether the subscription currently has any tables.
+ *
+ * Note: Unlike HasSubscriptionTables(), this function relies on cached
+ * information for subscription tables. Additionally, it should not be
+ * invoked outside of apply or tablesync workers, as MySubscription must be
+ * initialized first.
+ */
+bool
+HasSubscriptionTablesCached(void)
+{
+	bool		started_tx;
+	bool		has_tables;
+
+	/* We need up-to-date subscription tables info here */
+	FetchRelationStates(&has_tables, NULL, &started_tx);
+
+	if (started_tx)
+	{
+		CommitTransactionCommand();
+		pgstat_report_stat(true);
+	}
+
+	return has_tables;
 }
 
 /*

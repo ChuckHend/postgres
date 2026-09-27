@@ -11,13 +11,11 @@
 #include "postgres.h"
 
 #include "access/xact.h"
-#include "backup/basebackup.h"
 #include "backup/basebackup_sink.h"
 #include "catalog/pg_authid.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
-#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 typedef struct bbsink_server
@@ -61,7 +59,7 @@ static const bbsink_ops bbsink_server_ops = {
 bbsink *
 bbsink_server_new(bbsink *next, char *pathname)
 {
-	bbsink_server *sink = palloc0(sizeof(bbsink_server));
+	bbsink_server *sink = palloc0_object(bbsink_server);
 
 	*((const bbsink_ops **) &sink->base.bbs_ops) = &bbsink_server_ops;
 	sink->pathname = pathname;
@@ -162,7 +160,7 @@ static void
 bbsink_server_archive_contents(bbsink *sink, size_t len)
 {
 	bbsink_server *mysink = (bbsink_server *) sink;
-	int			nbytes;
+	ssize_t		nbytes;
 
 	nbytes = FileWrite(mysink->file, mysink->base.bbs_buffer, len,
 					   mysink->filepos, WAIT_EVENT_BASEBACKUP_WRITE);
@@ -178,9 +176,9 @@ bbsink_server_archive_contents(bbsink *sink, size_t len)
 		/* short write: complain appropriately */
 		ereport(ERROR,
 				(errcode(ERRCODE_DISK_FULL),
-				 errmsg("could not write file \"%s\": wrote only %d of %d bytes at offset %u",
+				 errmsg("could not write file \"%s\": wrote only %zd of %zu bytes at offset %lld",
 						FilePathName(mysink->file),
-						nbytes, (int) len, (unsigned) mysink->filepos),
+						nbytes, len, (long long) mysink->filepos),
 				 errhint("Check free disk space.")));
 	}
 
@@ -255,7 +253,7 @@ static void
 bbsink_server_manifest_contents(bbsink *sink, size_t len)
 {
 	bbsink_server *mysink = (bbsink_server *) sink;
-	int			nbytes;
+	ssize_t		nbytes;
 
 	nbytes = FileWrite(mysink->file, mysink->base.bbs_buffer, len,
 					   mysink->filepos, WAIT_EVENT_BASEBACKUP_WRITE);
@@ -271,9 +269,9 @@ bbsink_server_manifest_contents(bbsink *sink, size_t len)
 		/* short write: complain appropriately */
 		ereport(ERROR,
 				(errcode(ERRCODE_DISK_FULL),
-				 errmsg("could not write file \"%s\": wrote only %d of %d bytes at offset %u",
+				 errmsg("could not write file \"%s\": wrote only %zd of %zu bytes at offset %lld",
 						FilePathName(mysink->file),
-						nbytes, (int) len, (unsigned) mysink->filepos),
+						nbytes, len, (long long) mysink->filepos),
 				 errhint("Check free disk space.")));
 	}
 

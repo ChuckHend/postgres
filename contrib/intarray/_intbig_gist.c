@@ -3,18 +3,17 @@
  */
 #include "postgres.h"
 
-#include <math.h>
-
 #include "_int.h"
 #include "access/gist.h"
 #include "access/reloptions.h"
 #include "access/stratnum.h"
+#include "common/int.h"
 #include "port/pg_bitutils.h"
 
 #define GETENTRY(vec,pos) ((GISTTYPE *) DatumGetPointer((vec)->vector[(pos)].key))
 /*
-** _intbig methods
-*/
+ * _intbig methods
+ */
 PG_FUNCTION_INFO_V1(g_intbig_consistent);
 PG_FUNCTION_INFO_V1(g_intbig_compress);
 PG_FUNCTION_INFO_V1(g_intbig_decompress);
@@ -173,7 +172,7 @@ g_intbig_compress(PG_FUNCTION_ARGS)
 			ptr++;
 		}
 
-		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(res),
 					  entry->rel, entry->page,
 					  entry->offset, false);
@@ -194,7 +193,7 @@ g_intbig_compress(PG_FUNCTION_ARGS)
 		}
 
 		res = _intbig_alloc(true, siglen, sign);
-		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(res),
 					  entry->rel, entry->page,
 					  entry->offset, false);
@@ -312,7 +311,8 @@ typedef struct
 static int
 comparecost(const void *a, const void *b)
 {
-	return ((const SPLITCOST *) a)->cost - ((const SPLITCOST *) b)->cost;
+	return pg_cmp_s32(((const SPLITCOST *) a)->cost,
+					  ((const SPLITCOST *) b)->cost);
 }
 
 
@@ -383,7 +383,7 @@ g_intbig_picksplit(PG_FUNCTION_ARGS)
 
 	maxoff = OffsetNumberNext(maxoff);
 	/* sort before ... */
-	costvector = (SPLITCOST *) palloc(sizeof(SPLITCOST) * maxoff);
+	costvector = palloc_array(SPLITCOST, maxoff);
 	for (j = FirstOffsetNumber; j <= maxoff; j = OffsetNumberNext(j))
 	{
 		costvector[j - 1].pos = j;
@@ -465,8 +465,9 @@ g_intbig_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	ArrayType  *query = PG_GETARG_ARRAYTYPE_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	int			siglen = GET_SIGLEN();
 	bool		retval;

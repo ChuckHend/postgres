@@ -96,7 +96,7 @@ convert_to_utf8(text *src)
 static void
 clear_and_pfree(text *p)
 {
-	px_memset(p, 0, VARSIZE_ANY(p));
+	explicit_bzero(p, VARSIZE_ANY(p));
 	pfree(p);
 }
 
@@ -192,6 +192,8 @@ set_arg(PGP_Context *ctx, char *key, char *val,
 		res = pgp_set_convert_crlf(ctx, atoi(val));
 	else if (strcmp(key, "unicode-mode") == 0)
 		res = pgp_set_unicode_mode(ctx, atoi(val));
+	else if (strcmp(key, "ignore-cipher-failure") == 0)
+		res = pgp_set_ignore_cipher_failure(ctx, atoi(val));
 
 	/*
 	 * The remaining options are for debugging/testing and are therefore not
@@ -553,15 +555,15 @@ decrypt_internal(int is_pubenc, int need_text, text *data,
 Datum
 pgp_sym_encrypt_bytea(PG_FUNCTION_ARGS)
 {
-	bytea	   *data,
-			   *key;
+	bytea	   *data;
 	text	   *arg = NULL;
-	text	   *res;
+	text	   *res,
+			   *key;
 
 	data = PG_GETARG_BYTEA_PP(0);
-	key = PG_GETARG_BYTEA_PP(1);
+	key = PG_GETARG_TEXT_PP(1);
 	if (PG_NARGS() > 2)
-		arg = PG_GETARG_BYTEA_PP(2);
+		arg = PG_GETARG_TEXT_PP(2);
 
 	res = encrypt_internal(0, 0, data, key, arg);
 
@@ -575,15 +577,15 @@ pgp_sym_encrypt_bytea(PG_FUNCTION_ARGS)
 Datum
 pgp_sym_encrypt_text(PG_FUNCTION_ARGS)
 {
-	bytea	   *data,
+	text	   *data,
 			   *key;
 	text	   *arg = NULL;
 	text	   *res;
 
-	data = PG_GETARG_BYTEA_PP(0);
-	key = PG_GETARG_BYTEA_PP(1);
+	data = PG_GETARG_TEXT_PP(0);
+	key = PG_GETARG_TEXT_PP(1);
 	if (PG_NARGS() > 2)
-		arg = PG_GETARG_BYTEA_PP(2);
+		arg = PG_GETARG_TEXT_PP(2);
 
 	res = encrypt_internal(0, 1, data, key, arg);
 
@@ -598,15 +600,15 @@ pgp_sym_encrypt_text(PG_FUNCTION_ARGS)
 Datum
 pgp_sym_decrypt_bytea(PG_FUNCTION_ARGS)
 {
-	bytea	   *data,
-			   *key;
+	bytea	   *data;
 	text	   *arg = NULL;
-	text	   *res;
+	text	   *res,
+			   *key;
 
 	data = PG_GETARG_BYTEA_PP(0);
-	key = PG_GETARG_BYTEA_PP(1);
+	key = PG_GETARG_TEXT_PP(1);
 	if (PG_NARGS() > 2)
-		arg = PG_GETARG_BYTEA_PP(2);
+		arg = PG_GETARG_TEXT_PP(2);
 
 	res = decrypt_internal(0, 0, data, key, NULL, arg);
 
@@ -620,17 +622,18 @@ pgp_sym_decrypt_bytea(PG_FUNCTION_ARGS)
 Datum
 pgp_sym_decrypt_text(PG_FUNCTION_ARGS)
 {
-	bytea	   *data,
-			   *key;
+	bytea	   *data;
 	text	   *arg = NULL;
-	text	   *res;
+	text	   *res,
+			   *key;
 
 	data = PG_GETARG_BYTEA_PP(0);
-	key = PG_GETARG_BYTEA_PP(1);
+	key = PG_GETARG_TEXT_PP(1);
 	if (PG_NARGS() > 2)
-		arg = PG_GETARG_BYTEA_PP(2);
+		arg = PG_GETARG_TEXT_PP(2);
 
 	res = decrypt_internal(0, 1, data, key, NULL, arg);
+	pg_verifymbstr(VARDATA_ANY(res), VARSIZE_ANY_EXHDR(res), false);
 
 	PG_FREE_IF_COPY(data, 0);
 	PG_FREE_IF_COPY(key, 1);
@@ -654,7 +657,7 @@ pgp_pub_encrypt_bytea(PG_FUNCTION_ARGS)
 	data = PG_GETARG_BYTEA_PP(0);
 	key = PG_GETARG_BYTEA_PP(1);
 	if (PG_NARGS() > 2)
-		arg = PG_GETARG_BYTEA_PP(2);
+		arg = PG_GETARG_TEXT_PP(2);
 
 	res = encrypt_internal(1, 0, data, key, arg);
 
@@ -668,15 +671,15 @@ pgp_pub_encrypt_bytea(PG_FUNCTION_ARGS)
 Datum
 pgp_pub_encrypt_text(PG_FUNCTION_ARGS)
 {
-	bytea	   *data,
-			   *key;
+	bytea	   *key;
 	text	   *arg = NULL;
-	text	   *res;
+	text	   *res,
+			   *data;
 
-	data = PG_GETARG_BYTEA_PP(0);
+	data = PG_GETARG_TEXT_PP(0);
 	key = PG_GETARG_BYTEA_PP(1);
 	if (PG_NARGS() > 2)
-		arg = PG_GETARG_BYTEA_PP(2);
+		arg = PG_GETARG_TEXT_PP(2);
 
 	res = encrypt_internal(1, 1, data, key, arg);
 
@@ -700,9 +703,9 @@ pgp_pub_decrypt_bytea(PG_FUNCTION_ARGS)
 	data = PG_GETARG_BYTEA_PP(0);
 	key = PG_GETARG_BYTEA_PP(1);
 	if (PG_NARGS() > 2)
-		psw = PG_GETARG_BYTEA_PP(2);
+		psw = PG_GETARG_TEXT_PP(2);
 	if (PG_NARGS() > 3)
-		arg = PG_GETARG_BYTEA_PP(3);
+		arg = PG_GETARG_TEXT_PP(3);
 
 	res = decrypt_internal(1, 0, data, key, psw, arg);
 
@@ -727,11 +730,12 @@ pgp_pub_decrypt_text(PG_FUNCTION_ARGS)
 	data = PG_GETARG_BYTEA_PP(0);
 	key = PG_GETARG_BYTEA_PP(1);
 	if (PG_NARGS() > 2)
-		psw = PG_GETARG_BYTEA_PP(2);
+		psw = PG_GETARG_TEXT_PP(2);
 	if (PG_NARGS() > 3)
-		arg = PG_GETARG_BYTEA_PP(3);
+		arg = PG_GETARG_TEXT_PP(3);
 
 	res = decrypt_internal(1, 1, data, key, psw, arg);
+	pg_verifymbstr(VARDATA_ANY(res), VARSIZE_ANY_EXHDR(res), false);
 
 	PG_FREE_IF_COPY(data, 0);
 	PG_FREE_IF_COPY(key, 1);
@@ -782,8 +786,8 @@ parse_key_value_arrays(ArrayType *key_array, ArrayType *val_array,
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("mismatched array dimensions")));
 
-	keys = (char **) palloc(sizeof(char *) * key_count);
-	values = (char **) palloc(sizeof(char *) * val_count);
+	keys = palloc_array(char *, key_count);
+	values = palloc_array(char *, val_count);
 
 	for (i = 0; i < key_count; i++)
 	{
@@ -937,7 +941,7 @@ pgp_armor_headers(PG_FUNCTION_ARGS)
 		attinmeta = TupleDescGetAttInMetadata(tupdesc);
 		funcctx->attinmeta = attinmeta;
 
-		state = (pgp_armor_headers_state *) palloc(sizeof(pgp_armor_headers_state));
+		state = palloc_object(pgp_armor_headers_state);
 
 		res = pgp_extract_armor_headers((uint8 *) VARDATA_ANY(data),
 										VARSIZE_ANY_EXHDR(data),

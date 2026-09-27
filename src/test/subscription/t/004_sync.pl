@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Tests for logical replication table syncing
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -15,7 +15,7 @@ $node_publisher->start;
 
 # Create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->append_conf('postgresql.conf',
 	"wal_retrieve_retry_interval = 1ms");
 $node_subscriber->start;
@@ -165,12 +165,18 @@ $node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub");
 
 # When DROP SUBSCRIPTION tries to drop the tablesync slot, the slot may not
 # have been created, which causes the slot to be created after the DROP
-# SUSCRIPTION finishes. Such slots eventually get dropped at walsender exit
+# SUBSCRIPTION finishes. Such slots eventually get dropped at walsender exit
 # time. So, to prevent being affected by such ephemeral tablesync slots, we
 # wait until all the slots have been cleaned.
 ok( $node_publisher->poll_query_until(
 		'postgres', 'SELECT count(*) = 0 FROM pg_replication_slots'),
 	'DROP SUBSCRIPTION during error can clean up the slots on the publisher');
+
+# After dropping the subscription, all replication origins, whether created by
+# an apply worker or table sync worker, should have been cleaned up.
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT count(*) FROM pg_replication_origin_status");
+is($result, qq(0), 'all replication origins have been cleaned up');
 
 $node_subscriber->stop('fast');
 $node_publisher->stop('fast');

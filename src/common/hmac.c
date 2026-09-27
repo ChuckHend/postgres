@@ -5,7 +5,7 @@
  *
  * Fallback implementation of HMAC, as specified in RFC 2104.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -43,7 +43,7 @@ typedef enum pg_hmac_errno
 {
 	PG_HMAC_ERROR_NONE = 0,
 	PG_HMAC_ERROR_OOM,
-	PG_HMAC_ERROR_INTERNAL
+	PG_HMAC_ERROR_INTERNAL,
 } pg_hmac_errno;
 
 /* Internal pg_hmac_ctx structure */
@@ -137,7 +137,6 @@ pg_hmac_create(pg_cryptohash_type type)
 int
 pg_hmac_init(pg_hmac_ctx *ctx, const uint8 *key, size_t len)
 {
-	int			i;
 	int			digest_size;
 	int			block_size;
 	uint8	   *shrinkbuf = NULL;
@@ -192,7 +191,7 @@ pg_hmac_init(pg_hmac_ctx *ctx, const uint8 *key, size_t len)
 		pg_cryptohash_free(hash_ctx);
 	}
 
-	for (i = 0; i < len; i++)
+	for (size_t i = 0; i < len; i++)
 	{
 		ctx->k_ipad[i] ^= key[i];
 		ctx->k_opad[i] ^= key[i];

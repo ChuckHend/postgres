@@ -24,7 +24,7 @@
  * See psqlscan_int.h for additional commentary.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -52,12 +52,6 @@
  */
 typedef int YYSTYPE;
 
-/*
- * Set the type of yyextra; we use it as a pointer back to the containing
- * PsqlScanState.
- */
-#define YY_EXTRA_TYPE PsqlScanState
-
 
 /* Return values from yylex() */
 #define LEXRES_EOL			0	/* end of input */
@@ -67,14 +61,9 @@ typedef int YYSTYPE;
 
 #define ECHO psqlscan_emit(cur_state, yytext, yyleng)
 
-/*
- * Work around a bug in flex 2.5.35: it emits a couple of functions that
- * it forgets to emit declarations for.  Since we use -Wmissing-prototypes,
- * this would cause warnings.  Providing our own declarations should be
- * harmless even when the bug gets fixed.
- */
-extern int	psql_yyget_column(yyscan_t yyscanner);
-extern void psql_yyset_column(int column_no, yyscan_t yyscanner);
+static bool psqlscan_is_copy_from_stdin(PsqlScanState state);
+static void psqlscan_track_identifier(PsqlScanState state,
+									  const char *identifier);
 
 %}
 
@@ -88,6 +77,12 @@ extern void psql_yyset_column(int column_no, yyscan_t yyscanner);
 %option noyywrap
 %option warn
 %option prefix="psql_yy"
+
+/*
+ * Set the type of yyextra; we use it as a pointer back to the containing
+ * PsqlScanState.
+ */
+%option extra-type="PsqlScanState"
 
 /*
  * All of the following definitions and rules should exactly match
@@ -343,20 +338,35 @@ octfail			0[oO]_?
 binfail			0[bB]_?
 
 numeric			(({decinteger}\.{decinteger}?)|(\.{decinteger}))
-numericfail		{decdigit}+\.\.
+numericfail		{decinteger}\.\.
 
 real			({decinteger}|{numeric})[Ee][-+]?{decinteger}
 realfail		({decinteger}|{numeric})[Ee][-+]
 
-decinteger_junk	{decinteger}{ident_start}
-hexinteger_junk	{hexinteger}{ident_start}
-octinteger_junk	{octinteger}{ident_start}
-bininteger_junk	{bininteger}{ident_start}
-numeric_junk	{numeric}{ident_start}
-real_junk		{real}{ident_start}
+/* Positional parameters don't accept underscores. */
+param			\${decdigit}+
 
-param			\${decinteger}
-param_junk		\${decinteger}{ident_start}
+/*
+ * An identifier immediately following an integer literal is disallowed because
+ * in some cases it's ambiguous what is meant: for example, 0x1234 could be
+ * either a hexinteger or a decinteger "0" and an identifier "x1234".  We can
+ * detect such problems by seeing if integer_junk matches a longer substring
+ * than any of the XXXinteger patterns (decinteger, hexinteger, octinteger,
+ * bininteger).  One "junk" pattern is sufficient because
+ * {decinteger}{identifier} will match all the same strings we'd match with
+ * {hexinteger}{identifier} etc.
+ *
+ * Note that the rule for integer_junk must appear after the ones for
+ * XXXinteger to make this work correctly: 0x1234 will match both hexinteger
+ * and integer_junk, and we need hexinteger to be chosen in that case.
+ *
+ * Also disallow strings matched by numeric_junk, real_junk and param_junk
+ * for consistency.
+ */
+integer_junk	{decinteger}{identifier}
+numeric_junk	{numeric}{identifier}
+real_junk		{real}{identifier}
+param_junk		\${decdigit}+{identifier}
 
 /* psql-specific: characters allowed in variable names */
 variable_char	[A-Za-z\200-\377_0-9]
@@ -665,11 +675,15 @@ other			.
 
 ";"				{
 					ECHO;
-					if (cur_state->paren_depth == 0 && cur_state->begin_depth == 0)
+					if (cur_state->paren_depth == 0 &&
+						cur_state->begin_depth == 0)
 					{
+						/* Remember if this subcommand was COPY FROM STDIN */
+						if (psqlscan_is_copy_from_stdin(cur_state))
+							cur_state->copy_stdin_count++;
 						/* Terminate lexing temporarily */
 						cur_state->start_state = YY_START;
-						cur_state->identifier_count = 0;
+						cur_state->init_idents_count = 0;
 						return LEXRES_SEMI;
 					}
 				}
@@ -682,8 +696,16 @@ other			.
 "\\"[;:]		{
 					/* Force a semi-colon or colon into the query buffer */
 					psqlscan_emit(cur_state, yytext + 1, 1);
-					if (yytext[1] == ';')
-						cur_state->identifier_count = 0;
+					/* Reset BEGIN/END/COPY tracking if semi at outer level */
+					if (yytext[1] == ';' &&
+						cur_state->paren_depth == 0 &&
+						cur_state->begin_depth == 0)
+					{
+						/* Remember if this subcommand was COPY FROM STDIN */
+						if (psqlscan_is_copy_from_stdin(cur_state))
+							cur_state->copy_stdin_count++;
+						cur_state->init_idents_count = 0;
+					}
 				}
 
 "\\"			{
@@ -897,16 +919,7 @@ other			.
 {realfail}		{
 					ECHO;
 				}
-{decinteger_junk}	{
-					ECHO;
-				}
-{hexinteger_junk}	{
-					ECHO;
-				}
-{octinteger_junk}	{
-					ECHO;
-				}
-{bininteger_junk}	{
+{integer_junk}	{
 					ECHO;
 				}
 {numeric_junk}	{
@@ -918,55 +931,7 @@ other			.
 
 
 {identifier}	{
-					/*
-					 * We need to track if we are inside a BEGIN .. END block
-					 * in a function definition, so that semicolons contained
-					 * therein don't terminate the whole statement.  Short of
-					 * writing a full parser here, the following heuristic
-					 * should work.  First, we track whether the beginning of
-					 * the statement matches CREATE [OR REPLACE]
-					 * {FUNCTION|PROCEDURE}
-					 */
-
-					if (cur_state->identifier_count == 0)
-						memset(cur_state->identifiers, 0, sizeof(cur_state->identifiers));
-
-					if (pg_strcasecmp(yytext, "create") == 0 ||
-						pg_strcasecmp(yytext, "function") == 0 ||
-						pg_strcasecmp(yytext, "procedure") == 0 ||
-						pg_strcasecmp(yytext, "or") == 0 ||
-						pg_strcasecmp(yytext, "replace") == 0)
-					{
-						if (cur_state->identifier_count < sizeof(cur_state->identifiers))
-							cur_state->identifiers[cur_state->identifier_count] = pg_tolower((unsigned char) yytext[0]);
-					}
-
-					cur_state->identifier_count++;
-
-					if (cur_state->identifiers[0] == 'c' &&
-						(cur_state->identifiers[1] == 'f' || cur_state->identifiers[1] == 'p' ||
-						 (cur_state->identifiers[1] == 'o' && cur_state->identifiers[2] == 'r' &&
-						  (cur_state->identifiers[3] == 'f' || cur_state->identifiers[3] == 'p'))) &&
-						cur_state->paren_depth == 0)
-					{
-						if (pg_strcasecmp(yytext, "begin") == 0)
-							cur_state->begin_depth++;
-						else if (pg_strcasecmp(yytext, "case") == 0)
-						{
-							/*
-							 * CASE also ends with END.  We only need to track
-							 * this if we are already inside a BEGIN.
-							 */
-							if (cur_state->begin_depth >= 1)
-								cur_state->begin_depth++;
-						}
-						else if (pg_strcasecmp(yytext, "end") == 0)
-						{
-							if (cur_state->begin_depth > 0)
-								cur_state->begin_depth--;
-						}
-					}
-
+					psqlscan_track_identifier(cur_state, yytext);
 					ECHO;
 				}
 
@@ -994,6 +959,145 @@ other			.
 /* LCOV_EXCL_STOP */
 
 /*
+ * Record the first few keywords/identifiers of a statement
+ * in the idents[] array, of length idents_size.
+ * *idents_count is the number of entries filled so far.
+ *
+ * We record the interesting keywords using their first character, which
+ * works so long as those are all different.  We could switch to an enum
+ * if that stops being true, but for now this is easy and compact.
+ */
+static void
+psqlscan_record_initial_keyword(const char *identifier,
+								char *idents,
+								int idents_size,
+								int *idents_count)
+{
+	if (*idents_count < idents_size)
+	{
+		/*
+		 * What we need to recognize is CREATE [OR REPLACE] FUNCTION/PROCEDURE.
+		 * We record these keywords in lower case.  We also need to recognize
+		 * COPY ... FROM STDIN.  (Note: the backend grammar doesn't
+		 * distinguish STDIN from STDOUT, so we should not do so here either.)
+		 * We record these keywords in upper case, to avoid conflicting with
+		 * the first set.
+		 */
+		if (pg_strcasecmp(identifier, "create") == 0 ||
+			pg_strcasecmp(identifier, "function") == 0 ||
+			pg_strcasecmp(identifier, "procedure") == 0 ||
+			pg_strcasecmp(identifier, "or") == 0 ||
+			pg_strcasecmp(identifier, "replace") == 0)
+			idents[*idents_count] = pg_tolower((unsigned char) identifier[0]);
+		else if (pg_strcasecmp(identifier, "copy") == 0 ||
+			pg_strcasecmp(identifier, "from") == 0 ||
+			pg_strcasecmp(identifier, "stdin") == 0 ||
+			pg_strcasecmp(identifier, "stdout") == 0)
+			idents[*idents_count] = pg_toupper((unsigned char) identifier[0]);
+		/* For other keywords or identifiers, leave '\0' in the array entry */
+		(*idents_count)++;
+	}
+}
+
+/*
+ * Does the current input match CREATE [OR REPLACE] {FUNCTION|PROCEDURE}?
+ */
+static bool
+psqlscan_is_create_routine(const char *idents)
+{
+	return idents[0] == 'c' &&
+		(idents[1] == 'f' || idents[1] == 'p' ||
+		 (idents[1] == 'o' && idents[2] == 'r' &&
+		  (idents[3] == 'f' || idents[3] == 'p')));
+}
+
+/*
+ * Does the current input match COPY ... FROM STDIN?
+ */
+static bool
+psqlscan_is_copy_from_stdin(PsqlScanState state)
+{
+	const char *idents = state->init_idents;
+
+	/*
+	 * The first word must be COPY, but after that there could be up to four
+	 * identifiers (BINARY database.schema.table) before FROM.  Since some of
+	 * the words we track are not reserved words, don't assume the intervening
+	 * array entries are '\0'.  Life is simplified here by the fact that
+	 * psqlscan_track_identifier ignores everything within parens: we won't
+	 * see column lists nor the query in COPY (query).
+	 */
+	if (idents[0] != 'C')
+		return false;
+	for (int i = 1; i < lengthof(state->init_idents) - 1; i++)
+	{
+		/* Scan to find FROM; if not seen within range, it's not valid COPY */
+		if (idents[i] != 'F')
+			continue;
+		/* It's COPY FROM STDIN only if the next word is STDIN */
+		return (idents[i + 1] == 'S');
+	}
+	return false;
+}
+
+/*
+ * This function is called each time the lexer recognizes an unquoted
+ * identifier (which could also be a keyword, and indeed keywords are the
+ * only case we really care about here).  It presently has two tasks:
+ *
+ * 1. Track whether we are inside BEGIN .. END in a function definition,
+ * so that semicolons contained therein don't terminate the whole statement.
+ * Short of writing a full parser here, the following heuristic should work.
+ *
+ * We track whether the beginning of the statement matches CREATE [OR REPLACE]
+ * {FUNCTION|PROCEDURE}.  If so, count BEGIN and END pairs.  We also have to
+ * account for CASE ... END.
+ *
+ * 2. Record enough information for psqlscan_is_copy_from_stdin() to recognize
+ * COPY FROM STDIN commands.
+ */
+static void
+psqlscan_track_identifier(PsqlScanState state, const char *identifier)
+{
+	/* None of this needs to happen when we're inside parentheses */
+	if (state->paren_depth != 0)
+		return;
+
+	/* Reset all my state at the start of each new statement */
+	if (state->init_idents_count == 0)
+		memset(state->init_idents, 0, sizeof(state->init_idents));
+
+	/* Record initial keywords if init_idents_count is small enough */
+	psqlscan_record_initial_keyword(identifier,
+									state->init_idents,
+									lengthof(state->init_idents),
+									&state->init_idents_count);
+
+	/*
+	 * Track BEGIN/CASE/END only when within an appropriate statement.
+	 */
+	if (psqlscan_is_create_routine(state->init_idents))
+	{
+		if (pg_strcasecmp(identifier, "begin") == 0)
+			state->begin_depth++;
+		else if (pg_strcasecmp(identifier, "case") == 0)
+		{
+			/*
+			 * CASE also ends with END.  We only need to track this if we are
+			 * already inside a BEGIN.
+			 */
+			if (state->begin_depth >= 1)
+				state->begin_depth++;
+		}
+		else if (pg_strcasecmp(identifier, "end") == 0)
+		{
+			if (state->begin_depth > 0)
+				state->begin_depth--;
+		}
+	}
+}
+
+/*
  * Create a lexer working state struct.
  *
  * callbacks is a struct of function pointers that encapsulate some
@@ -1005,7 +1109,7 @@ psql_scan_create(const PsqlScanCallbacks *callbacks)
 {
 	PsqlScanState state;
 
-	state = (PsqlScanStateData *) pg_malloc0(sizeof(PsqlScanStateData));
+	state = pg_malloc0_object(PsqlScanStateData);
 
 	state->callbacks = callbacks;
 
@@ -1082,6 +1186,10 @@ psql_scan_setup(PsqlScanState state,
 	/* Set lookaside data in case we have to map unsafe encoding */
 	state->curline = state->scanbuf;
 	state->refline = state->scanline;
+
+	/* Initialize state for psql_scan_get_location() */
+	state->cur_line_no = 0;		/* yylex not called yet */
+	state->cur_line_ptr = state->scanbuf;
 }
 
 /*
@@ -1138,6 +1246,10 @@ psql_scan(PsqlScanState state,
 
 	/* And lex. */
 	lexresult = yylex(NULL, state->scanner);
+
+	/* Notify psql_scan_get_location() that a yylex call has been made. */
+	if (state->cur_line_no == 0)
+		state->cur_line_no = 1;
 
 	/*
 	 * Check termination state and return appropriate result info.
@@ -1258,10 +1370,9 @@ psql_scan_finish(PsqlScanState state)
 /*
  * Reset lexer scanning state to start conditions.  This is appropriate
  * for executing \r psql commands (or any other time that we discard the
- * prior contents of query_buf).  It is not, however, necessary to do this
- * when we execute and clear the buffer after getting a PSCAN_SEMICOLON or
- * PSCAN_EOL scan result, because the scan state must be INITIAL when those
- * conditions are returned.
+ * prior contents of query_buf).  Do not call this between psql_scan()
+ * calls that are scanning successive chunks of a single query string;
+ * do call it when preparing to process a new query string.
  *
  * Note that this is unrelated to flushing unread input; that task is
  * done by psql_scan_finish().
@@ -1275,8 +1386,9 @@ psql_scan_reset(PsqlScanState state)
 	if (state->dolqstart)
 		free(state->dolqstart);
 	state->dolqstart = NULL;
-	state->identifier_count = 0;
 	state->begin_depth = 0;
+	state->copy_stdin_count = 0;
+	state->init_idents_count = 0;
 }
 
 /*
@@ -1301,6 +1413,26 @@ psql_scan_reselect_sql_lexer(PsqlScanState state)
 }
 
 /*
+ * Return the number of COPY ... FROM STDIN commands in the input string.
+ *
+ * This should be called only after we've finished parsing a complete
+ * string and are ready to send it to the backend.
+ */
+int
+psql_scan_count_copy_from_stdin(PsqlScanState state)
+{
+	if (state->init_idents_count > 0)
+	{
+		/* Count any COPY FROM STDIN following the last semicolon */
+		if (psqlscan_is_copy_from_stdin(state))
+			state->copy_stdin_count++;
+		/* ... but do so only once */
+		state->init_idents_count = 0;
+	}
+	return state->copy_stdin_count;
+}
+
+/*
  * Return true if lexer is currently in an "inside quotes" state.
  *
  * This is pretty grotty but is needed to preserve the old behavior
@@ -1311,7 +1443,53 @@ bool
 psql_scan_in_quote(PsqlScanState state)
 {
 	return state->start_state != INITIAL &&
-			state->start_state != xqs;
+		state->start_state != xqs;
+}
+
+/*
+ * Return the current scanning location (end+1 of last scanned token),
+ * as a line number counted from 1 and an offset from string start.
+ *
+ * This considers only the outermost input string, and therefore is of
+ * limited use for programs that use psqlscan_push_new_buffer().
+ *
+ * It would be a bit easier probably to use "%option yylineno" to count
+ * lines, but the flex manual says that has a performance cost, and only
+ * a minority of programs using psqlscan have need for this functionality.
+ * So we implement it ourselves without adding overhead to the lexer itself.
+ */
+void
+psql_scan_get_location(PsqlScanState state,
+					   int *lineno, int *offset)
+{
+	const char *line_end;
+
+	/*
+	 * We rely on flex's having stored a NUL after the current token in
+	 * scanbuf.  Therefore we must specially handle the state before yylex()
+	 * has been called, when obviously that won't have happened yet.
+	 */
+	if (state->cur_line_no == 0)
+	{
+		*lineno = 1;
+		*offset = 0;
+		return;
+	}
+
+	/*
+	 * Advance cur_line_no/cur_line_ptr past whatever has been lexed so far.
+	 * Doing this prevents repeated calls from being O(N^2) for long inputs.
+	 */
+	while ((line_end = strchr(state->cur_line_ptr, '\n')) != NULL)
+	{
+		state->cur_line_no++;
+		state->cur_line_ptr = line_end + 1;
+	}
+	state->cur_line_ptr += strlen(state->cur_line_ptr);
+
+	/* Report current location. */
+	*lineno = state->cur_line_no;
+	*offset = state->cur_line_ptr - state->scanbuf;
 }
 
 /*
@@ -1325,7 +1503,7 @@ psqlscan_push_new_buffer(PsqlScanState state, const char *newstr,
 {
 	StackElem  *stackelem;
 
-	stackelem = (StackElem *) pg_malloc(sizeof(StackElem));
+	stackelem = pg_malloc_object(StackElem);
 
 	/*
 	 * In current usage, the passed varname points at the current flex input
@@ -1428,7 +1606,7 @@ psqlscan_prepare_buffer(PsqlScanState state, const char *txt, int len,
 	char	   *newtxt;
 
 	/* Flex wants two \0 characters after the actual data */
-	newtxt = pg_malloc(len + 2);
+	newtxt = pg_malloc_array(char, (len + 2));
 	*txtcopy = newtxt;
 	newtxt[len] = newtxt[len + 1] = YY_END_OF_BUFFER_CHAR;
 
@@ -1497,7 +1675,7 @@ psqlscan_emit(PsqlScanState state, const char *txt, int len)
 char *
 psqlscan_extract_substring(PsqlScanState state, const char *txt, int len)
 {
-	char	   *result = (char *) pg_malloc(len + 1);
+	char	   *result = pg_malloc_array(char, (len + 1));
 
 	if (state->safe_encoding)
 		memcpy(result, txt, len);
@@ -1562,8 +1740,8 @@ psqlscan_escape_variable(PsqlScanState state, const char *txt, int len,
 void
 psqlscan_test_variable(PsqlScanState state, const char *txt, int len)
 {
-	char	*varname;
-	char	*value;
+	char	   *varname;
+	char	   *value;
 
 	varname = psqlscan_extract_substring(state, txt + 3, len - 4);
 	if (state->callbacks->get_variable)
@@ -1575,11 +1753,11 @@ psqlscan_test_variable(PsqlScanState state, const char *txt, int len)
 
 	if (value != NULL)
 	{
-		psqlscan_emit(state, "TRUE", 4);
+		appendPQExpBufferStr(state->output_buf, "TRUE");
 		free(value);
 	}
 	else
 	{
-		psqlscan_emit(state, "FALSE", 5);
+		appendPQExpBufferStr(state->output_buf, "FALSE");
 	}
 }

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 if not llvm.found()
   subdir_done()
@@ -14,6 +14,7 @@ llvmjit_sources += files(
   'llvmjit_error.cpp',
   'llvmjit_inline.cpp',
   'llvmjit_wrap.cpp',
+  'SectionMemoryManager.cpp',
 )
 
 # Code generation
@@ -32,7 +33,7 @@ llvmjit = shared_module('llvmjit',
   llvmjit_sources,
   kwargs: pg_mod_args + {
     'dependencies': pg_mod_args['dependencies'] + [llvm],
-    'cpp_args': pg_mod_args['cpp_args'] + llvm.get_variable(configtool: 'cxxflags').split(),
+    'cpp_args': pg_mod_args['cpp_args'] + llvm.get_variable(configtool: 'cxxflags').split() + cxxflags_no_shadow,
   }
 )
 
@@ -52,7 +53,7 @@ llvm_irgen_args = [
 
 if ccache.found()
   llvm_irgen_command = ccache
-  llvm_irgen_args = [clang.path()] + llvm_irgen_args
+  llvm_irgen_args = [clang.full_path()] + llvm_irgen_args
 else
   llvm_irgen_command = clang
 endif
@@ -60,9 +61,7 @@ endif
 
 # XXX: Need to determine proper version of the function cflags for clang
 bitcode_cflags = ['-fno-strict-aliasing', '-fwrapv']
-if llvm.version().version_compare('>=15.0')
-  bitcode_cflags += ['-Xclang', '-no-opaque-pointers']
-endif
+bitcode_cflags += get_option('c_args')
 bitcode_cflags += cppflags
 
 # XXX: Worth improving on the logic to find directories here

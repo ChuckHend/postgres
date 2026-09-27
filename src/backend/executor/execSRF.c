@@ -7,7 +7,7 @@
  * common code for calling set-returning functions according to the
  * ReturnSetInfo API.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,7 +21,6 @@
 #include "access/htup_details.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_proc.h"
-#include "executor/execdebug.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
@@ -31,6 +30,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 
@@ -273,6 +273,7 @@ ExecMakeTableFunctionResult(SetExprState *setexpr,
 									   funcrettype,
 									   -1,
 									   0);
+					TupleDescFinalize(tupdesc);
 					rsinfo.setDesc = tupdesc;
 				}
 				MemoryContextSwitchTo(oldcontext);
@@ -338,7 +339,7 @@ ExecMakeTableFunctionResult(SetExprState *setexpr,
 					int			natts = expectedDesc->natts;
 					bool	   *nullflags;
 
-					nullflags = (bool *) palloc(natts * sizeof(bool));
+					nullflags = palloc_array(bool, natts);
 					memset(nullflags, true, natts * sizeof(bool));
 					tuplestore_putvalues(tupstore, expectedDesc, NULL, nullflags);
 				}
@@ -406,7 +407,7 @@ no_function_result:
 			int			natts = expectedDesc->natts;
 			bool	   *nullflags;
 
-			nullflags = (bool *) palloc(natts * sizeof(bool));
+			nullflags = palloc_array(bool, natts);
 			memset(nullflags, true, natts * sizeof(bool));
 			tuplestore_putvalues(tupstore, expectedDesc, NULL, nullflags);
 		}
@@ -777,6 +778,7 @@ init_sexpr(Oid foid, Oid input_collation, Expr *node,
 							   funcrettype,
 							   -1,
 							   0);
+			TupleDescFinalize(tupdesc);
 			sexpr->funcResultDesc = tupdesc;
 			sexpr->funcReturnsTuple = false;
 		}

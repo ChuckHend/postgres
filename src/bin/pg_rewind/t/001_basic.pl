@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -60,7 +60,7 @@ sub run_test
 
 	# Insert a row in the old primary. This causes the primary and standby
 	# to have "diverged", it's no longer possible to just apply the
-	# standy's logs over primary directory - you need to rewind.
+	# standby's logs over primary directory - you need to rewind.
 	primary_psql("INSERT INTO tbl1 VALUES ('in primary, after promotion')");
 
 	# Also insert a new row in the standby, which won't be present in the
@@ -106,8 +106,8 @@ sub run_test
 		command_fails(
 			[
 				'pg_rewind', '--debug',
-				'--source-pgdata', $standby_pgdata,
-				'--target-pgdata', $primary_pgdata,
+				'--source-pgdata' => $standby_pgdata,
+				'--target-pgdata' => $primary_pgdata,
 				'--no-sync'
 			],
 			'pg_rewind with running target');
@@ -118,8 +118,8 @@ sub run_test
 		command_fails(
 			[
 				'pg_rewind', '--debug',
-				'--source-pgdata', $standby_pgdata,
-				'--target-pgdata', $primary_pgdata,
+				'--source-pgdata' => $standby_pgdata,
+				'--target-pgdata' => $primary_pgdata,
 				'--no-sync', '--no-ensure-shutdown'
 			],
 			'pg_rewind --no-ensure-shutdown with running target');
@@ -131,8 +131,8 @@ sub run_test
 		command_fails(
 			[
 				'pg_rewind', '--debug',
-				'--source-pgdata', $standby_pgdata,
-				'--target-pgdata', $primary_pgdata,
+				'--source-pgdata' => $standby_pgdata,
+				'--target-pgdata' => $primary_pgdata,
 				'--no-sync', '--no-ensure-shutdown'
 			],
 			'pg_rewind with unexpected running source');
@@ -145,8 +145,8 @@ sub run_test
 		command_ok(
 			[
 				'pg_rewind', '--debug',
-				'--source-pgdata', $standby_pgdata,
-				'--target-pgdata', $primary_pgdata,
+				'--source-pgdata' => $standby_pgdata,
+				'--target-pgdata' => $primary_pgdata,
 				'--no-sync', '--dry-run'
 			],
 			'pg_rewind --dry-run');

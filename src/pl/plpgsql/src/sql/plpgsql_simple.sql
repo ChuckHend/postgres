@@ -80,3 +80,54 @@ create or replace function simplesql() returns int language sql
 as $$select 2 + 2$$;
 
 select simplecaller();
+
+
+-- Check case where called function changes from non-SRF to SRF (bug #18497)
+
+create or replace function simplecaller() returns int language plpgsql
+as $$
+declare x int;
+begin
+  x := simplesql();
+  return x;
+end$$;
+
+select simplecaller();
+
+drop function simplesql();
+
+create function simplesql() returns setof int language sql
+as $$select 22 + 22$$;
+
+select simplecaller();
+
+select simplecaller();
+
+-- Check handling of simple expression in a scrollable cursor (bug #18859)
+
+do $$
+declare
+ p_CurData refcursor;
+ val int;
+begin
+ open p_CurData scroll for select 42;
+ fetch p_CurData into val;
+ raise notice 'val = %', val;
+end; $$;
+
+-- We now optimize "SELECT simple-expr INTO var" using the simple-expression
+-- logic.  Verify that error reporting works the same as it did before.
+
+do $$
+declare x bigint := 2^30; y int;
+begin
+  -- overflow during assignment step does not get an extra context line
+  select x*x into y;
+end $$;
+
+do $$
+declare x bigint := 2^30; y int;
+begin
+  -- overflow during expression evaluation step does get an extra context line
+  select x*x*x into y;
+end $$;

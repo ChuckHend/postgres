@@ -3,7 +3,7 @@
  * nodeAppend.c
  *	  routines to handle append nodes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -12,7 +12,8 @@
  *
  *-------------------------------------------------------------------------
  */
-/* INTERFACE ROUTINES
+/*
+ * INTERFACE ROUTINES
  *		ExecInitAppend	- initialize the append node
  *		ExecAppend		- retrieve the next tuple from the node
  *		ExecEndAppend	- shut down the append node
@@ -58,12 +59,14 @@
 #include "postgres.h"
 
 #include "executor/execAsync.h"
-#include "executor/execdebug.h"
 #include "executor/execPartition.h"
+#include "executor/executor.h"
 #include "executor/nodeAppend.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "utils/wait_event.h"
 
 /* Shared state for parallel-aware Append. */
 struct ParallelAppendState
@@ -92,6 +95,7 @@ static void ExecAppendAsyncBegin(AppendState *node);
 static bool ExecAppendAsyncGetNext(AppendState *node, TupleTableSlot **result);
 static bool ExecAppendAsyncRequest(AppendState *node, TupleTableSlot **result);
 static void ExecAppendAsyncEventWait(AppendState *node);
+static void ExecAppendAsyncReset(AppendState *node);
 static void classify_matching_subplans(AppendState *node);
 
 /* ----------------------------------------------------------------
@@ -110,6 +114,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 {
 	AppendState *appendstate = makeNode(AppendState);
 	PlanState **appendplanstates;
+	const TupleTableSlotOps *appendops;
 	Bitmapset  *validsubplans;
 	Bitmapset  *asyncplans;
 	int			nplans;
@@ -134,7 +139,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 	appendstate->as_begun = false;
 
 	/* If run-time partition pruning is enabled, then set that up now */
-	if (node->part_prune_info != NULL)
+	if (node->part_prune_index >= 0)
 	{
 		PartitionPruneState *prunestate;
 
@@ -143,10 +148,11 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 		 * subplans to initialize (validsubplans) by taking into account the
 		 * result of performing initial pruning if any.
 		 */
-		prunestate = ExecInitPartitionPruning(&appendstate->ps,
-											  list_length(node->appendplans),
-											  node->part_prune_info,
-											  &validsubplans);
+		prunestate = ExecInitPartitionExecPruning(&appendstate->ps,
+												  list_length(node->appendplans),
+												  node->part_prune_index,
+												  node->apprelids,
+												  &validsubplans);
 		appendstate->as_prune_state = prunestate;
 		nplans = bms_num_members(validsubplans);
 
@@ -176,17 +182,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 		appendstate->as_prune_state = NULL;
 	}
 
-	/*
-	 * Initialize result tuple type and slot.
-	 */
-	ExecInitResultTupleSlotTL(&appendstate->ps, &TTSOpsVirtual);
-
-	/* node returns slots from each of its subnodes, therefore not fixed */
-	appendstate->ps.resultopsset = true;
-	appendstate->ps.resultopsfixed = false;
-
-	appendplanstates = (PlanState **) palloc(nplans *
-											 sizeof(PlanState *));
+	appendplanstates = palloc_array(PlanState *, nplans);
 
 	/*
 	 * call ExecInitNode on each of the valid plans to be executed and save
@@ -227,6 +223,28 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 	appendstate->appendplans = appendplanstates;
 	appendstate->as_nplans = nplans;
 
+	/*
+	 * Initialize Append's result tuple type and slot.  If the child plans all
+	 * produce the same fixed slot type, we can use that slot type; otherwise
+	 * make a virtual slot.  (Note that the result slot itself is used only to
+	 * return a null tuple at end of execution; real tuples are returned to
+	 * the caller in the children's own result slots.  What we are doing here
+	 * is allowing the parent plan node to optimize if the Append will return
+	 * only one kind of slot.)
+	 */
+	appendops = ExecGetCommonSlotOps(appendplanstates, j);
+	if (appendops != NULL)
+	{
+		ExecInitResultTupleSlotTL(&appendstate->ps, appendops);
+	}
+	else
+	{
+		ExecInitResultTupleSlotTL(&appendstate->ps, &TTSOpsVirtual);
+		/* show that the output slot type is not fixed */
+		appendstate->ps.resultopsset = true;
+		appendstate->ps.resultopsfixed = false;
+	}
+
 	/* Initialize async state */
 	appendstate->as_asyncplans = asyncplans;
 	appendstate->as_nasyncplans = nasyncplans;
@@ -240,15 +258,14 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 
 	if (nasyncplans > 0)
 	{
-		appendstate->as_asyncrequests = (AsyncRequest **)
-			palloc0(nplans * sizeof(AsyncRequest *));
+		appendstate->as_asyncrequests = palloc0_array(AsyncRequest *, nplans);
 
 		i = -1;
 		while ((i = bms_next_member(asyncplans, i)) >= 0)
 		{
 			AsyncRequest *areq;
 
-			areq = palloc(sizeof(AsyncRequest));
+			areq = palloc_object(AsyncRequest);
 			areq->requestor = (PlanState *) appendstate;
 			areq->requestee = appendplanstates[i];
 			areq->request_index = i;
@@ -259,8 +276,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 			appendstate->as_asyncrequests[i] = areq;
 		}
 
-		appendstate->as_asyncresults = (TupleTableSlot **)
-			palloc0(nasyncplans * sizeof(TupleTableSlot *));
+		appendstate->as_asyncresults = palloc0_array(TupleTableSlot *, nasyncplans);
 
 		if (appendstate->as_valid_subplans_identified)
 			classify_matching_subplans(appendstate);
@@ -408,6 +424,10 @@ ExecReScanAppend(AppendState *node)
 	int			nasyncplans = node->as_nasyncplans;
 	int			i;
 
+	/* If there are any async subplans, reset async requests made for them. */
+	if (nasyncplans > 0)
+		ExecAppendAsyncReset(node);
+
 	/*
 	 * If any PARAM_EXEC Params used in pruning expressions have changed, then
 	 * we'd better unset the valid subplans so that they are reselected for
@@ -441,25 +461,6 @@ ExecReScanAppend(AppendState *node)
 		 */
 		if (subnode->chgParam == NULL)
 			ExecReScan(subnode);
-	}
-
-	/* Reset async state */
-	if (nasyncplans > 0)
-	{
-		i = -1;
-		while ((i = bms_next_member(node->as_asyncplans, i)) >= 0)
-		{
-			AsyncRequest *areq = node->as_asyncrequests[i];
-
-			areq->callback_pending = false;
-			areq->request_complete = false;
-			areq->result = NULL;
-		}
-
-		node->as_nasyncresults = 0;
-		node->as_nasyncremain = 0;
-		bms_free(node->as_needrequest);
-		node->as_needrequest = NULL;
 	}
 
 	/* Let choose_next_subplan_* function handle setting the first subplan */
@@ -580,7 +581,7 @@ choose_next_subplan_locally(AppendState *node)
 		else if (!node->as_valid_subplans_identified)
 		{
 			node->as_valid_subplans =
-				ExecFindMatchingSubPlans(node->as_prune_state, false);
+				ExecFindMatchingSubPlans(node->as_prune_state, false, NULL);
 			node->as_valid_subplans_identified = true;
 		}
 
@@ -647,7 +648,7 @@ choose_next_subplan_for_leader(AppendState *node)
 		if (!node->as_valid_subplans_identified)
 		{
 			node->as_valid_subplans =
-				ExecFindMatchingSubPlans(node->as_prune_state, false);
+				ExecFindMatchingSubPlans(node->as_prune_state, false, NULL);
 			node->as_valid_subplans_identified = true;
 
 			/*
@@ -723,7 +724,7 @@ choose_next_subplan_for_worker(AppendState *node)
 	else if (!node->as_valid_subplans_identified)
 	{
 		node->as_valid_subplans =
-			ExecFindMatchingSubPlans(node->as_prune_state, false);
+			ExecFindMatchingSubPlans(node->as_prune_state, false, NULL);
 		node->as_valid_subplans_identified = true;
 
 		mark_invalid_subplans_as_finished(node);
@@ -876,7 +877,7 @@ ExecAppendAsyncBegin(AppendState *node)
 	if (!node->as_valid_subplans_identified)
 	{
 		node->as_valid_subplans =
-			ExecFindMatchingSubPlans(node->as_prune_state, false);
+			ExecFindMatchingSubPlans(node->as_prune_state, false, NULL);
 		node->as_valid_subplans_identified = true;
 
 		classify_matching_subplans(node);
@@ -1016,7 +1017,7 @@ ExecAppendAsyncRequest(AppendState *node, TupleTableSlot **result)
 static void
 ExecAppendAsyncEventWait(AppendState *node)
 {
-	int			nevents = node->as_nasyncplans + 1;
+	int			nevents = node->as_nasyncplans + 2;
 	long		timeout = node->as_syncdone ? -1 : 0;
 	WaitEvent	occurred_event[EVENT_BUFFER_SIZE];
 	int			noccurred;
@@ -1025,7 +1026,8 @@ ExecAppendAsyncEventWait(AppendState *node)
 	/* We should never be called when there are no valid async subplans. */
 	Assert(node->as_nasyncremain > 0);
 
-	node->as_eventset = CreateWaitEventSet(CurrentMemoryContext, nevents);
+	Assert(node->as_eventset == NULL);
+	node->as_eventset = CreateWaitEventSet(CurrentResourceOwner, nevents);
 	AddWaitEventToSet(node->as_eventset, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
 					  NULL, NULL);
 
@@ -1040,8 +1042,8 @@ ExecAppendAsyncEventWait(AppendState *node)
 	}
 
 	/*
-	 * No need for further processing if there are no configured events other
-	 * than the postmaster death event.
+	 * No need for further processing if none of the subplans configured any
+	 * events.
 	 */
 	if (GetNumRegisteredWaitEvents(node->as_eventset) == 1)
 	{
@@ -1050,7 +1052,22 @@ ExecAppendAsyncEventWait(AppendState *node)
 		return;
 	}
 
-	/* We wait on at most EVENT_BUFFER_SIZE events. */
+	/*
+	 * Add the process latch to the set, so that we wake up to process the
+	 * standard interrupts with CHECK_FOR_INTERRUPTS().
+	 *
+	 * NOTE: For historical reasons, it's important that this is added to the
+	 * WaitEventSet after the ExecAsyncConfigureWait() calls.  Namely,
+	 * postgres_fdw calls "GetNumRegisteredWaitEvents(set) == 1" to check if
+	 * any other events are in the set.  That's a poor design, it's
+	 * questionable for postgres_fdw to be doing that in the first place, but
+	 * we cannot change it now.  The pattern has possibly been copied to other
+	 * extensions too.
+	 */
+	AddWaitEventToSet(node->as_eventset, WL_LATCH_SET, PGINVALID_SOCKET,
+					  MyLatch, NULL);
+
+	/* Return at most EVENT_BUFFER_SIZE events in one call. */
 	if (nevents > EVENT_BUFFER_SIZE)
 		nevents = EVENT_BUFFER_SIZE;
 
@@ -1091,7 +1108,87 @@ ExecAppendAsyncEventWait(AppendState *node)
 				ExecAsyncNotify(areq);
 			}
 		}
+
+		/* Handle standard interrupts */
+		if ((w->events & WL_LATCH_SET) != 0)
+		{
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+		}
 	}
+}
+
+/* ----------------------------------------------------------------
+ *		ExecAppendAsyncReset
+ *
+ *		Reset asynchronous requests made for async-capable subplans.
+ * ----------------------------------------------------------------
+ */
+static void
+ExecAppendAsyncReset(AppendState *node)
+{
+	int			i;
+
+	/* We should never be called when there are no async subplans. */
+	Assert(node->as_nasyncplans > 0);
+
+	/*
+	 * Drain pending async requests if any.  We force the as_syncdone flag to
+	 * be true so that ExecAppendAsyncEventWait() waits until at least one
+	 * event occurs.
+	 */
+	node->as_syncdone = true;
+	for (;;)
+	{
+		bool		found = false;
+
+		/*
+		 * When called from ExecAppendAsyncEventWait(), postgres_fdw (and
+		 * possibly other FDWs) will skip configuration of events for pending
+		 * requests in some cases if as_needrequest isn't empty.  To avoid
+		 * that, discard results we already have.  Note that we need to do
+		 * this on every iteration, as the call to that function may produce
+		 * new results.
+		 */
+		node->as_nasyncresults = 0;
+		bms_free(node->as_needrequest);
+		node->as_needrequest = NULL;
+
+		i = -1;
+		while ((i = bms_next_member(node->as_asyncplans, i)) >= 0)
+		{
+			AsyncRequest *areq = node->as_asyncrequests[i];
+
+			if (areq->callback_pending)
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* Wait or poll for async events. */
+		ExecAppendAsyncEventWait(node);
+	}
+
+	/* Reset async requests. */
+	i = -1;
+	while ((i = bms_next_member(node->as_asyncplans, i)) >= 0)
+	{
+		AsyncRequest *areq = node->as_asyncrequests[i];
+
+		Assert(!areq->callback_pending);
+		areq->request_complete = false;
+		areq->result = NULL;
+	}
+
+	/* Reset state variables. */
+	Assert(node->as_nasyncresults == 0);
+	Assert(node->as_needrequest == NULL);
+	node->as_nasyncremain = 0;
 }
 
 /* ----------------------------------------------------------------

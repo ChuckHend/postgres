@@ -4,7 +4,7 @@
  *	  This file contains routines to support creation of toast tables
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
@@ -26,13 +27,12 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
-#include "catalog/pg_type.h"
 #include "catalog/toasting.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
-#include "storage/lock.h"
-#include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/rel.h"
+#include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
 static void CheckAndCreateToastTable(Oid relOid, Datum reloptions,
@@ -147,6 +147,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	int16		coloptions[2];
 	ObjectAddress baseobject,
 				toastobject;
+	Oid			toast_chunkid_typid = OIDOID;
 
 	/*
 	 * Is it already toasted?
@@ -159,9 +160,28 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 */
 	if (!IsBinaryUpgrade)
 	{
+		StdRdOptToastValueType value_type;
+
 		/* Normal mode, normal check */
 		if (!needs_toast_table(rel))
 			return false;
+
+		value_type = RelationGetToastValueType(rel, STDRD_OPTION_TOAST_VALUE_TYPE_OID);
+
+		/* no default clause to catch new values added */
+		switch (value_type)
+		{
+			case STDRD_OPTION_TOAST_VALUE_TYPE_OID:
+				toast_chunkid_typid = OIDOID;
+				break;
+			case STDRD_OPTION_TOAST_VALUE_TYPE_OID8:
+				toast_chunkid_typid = OID8OID;
+				break;
+			case STDRD_OPTION_TOAST_VALUE_TYPE_INVALID:
+				elog(ERROR, "unexpected toast_value_type value %d",
+					 value_type);
+				break;
+		}
 	}
 	else
 	{
@@ -185,6 +205,24 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 		 */
 		if (!OidIsValid(binary_upgrade_next_toast_pg_class_oid))
 			return false;
+
+		/*
+		 * The attribute type for chunk_id should have been set when
+		 * requesting a TOAST table creation.
+		 */
+		if (!OidIsValid(binary_upgrade_next_toast_chunk_id_typoid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("toast chunk_id type not set while in binary upgrade mode")));
+		if (binary_upgrade_next_toast_chunk_id_typoid != OIDOID &&
+			binary_upgrade_next_toast_chunk_id_typoid != OID8OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cannot support toast chunk_id type %u in binary upgrade mode",
+							binary_upgrade_next_toast_chunk_id_typoid)));
+
+		toast_chunkid_typid = binary_upgrade_next_toast_chunk_id_typoid;
+		binary_upgrade_next_toast_chunk_id_typoid = InvalidOid;
 	}
 
 	/*
@@ -202,11 +240,24 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	snprintf(toast_idxname, sizeof(toast_idxname),
 			 "pg_toast_%u_index", relOid);
 
+	/*
+	 * Special case here.  If OIDOldToast is defined, rely on the existing
+	 * TOAST table and its chunk_id type, not the reloption value.  This
+	 * guarantees that the same TOAST table is kept across rewrites of the
+	 * parent.
+	 */
+	if (OidIsValid(OIDOldToast))
+	{
+		toast_chunkid_typid = get_atttype(OIDOldToast, 1);
+		if (!OidIsValid(toast_chunkid_typid))
+			elog(ERROR, "cache lookup failed for relation %u", OIDOldToast);
+	}
+
 	/* this is pretty painful...  need a tuple descriptor */
 	tupdesc = CreateTemplateTupleDesc(3);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1,
 					   "chunk_id",
-					   OIDOID,
+					   toast_chunkid_typid,
 					   -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2,
 					   "chunk_seq",
@@ -230,6 +281,12 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	TupleDescAttr(tupdesc, 0)->attcompression = InvalidCompressionMethod;
 	TupleDescAttr(tupdesc, 1)->attcompression = InvalidCompressionMethod;
 	TupleDescAttr(tupdesc, 2)->attcompression = InvalidCompressionMethod;
+
+	populate_compact_attribute(tupdesc, 0);
+	populate_compact_attribute(tupdesc, 1);
+	populate_compact_attribute(tupdesc, 2);
+
+	TupleDescFinalize(tupdesc);
 
 	/*
 	 * Toast tables for regular relations go in pg_toast; those for temp
@@ -314,20 +371,28 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	collationIds[0] = InvalidOid;
 	collationIds[1] = InvalidOid;
 
-	opclassIds[0] = OID_BTREE_OPS_OID;
+	if (toast_chunkid_typid == OID8OID)
+		opclassIds[0] = OID8_BTREE_OPS_OID;
+	else
+		opclassIds[0] = OID_BTREE_OPS_OID;
 	opclassIds[1] = INT4_BTREE_OPS_OID;
 
 	coloptions[0] = 0;
 	coloptions[1] = 0;
 
+	/*
+	 * Don't let index creation overwrite progress information for the command
+	 * that caused the TOAST table to be created.
+	 */
 	index_create(toast_rel, toast_idxname, toastIndexOid, InvalidOid,
 				 InvalidOid, InvalidOid,
 				 indexInfo,
 				 list_make2("chunk_id", "chunk_seq"),
 				 BTREE_AM_OID,
 				 rel->rd_rel->reltablespace,
-				 collationIds, opclassIds, NULL, coloptions, (Datum) 0,
-				 INDEX_CREATE_IS_PRIMARY, 0, true, true, NULL);
+				 collationIds, opclassIds, NULL, coloptions, NULL, (Datum) 0,
+				 INDEX_CREATE_IS_PRIMARY | INDEX_CREATE_SUPPRESS_PROGRESS,
+				 0, true, true, NULL);
 
 	table_close(toast_rel, NoLock);
 
@@ -336,21 +401,36 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 */
 	class_rel = table_open(RelationRelationId, RowExclusiveLock);
 
-	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relOid));
-	if (!HeapTupleIsValid(reltup))
-		elog(ERROR, "cache lookup failed for relation %u", relOid);
-
-	((Form_pg_class) GETSTRUCT(reltup))->reltoastrelid = toast_relid;
-
 	if (!IsBootstrapProcessingMode())
 	{
 		/* normal case, use a transactional update */
+		reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relOid));
+		if (!HeapTupleIsValid(reltup))
+			elog(ERROR, "cache lookup failed for relation %u", relOid);
+
+		((Form_pg_class) GETSTRUCT(reltup))->reltoastrelid = toast_relid;
+
 		CatalogTupleUpdate(class_rel, &reltup->t_self, reltup);
 	}
 	else
 	{
 		/* While bootstrapping, we cannot UPDATE, so overwrite in-place */
-		heap_inplace_update(class_rel, reltup);
+
+		ScanKeyData key[1];
+		void	   *state;
+
+		ScanKeyInit(&key[0],
+					Anum_pg_class_oid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relOid));
+		systable_inplace_update_begin(class_rel, ClassOidIndexId, true,
+									  NULL, 1, key, &reltup, &state);
+		if (!HeapTupleIsValid(reltup))
+			elog(ERROR, "cache lookup failed for relation %u", relOid);
+
+		((Form_pg_class) GETSTRUCT(reltup))->reltoastrelid = toast_relid;
+
+		systable_inplace_update_finish(state, reltup);
 	}
 
 	heap_freetuple(reltup);

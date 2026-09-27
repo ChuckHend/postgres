@@ -4,7 +4,7 @@
  *	  definition of the "namespace" system catalog (pg_namespace)
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_namespace.h
@@ -19,7 +19,7 @@
 #define PG_NAMESPACE_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_namespace_d.h"
+#include "catalog/pg_namespace_d.h" /* IWYU pragma: export */
 #include "utils/acl.h"
 
 /* ----------------------------------------------------------------
@@ -32,6 +32,8 @@
  *	nspacl				access privilege list
  * ----------------------------------------------------------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_namespace,2615,NamespaceRelationId)
 {
 	Oid			oid;			/* oid */
@@ -40,9 +42,11 @@ CATALOG(pg_namespace,2615,NamespaceRelationId)
 	Oid			nspowner BKI_DEFAULT(POSTGRES) BKI_LOOKUP(pg_authid);
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
-	aclitem		nspacl[1];
+	aclitem		nspacl[];
 #endif
 } FormData_pg_namespace;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_namespace corresponds to a pointer to a tuple with
@@ -55,6 +59,9 @@ DECLARE_TOAST(pg_namespace, 4163, 4164);
 
 DECLARE_UNIQUE_INDEX(pg_namespace_nspname_index, 2684, NamespaceNameIndexId, pg_namespace, btree(nspname name_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_namespace_oid_index, 2685, NamespaceOidIndexId, pg_namespace, btree(oid oid_ops));
+
+MAKE_SYSCACHE(NAMESPACENAME, pg_namespace_nspname_index, 4);
+MAKE_SYSCACHE(NAMESPACEOID, pg_namespace_oid_index, 16);
 
 /*
  * prototypes for functions in pg_namespace.c

@@ -41,6 +41,9 @@ SELECT pg_replication_origin_create('regress_test_decoding: regression_slot');
 SELECT pg_replication_origin_create('regress_test_decoding: regression_slot');
 ERROR:  duplicate key value violates unique constraint "pg_replication_origin_roname_index"
 DETAIL:  Key (roname)=(regress_test_decoding: regression_slot) already exists.
+-- ensure inactive origin cannot be set as session one if pid is specified
+SELECT pg_replication_origin_session_setup('regress_test_decoding: regression_slot', -1);
+ERROR:  cannot use PID -1 for inactive replication origin with ID 1
 --ensure deletions work (once)
 SELECT pg_replication_origin_create('regress_test_decoding: temp');
  pg_replication_origin_create 
@@ -289,6 +292,10 @@ SELECT pg_replication_origin_session_setup('regress_test_decoding: regression_sl
 (1 row)
 
 INSERT INTO target_tbl(data) VALUES ('test data');
+-- invalid proto_version
+SELECT pg_logical_slot_peek_binary_changes('regression_slot', NULL, NULL, 'proto_version', '', 'publication_names', 'pub', 'origin', 'none');
+ERROR:  invalid proto_version
+CONTEXT:  slot "regression_slot", output plugin "pgoutput", in the startup callback
 -- The replayed change will be filtered.
 SELECT count(*) = 0 FROM pg_logical_slot_peek_binary_changes('regression_slot', NULL, NULL, 'proto_version', '4', 'publication_names', 'pub', 'origin', 'none');
  ?column? 

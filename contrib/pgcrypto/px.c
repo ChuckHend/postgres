@@ -65,6 +65,7 @@ static const struct error_desc px_err_list[] = {
 	{PXE_PGP_UNEXPECTED_PKT, "Unexpected packet in key data"},
 	{PXE_PGP_MATH_FAILED, "Math operation failed"},
 	{PXE_PGP_SHORT_ELGAMAL_KEY, "Elgamal keys must be at least 1024 bits long"},
+	{PXE_PGP_KEY_TOO_BIG, "Session key too big"},
 	{PXE_PGP_UNKNOWN_PUBALGO, "Unknown public-key encryption algorithm"},
 	{PXE_PGP_WRONG_KEY, "Wrong key"},
 	{PXE_PGP_MULTIPLE_KEYS,
@@ -118,13 +119,6 @@ px_strerror(int err)
 	return "Bad error code";
 }
 
-/* memset that must not be optimized away */
-void
-px_memset(void *ptr, int c, size_t len)
-{
-	memset(ptr, c, len);
-}
-
 const char *
 px_resolve_alias(const PX_Alias *list, const char *name)
 {
@@ -146,7 +140,7 @@ px_set_debug_handler(void (*handler) (const char *))
 }
 
 void
-px_debug(const char *fmt,...)
+px_debug(const char *fmt, ...)
 {
 	va_list		ap;
 
@@ -233,7 +227,7 @@ combo_free(PX_Combo *cx)
 {
 	if (cx->cipher)
 		px_cipher_free(cx->cipher);
-	px_memset(cx, 0, sizeof(*cx));
+	explicit_bzero(cx, sizeof(*cx));
 	pfree(cx);
 }
 
@@ -291,7 +285,7 @@ px_find_combo(const char *name, PX_Combo **res)
 
 	PX_Combo   *cx;
 
-	cx = palloc0(sizeof(*cx));
+	cx = palloc0_object(PX_Combo);
 	buf = pstrdup(name);
 
 	err = parse_cipher_name(buf, &s_cipher, &s_pad);

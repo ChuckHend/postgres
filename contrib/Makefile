@@ -5,7 +5,6 @@ top_builddir = ..
 include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = \
-		adminpack	\
 		amcheck		\
 		auth_delay	\
 		auto_explain	\
@@ -33,7 +32,11 @@ SUBDIRS = \
 		passwordcheck	\
 		pg_buffercache	\
 		pg_freespacemap \
+		pg_logicalinspect \
+		pg_overexplain \
+		pg_plan_advice \
 		pg_prewarm	\
+		pg_stash_advice	\
 		pg_stat_statements \
 		pg_surgery	\
 		pg_trgm		\

@@ -3,7 +3,7 @@
  * parse_coerce.c
  *		handle type coercions/conversions for parser
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
@@ -414,6 +415,12 @@ coerce_type(ParseState *pstate, Node *node,
 									 &funcId);
 	if (pathtype != COERCION_PATH_NONE)
 	{
+		Oid			baseTypeId;
+		int32		baseTypeMod;
+
+		baseTypeMod = targetTypeMod;
+		baseTypeId = getBaseTypeAndTypmod(targetTypeId, &baseTypeMod);
+
 		if (pathtype != COERCION_PATH_RELABELTYPE)
 		{
 			/*
@@ -423,12 +430,6 @@ coerce_type(ParseState *pstate, Node *node,
 			 * and we need to extract the correct typmod to use from the
 			 * domain's typtypmod.
 			 */
-			Oid			baseTypeId;
-			int32		baseTypeMod;
-
-			baseTypeMod = targetTypeMod;
-			baseTypeId = getBaseTypeAndTypmod(targetTypeId, &baseTypeMod);
-
 			result = build_coercion_expression(node, pathtype, funcId,
 											   baseTypeId, baseTypeMod,
 											   ccontext, cformat, location);
@@ -454,7 +455,8 @@ coerce_type(ParseState *pstate, Node *node,
 			 * that must be accounted for.  If the destination is a domain
 			 * then we won't need a RelabelType node.
 			 */
-			result = coerce_to_domain(node, InvalidOid, -1, targetTypeId,
+			result = coerce_to_domain(node, baseTypeId, baseTypeMod,
+									  targetTypeId,
 									  ccontext, cformat, location,
 									  false);
 			if (result == node)
@@ -571,6 +573,10 @@ can_coerce_type(int nargs, const Oid *input_typeids, const Oid *target_typeids,
 		if (inputTypeId == targetTypeId)
 			continue;
 
+		/* reject all cases of casting something else to/from "internal" */
+		if (inputTypeId == INTERNALOID || targetTypeId == INTERNALOID)
+			return false;
+
 		/* accept if target is ANY */
 		if (targetTypeId == ANYOID)
 			continue;
@@ -660,10 +666,8 @@ can_coerce_type(int nargs, const Oid *input_typeids, const Oid *target_typeids,
  * Create an expression tree to represent coercion to a domain type.
  *
  * 'arg': input expression
- * 'baseTypeId': base type of domain, if known (pass InvalidOid if caller
- *		has not bothered to look this up)
- * 'baseTypeMod': base type typmod of domain, if known (pass -1 if caller
- *		has not bothered to look this up)
+ * 'baseTypeId': base type of domain
+ * 'baseTypeMod': base type typmod of domain
  * 'typeId': target type to coerce to
  * 'ccontext': context indicator to control coercions
  * 'cformat': coercion display format
@@ -679,9 +683,8 @@ coerce_to_domain(Node *arg, Oid baseTypeId, int32 baseTypeMod, Oid typeId,
 {
 	CoerceToDomain *result;
 
-	/* Get the base type if it hasn't been supplied */
-	if (baseTypeId == InvalidOid)
-		baseTypeId = getBaseTypeAndTypmod(typeId, &baseTypeMod);
+	/* We now require the caller to supply correct baseTypeId/baseTypeMod */
+	Assert(OidIsValid(baseTypeId));
 
 	/* If it isn't a domain, return the node as it was passed in */
 	if (baseTypeId == typeId)
@@ -1036,13 +1039,12 @@ coerce_record_to_complex(ParseState *pstate, Node *node,
 	else if (node && IsA(node, Var) &&
 			 ((Var *) node)->varattno == InvalidAttrNumber)
 	{
-		int			rtindex = ((Var *) node)->varno;
-		int			sublevels_up = ((Var *) node)->varlevelsup;
-		int			vlocation = ((Var *) node)->location;
+		Var		   *var = (Var *) node;
 		ParseNamespaceItem *nsitem;
 
-		nsitem = GetNSItemByRangeTablePosn(pstate, rtindex, sublevels_up);
-		args = expandNSItemVars(pstate, nsitem, sublevels_up, vlocation, NULL);
+		nsitem = GetNSItemByVar(pstate, var);
+		args = expandNSItemVars(pstate, nsitem, var->varlevelsup,
+								var->location, NULL);
 	}
 	else
 		ereport(ERROR,
@@ -1261,6 +1263,43 @@ coerce_to_specific_type(ParseState *pstate, Node *node,
 	return coerce_to_specific_type_typmod(pstate, node,
 										  targetTypeId, -1,
 										  constructName);
+}
+
+/*
+ * coerce_null_to_domain()
+ *		Build a NULL constant, then wrap it in CoerceToDomain
+ *		if the desired type is a domain type.  This allows any
+ *		NOT NULL domain constraint to be enforced at runtime.
+ */
+Node *
+coerce_null_to_domain(Oid typid, int32 typmod, Oid collation,
+					  int typlen, bool typbyval)
+{
+	Node	   *result;
+	Oid			baseTypeId;
+	int32		baseTypeMod = typmod;
+
+	/*
+	 * The constant must appear to have the domain's base type/typmod, else
+	 * coerce_to_domain() will apply a length coercion which is useless.
+	 */
+	baseTypeId = getBaseTypeAndTypmod(typid, &baseTypeMod);
+	result = (Node *) makeConst(baseTypeId,
+								baseTypeMod,
+								collation,
+								typlen,
+								(Datum) 0,
+								true,	/* isnull */
+								typbyval);
+	if (typid != baseTypeId)
+		result = coerce_to_domain(result,
+								  baseTypeId, baseTypeMod,
+								  typid,
+								  COERCION_IMPLICIT,
+								  COERCE_IMPLICIT_CAST,
+								  -1,
+								  false);
+	return result;
 }
 
 /*
@@ -2932,7 +2971,8 @@ check_valid_internal_signature(Oid ret_type,
 }
 
 
-/* TypeCategory()
+/*
+ * TypeCategory()
  *		Assign a category to the specified type OID.
  *
  * NB: this must not return TYPCATEGORY_INVALID.
@@ -2949,7 +2989,8 @@ TypeCategory(Oid type)
 }
 
 
-/* IsPreferredType()
+/*
+ * IsPreferredType()
  *		Check if this type is a preferred type for the given category.
  *
  * If category is TYPCATEGORY_INVALID, then we'll return true for preferred
@@ -2970,7 +3011,8 @@ IsPreferredType(TYPCATEGORY category, Oid type)
 }
 
 
-/* IsBinaryCoercible()
+/*
+ * IsBinaryCoercible()
  *		Check if srctype is binary-coercible to targettype.
  *
  * This notion allows us to cheat and directly exchange values without
@@ -2999,7 +3041,8 @@ IsBinaryCoercible(Oid srctype, Oid targettype)
 	return IsBinaryCoercibleWithCast(srctype, targettype, &castoid);
 }
 
-/* IsBinaryCoercibleWithCast()
+/*
+ * IsBinaryCoercibleWithCast()
  *		Check if srctype is binary-coercible to targettype.
  *
  * This variant also returns the OID of the pg_cast entry if one is involved.
@@ -3133,6 +3176,10 @@ find_coercion_pathway(Oid targetTypeId, Oid sourceTypeId,
 	/* Domains are always coercible to and from their base type */
 	if (sourceTypeId == targetTypeId)
 		return COERCION_PATH_RELABELTYPE;
+
+	/* Reject all cases of casting something else to/from "internal" */
+	if (sourceTypeId == INTERNALOID || targetTypeId == INTERNALOID)
+		return COERCION_PATH_NONE;
 
 	/* Look in pg_cast */
 	tuple = SearchSysCache2(CASTSOURCETARGET,

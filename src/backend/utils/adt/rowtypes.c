@@ -3,7 +3,7 @@
  * rowtypes.c
  *	  I/O and comparison functions for generic composite types.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,6 @@
 #include "access/detoast.h"
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
-#include "common/hashfn.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
@@ -141,8 +140,8 @@ record_in(PG_FUNCTION_ARGS)
 		my_extra->ncolumns = ncolumns;
 	}
 
-	values = (Datum *) palloc(ncolumns * sizeof(Datum));
-	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
 
 	/*
 	 * Scan the string.  We use "buf" to accumulate the de-quoted data for
@@ -168,7 +167,7 @@ record_in(PG_FUNCTION_ARGS)
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		ColumnIOData *column_info = &my_extra->columns[i];
 		Oid			column_type = att->atttypid;
-		char	   *column_data;
+		const char *column_data;
 
 		/* Ignore dropped columns in datatype, but fill with nulls */
 		if (att->attisdropped)
@@ -384,8 +383,8 @@ record_out(PG_FUNCTION_ARGS)
 		my_extra->ncolumns = ncolumns;
 	}
 
-	values = (Datum *) palloc(ncolumns * sizeof(Datum));
-	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
 
 	/* Break down the tuple into fields */
 	heap_deform_tuple(&tuple, tupdesc, values, nulls);
@@ -540,8 +539,8 @@ record_recv(PG_FUNCTION_ARGS)
 		my_extra->ncolumns = ncolumns;
 	}
 
-	values = (Datum *) palloc(ncolumns * sizeof(Datum));
-	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
 
 	/* Fetch number of columns user thinks it has */
 	usercols = pq_getmsgint(buf, 4);
@@ -569,7 +568,6 @@ record_recv(PG_FUNCTION_ARGS)
 		int			itemlen;
 		StringInfoData item_buf;
 		StringInfo	bufptr;
-		char		csave;
 
 		/* Ignore dropped columns in datatype, but fill with nulls */
 		if (att->attisdropped)
@@ -619,25 +617,19 @@ record_recv(PG_FUNCTION_ARGS)
 			/* -1 length means NULL */
 			bufptr = NULL;
 			nulls[i] = true;
-			csave = 0;			/* keep compiler quiet */
 		}
 		else
 		{
+			char	   *strbuff;
+
 			/*
-			 * Rather than copying data around, we just set up a phony
-			 * StringInfo pointing to the correct portion of the input buffer.
-			 * We assume we can scribble on the input buffer so as to maintain
-			 * the convention that StringInfos have a trailing null.
+			 * Rather than copying data around, we just initialize a
+			 * StringInfo pointing to the correct portion of the message
+			 * buffer.
 			 */
-			item_buf.data = &buf->data[buf->cursor];
-			item_buf.maxlen = itemlen + 1;
-			item_buf.len = itemlen;
-			item_buf.cursor = 0;
-
+			strbuff = &buf->data[buf->cursor];
 			buf->cursor += itemlen;
-
-			csave = buf->data[buf->cursor];
-			buf->data[buf->cursor] = '\0';
+			initReadOnlyStringInfo(&item_buf, strbuff, itemlen);
 
 			bufptr = &item_buf;
 			nulls[i] = false;
@@ -667,8 +659,6 @@ record_recv(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 						 errmsg("improper binary format in record column %d",
 								i + 1)));
-
-			buf->data[buf->cursor] = csave;
 		}
 	}
 
@@ -751,8 +741,8 @@ record_send(PG_FUNCTION_ARGS)
 		my_extra->ncolumns = ncolumns;
 	}
 
-	values = (Datum *) palloc(ncolumns * sizeof(Datum));
-	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
 
 	/* Break down the tuple into fields */
 	heap_deform_tuple(&tuple, tupdesc, values, nulls);
@@ -911,11 +901,11 @@ record_cmp(FunctionCallInfo fcinfo)
 	}
 
 	/* Break down the tuples into fields */
-	values1 = (Datum *) palloc(ncolumns1 * sizeof(Datum));
-	nulls1 = (bool *) palloc(ncolumns1 * sizeof(bool));
+	values1 = palloc_array(Datum, ncolumns1);
+	nulls1 = palloc_array(bool, ncolumns1);
 	heap_deform_tuple(&tuple1, tupdesc1, values1, nulls1);
-	values2 = (Datum *) palloc(ncolumns2 * sizeof(Datum));
-	nulls2 = (bool *) palloc(ncolumns2 * sizeof(bool));
+	values2 = palloc_array(Datum, ncolumns2);
+	nulls2 = palloc_array(bool, ncolumns2);
 	heap_deform_tuple(&tuple2, tupdesc2, values2, nulls2);
 
 	/*
@@ -1155,11 +1145,11 @@ record_eq(PG_FUNCTION_ARGS)
 	}
 
 	/* Break down the tuples into fields */
-	values1 = (Datum *) palloc(ncolumns1 * sizeof(Datum));
-	nulls1 = (bool *) palloc(ncolumns1 * sizeof(bool));
+	values1 = palloc_array(Datum, ncolumns1);
+	nulls1 = palloc_array(bool, ncolumns1);
 	heap_deform_tuple(&tuple1, tupdesc1, values1, nulls1);
-	values2 = (Datum *) palloc(ncolumns2 * sizeof(Datum));
-	nulls2 = (bool *) palloc(ncolumns2 * sizeof(bool));
+	values2 = palloc_array(Datum, ncolumns2);
+	nulls2 = palloc_array(bool, ncolumns2);
 	heap_deform_tuple(&tuple2, tupdesc2, values2, nulls2);
 
 	/*
@@ -1325,6 +1315,24 @@ btrecordcmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(record_cmp(fcinfo));
 }
 
+Datum
+record_larger(PG_FUNCTION_ARGS)
+{
+	if (record_cmp(fcinfo) > 0)
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+	else
+		PG_RETURN_DATUM(PG_GETARG_DATUM(1));
+}
+
+Datum
+record_smaller(PG_FUNCTION_ARGS)
+{
+	if (record_cmp(fcinfo) < 0)
+		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+	else
+		PG_RETURN_DATUM(PG_GETARG_DATUM(1));
+}
+
 
 /*
  * record_image_cmp :
@@ -1417,11 +1425,11 @@ record_image_cmp(FunctionCallInfo fcinfo)
 	}
 
 	/* Break down the tuples into fields */
-	values1 = (Datum *) palloc(ncolumns1 * sizeof(Datum));
-	nulls1 = (bool *) palloc(ncolumns1 * sizeof(bool));
+	values1 = palloc_array(Datum, ncolumns1);
+	nulls1 = palloc_array(bool, ncolumns1);
 	heap_deform_tuple(&tuple1, tupdesc1, values1, nulls1);
-	values2 = (Datum *) palloc(ncolumns2 * sizeof(Datum));
-	nulls2 = (bool *) palloc(ncolumns2 * sizeof(bool));
+	values2 = palloc_array(Datum, ncolumns2);
+	nulls2 = palloc_array(bool, ncolumns2);
 	heap_deform_tuple(&tuple2, tupdesc2, values2, nulls2);
 
 	/*
@@ -1507,8 +1515,8 @@ record_image_cmp(FunctionCallInfo fcinfo)
 			{
 				Size		len1,
 							len2;
-				struct varlena *arg1val;
-				struct varlena *arg2val;
+				varlena    *arg1val;
+				varlena    *arg2val;
 
 				len1 = toast_raw_datum_size(values1[i1]);
 				len2 = toast_raw_datum_size(values2[i2]);
@@ -1521,9 +1529,9 @@ record_image_cmp(FunctionCallInfo fcinfo)
 				if ((cmpresult == 0) && (len1 != len2))
 					cmpresult = (len1 < len2) ? -1 : 1;
 
-				if ((Pointer) arg1val != (Pointer) values1[i1])
+				if (arg1val != DatumGetPointer(values1[i1]))
 					pfree(arg1val);
-				if ((Pointer) arg2val != (Pointer) values2[i2])
+				if (arg2val != DatumGetPointer(values2[i2]))
 					pfree(arg2val);
 			}
 			else
@@ -1663,11 +1671,11 @@ record_image_eq(PG_FUNCTION_ARGS)
 	}
 
 	/* Break down the tuples into fields */
-	values1 = (Datum *) palloc(ncolumns1 * sizeof(Datum));
-	nulls1 = (bool *) palloc(ncolumns1 * sizeof(bool));
+	values1 = palloc_array(Datum, ncolumns1);
+	nulls1 = palloc_array(bool, ncolumns1);
 	heap_deform_tuple(&tuple1, tupdesc1, values1, nulls1);
-	values2 = (Datum *) palloc(ncolumns2 * sizeof(Datum));
-	nulls2 = (bool *) palloc(ncolumns2 * sizeof(bool));
+	values2 = palloc_array(Datum, ncolumns2);
+	nulls2 = palloc_array(bool, ncolumns2);
 	heap_deform_tuple(&tuple2, tupdesc2, values2, nulls2);
 
 	/*
@@ -1855,8 +1863,8 @@ hash_record(PG_FUNCTION_ARGS)
 	}
 
 	/* Break down the tuple into fields */
-	values = (Datum *) palloc(ncolumns * sizeof(Datum));
-	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
 	heap_deform_tuple(&tuple, tupdesc, values, nulls);
 
 	for (int i = 0; i < ncolumns; i++)
@@ -1976,8 +1984,8 @@ hash_record_extended(PG_FUNCTION_ARGS)
 	}
 
 	/* Break down the tuple into fields */
-	values = (Datum *) palloc(ncolumns * sizeof(Datum));
-	nulls = (bool *) palloc(ncolumns * sizeof(bool));
+	values = palloc_array(Datum, ncolumns);
+	nulls = palloc_array(bool, ncolumns);
 	heap_deform_tuple(&tuple, tupdesc, values, nulls);
 
 	for (int i = 0; i < ncolumns; i++)
@@ -2022,7 +2030,7 @@ hash_record_extended(PG_FUNCTION_ARGS)
 			locfcinfo->args[0].value = values[i];
 			locfcinfo->args[0].isnull = false;
 			locfcinfo->args[1].value = Int64GetDatum(seed);
-			locfcinfo->args[0].isnull = false;
+			locfcinfo->args[1].isnull = false;
 			element_hash = DatumGetUInt64(FunctionCallInvoke(locfcinfo));
 
 			/* We don't expect hash support functions to return null */

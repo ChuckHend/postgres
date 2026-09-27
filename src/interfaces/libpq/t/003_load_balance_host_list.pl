@@ -1,6 +1,6 @@
-# Copyright (c) 2023, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Config;
 use PostgreSQL::Test::Utils;
 use PostgreSQL::Test::Cluster;
@@ -51,20 +51,23 @@ foreach my $i (1 .. 50)
 		sql => "SELECT 'connect2'");
 }
 
-my $node1_occurences = () =
+my $node1_occurrences = () =
   $node1->log_content() =~ /statement: SELECT 'connect2'/g;
-my $node2_occurences = () =
+my $node2_occurrences = () =
   $node2->log_content() =~ /statement: SELECT 'connect2'/g;
-my $node3_occurences = () =
+my $node3_occurrences = () =
   $node3->log_content() =~ /statement: SELECT 'connect2'/g;
 
-my $total_occurences =
-  $node1_occurences + $node2_occurences + $node3_occurences;
+my $total_occurrences =
+  $node1_occurrences + $node2_occurrences + $node3_occurrences;
 
-ok($node1_occurences > 1, "received at least one connection on node1");
-ok($node2_occurences > 1, "received at least one connection on node2");
-ok($node3_occurences > 1, "received at least one connection on node3");
-ok($total_occurences == 50, "received 50 connections across all nodes");
+cmp_ok($node1_occurrences, '>', 1,
+	"received at least one connection on node1");
+cmp_ok($node2_occurrences, '>', 1,
+	"received at least one connection on node2");
+cmp_ok($node3_occurrences, '>', 1,
+	"received at least one connection on node3");
+is($total_occurrences, 50, "received 50 connections across all nodes");
 
 $node1->stop();
 $node2->stop();
@@ -73,7 +76,7 @@ $node2->stop();
 # working one.
 $node3->connect_ok(
 	"host=$hostlist port=$portlist load_balance_hosts=disable",
-	"load_balance_hosts=disable continues until it connects to the a working node",
+	"load_balance_hosts=disable continues until it connects to a working node",
 	sql => "SELECT 'connect3'",
 	log_like => [qr/statement: SELECT 'connect3'/]);
 
@@ -83,7 +86,7 @@ foreach my $i (1 .. 5)
 {
 	$node3->connect_ok(
 		"host=$hostlist port=$portlist load_balance_hosts=random",
-		"load_balance_hosts=random continues until it connects to the a working node",
+		"load_balance_hosts=random continues until it connects to a working node",
 		sql => "SELECT 'connect4'",
 		log_like => [qr/statement: SELECT 'connect4'/]);
 }

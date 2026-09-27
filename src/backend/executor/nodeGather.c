@@ -3,7 +3,7 @@
  * nodeGather.c
  *	  Support routines for scanning a plan via multiple workers.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * A Gather executor launches parallel workers to run multiple copies of a
@@ -30,18 +30,14 @@
 
 #include "postgres.h"
 
-#include "access/relscan.h"
-#include "access/xact.h"
-#include "executor/execdebug.h"
 #include "executor/execParallel.h"
+#include "executor/executor.h"
 #include "executor/nodeGather.h"
-#include "executor/nodeSubplan.h"
 #include "executor/tqueue.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
-#include "pgstat.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
+#include "storage/latch.h"
+#include "utils/wait_event.h"
 
 
 static TupleTableSlot *ExecGather(PlanState *pstate);
@@ -187,14 +183,20 @@ ExecGather(PlanState *pstate)
 			/* We save # workers launched for the benefit of EXPLAIN */
 			node->nworkers_launched = pcxt->nworkers_launched;
 
+			/*
+			 * Count number of workers originally wanted and actually
+			 * launched.
+			 */
+			estate->es_parallel_workers_to_launch += pcxt->nworkers_to_launch;
+			estate->es_parallel_workers_launched += pcxt->nworkers_launched;
+
 			/* Set up tuple queue readers to read the results. */
 			if (pcxt->nworkers_launched > 0)
 			{
 				ExecParallelCreateReaders(node->pei);
 				/* Make a working array showing the active readers */
 				node->nreaders = pcxt->nworkers_launched;
-				node->reader = (TupleQueueReader **)
-					palloc(node->nreaders * sizeof(TupleQueueReader *));
+				node->reader = palloc_array(TupleQueueReader *, node->nreaders);
 				memcpy(node->reader, node->pei->reader,
 					   node->nreaders * sizeof(TupleQueueReader *));
 			}

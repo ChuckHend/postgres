@@ -4,7 +4,7 @@
  *		Functions for archiving WAL files and restoring from the archive.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlogarchive.c
@@ -26,12 +26,12 @@
 #include "common/percentrepl.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/startup.h"
 #include "postmaster/pgarch.h"
+#include "postmaster/startup.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
-#include "storage/lwlock.h"
+#include "utils/wait_event.h"
 
 /*
  * Attempt to retrieve the specified file from off-line archival storage.
@@ -159,20 +159,27 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 			(errmsg_internal("executing restore command \"%s\"",
 							 xlogRestoreCmd)));
 
+	fflush(NULL);
+	pgstat_report_wait_start(WAIT_EVENT_RESTORE_COMMAND);
+
 	/*
-	 * Check signals before restore command and reset afterwards.
+	 * PreRestoreCommand() informs the SIGTERM handler for the startup process
+	 * that it should proc_exit() right away.  This is done for the duration
+	 * of the system() call because there isn't a good way to break out while
+	 * it is executing.  Since we might call proc_exit() in a signal handler,
+	 * it is best to put any additional logic before or after the
+	 * PreRestoreCommand()/PostRestoreCommand() section.
 	 */
 	PreRestoreCommand();
 
 	/*
 	 * Copy xlog from archival storage to XLOGDIR
 	 */
-	fflush(NULL);
-	pgstat_report_wait_start(WAIT_EVENT_RESTORE_COMMAND);
 	rc = system(xlogRestoreCmd);
-	pgstat_report_wait_end();
 
 	PostRestoreCommand();
+
+	pgstat_report_wait_end();
 	pfree(xlogRestoreCmd);
 
 	if (rc == 0)
@@ -227,7 +234,7 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 			ereport(elevel,
 					(errcode_for_file_access(),
 					 errmsg("could not stat file \"%s\": %m", xlogpath),
-					 errdetail("restore_command returned a zero exit status, but stat() failed.")));
+					 errdetail("\"restore_command\" returned a zero exit status, but stat() failed.")));
 		}
 	}
 
@@ -359,9 +366,8 @@ KeepFileRestoredFromArchive(const char *path, const char *xlogfname)
 
 	if (stat(xlogfpath, &statbuf) == 0)
 	{
-		char		oldpath[MAXPGPATH];
-
 #ifdef WIN32
+		char		oldpath[MAXPGPATH];
 		static unsigned int deletedcounter = 1;
 
 		/*
@@ -373,6 +379,10 @@ KeepFileRestoredFromArchive(const char *path, const char *xlogfname)
 		 * name first. Use a counter to create a unique filename, because the
 		 * same file might be restored from the archive multiple times, and a
 		 * walsender could still be holding onto an old deleted version of it.
+		 *
+		 * Note that this leaves a short window where the target name does not
+		 * exist, during which a concurrent walsender opening the segment
+		 * could fail.
 		 */
 		snprintf(oldpath, MAXPGPATH, "%s.deleted%u",
 				 xlogfpath, deletedcounter++);
@@ -383,15 +393,13 @@ KeepFileRestoredFromArchive(const char *path, const char *xlogfname)
 					 errmsg("could not rename file \"%s\" to \"%s\": %m",
 							xlogfpath, oldpath)));
 		}
-#else
-		/* same-size buffers, so this never truncates */
-		strlcpy(oldpath, xlogfpath, MAXPGPATH);
-#endif
+
 		if (unlink(oldpath) != 0)
 			ereport(FATAL,
 					(errcode_for_file_access(),
 					 errmsg("could not remove file \"%s\": %m",
-							xlogfpath)));
+							oldpath)));
+#endif
 		reload = true;
 	}
 

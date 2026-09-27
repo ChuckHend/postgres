@@ -17,7 +17,7 @@
  * any database access.
  *
  *
- * Copyright (c) 2006-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2006-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/cache/ts_cache.c
@@ -44,6 +44,7 @@
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/guc_hooks.h"
+#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -91,7 +92,7 @@ static Oid	TSCurrentConfigCache = InvalidOid;
  * table address as the "arg".
  */
 static void
-InvalidateTSCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
+InvalidateTSCacheCallBack(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	HTAB	   *hash = (HTAB *) DatumGetPointer(arg);
 	HASH_SEQ_STATUS status;
@@ -279,36 +280,49 @@ lookup_ts_dictionary_cache(Oid dictId)
 			elog(ERROR, "text search template %u has no lexize method",
 				 template->tmpllexize);
 
+		/*
+		 * OK, create or clear out the hashtable entry
+		 */
 		if (entry == NULL)
 		{
 			bool		found;
 
-			/* Now make the cache entry */
 			entry = (TSDictionaryCacheEntry *)
 				hash_search(TSDictionaryCacheHash,
 							&dictId,
 							HASH_ENTER, &found);
 			Assert(!found);		/* it wasn't there a moment ago */
 
-			/* Create private memory context the first time through */
+			memset(entry, 0, sizeof(TSDictionaryCacheEntry));
+			entry->dictId = dictId;
+			saveCtx = NULL;
+		}
+		else
+		{
+			saveCtx = entry->dictCtx;	/* could be NULL if we failed before */
+			memset(entry, 0, sizeof(TSDictionaryCacheEntry));
+			entry->dictId = dictId;
+			entry->dictCtx = saveCtx;
+		}
+
+		/*
+		 * Create or clear the entry's private memory context
+		 */
+		if (saveCtx == NULL)
+		{
 			saveCtx = AllocSetContextCreate(CacheMemoryContext,
 											"TS dictionary",
 											ALLOCSET_SMALL_SIZES);
+			entry->dictCtx = saveCtx;
 			MemoryContextCopyAndSetIdentifier(saveCtx, NameStr(dict->dictname));
 		}
 		else
 		{
-			/* Clear the existing entry's private context */
-			saveCtx = entry->dictCtx;
 			/* Don't let context's ident pointer dangle while we reset it */
 			MemoryContextSetIdentifier(saveCtx, NULL);
 			MemoryContextReset(saveCtx);
 			MemoryContextCopyAndSetIdentifier(saveCtx, NameStr(dict->dictname));
 		}
-
-		MemSet(entry, 0, sizeof(TSDictionaryCacheEntry));
-		entry->dictId = dictId;
-		entry->dictCtx = saveCtx;
 
 		entry->lexizeOid = template->tmpllexize;
 
@@ -321,7 +335,9 @@ lookup_ts_dictionary_cache(Oid dictId)
 
 			/*
 			 * Init method runs in dictionary's private memory context, and we
-			 * make sure the options are stored there too
+			 * make sure the options are stored there too.  This typically
+			 * results in a small amount of memory leakage, but it's not worth
+			 * complicating the API for tmplinit functions to avoid it.
 			 */
 			oldcontext = MemoryContextSwitchTo(entry->dictCtx);
 

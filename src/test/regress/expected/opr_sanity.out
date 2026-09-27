@@ -487,7 +487,7 @@ AND case proargtypes[array_length(proargtypes, 1)-1]
 	ELSE (SELECT t.oid
 		  FROM pg_type t
 		  WHERE t.typarray = proargtypes[array_length(proargtypes, 1)-1])
-	END  != provariadic;
+	END IS DISTINCT FROM provariadic;
  oid | provariadic | proargtypes 
 -----+-------------+-------------
 (0 rows)
@@ -855,7 +855,6 @@ sha224(bytea)
 sha256(bytea)
 sha384(bytea)
 sha512(bytea)
-gen_random_uuid()
 starts_with(text,text)
 macaddr8_eq(macaddr8,macaddr8)
 macaddr8_lt(macaddr8,macaddr8)
@@ -872,6 +871,33 @@ xid8ge(xid8,xid8)
 xid8eq(xid8,xid8)
 xid8ne(xid8,xid8)
 xid8cmp(xid8,xid8)
+uuid_extract_timestamp(uuid)
+uuid_extract_version(uuid)
+crc32(bytea)
+crc32c(bytea)
+bytea(smallint)
+bytea(integer)
+bytea(bigint)
+bytea_larger(bytea,bytea)
+bytea_smaller(bytea,bytea)
+oid8eq(oid8,oid8)
+oid8ne(oid8,oid8)
+oid8lt(oid8,oid8)
+oid8le(oid8,oid8)
+oid8gt(oid8,oid8)
+oid8ge(oid8,oid8)
+btoid8cmp(oid8,oid8)
+bytea(uuid)
+tid_block(tid)
+tid_offset(tid)
+uuid_larger(uuid,uuid)
+uuid_smaller(uuid,uuid)
+-- Check that functions without argument are not marked as leakproof.
+SELECT p1.oid::regprocedure
+FROM pg_proc p1 JOIN pg_namespace pn
+     ON pronamespace = pn.oid
+WHERE nspname = 'pg_catalog' AND proleakproof AND pronargs = 0
+ORDER BY 1;
 -- restore normal output mode
 \a\t
 -- List of functions used by libpq's fe-lobj.c
@@ -1009,16 +1035,16 @@ WHERE c.castmethod = 'b' AND
                     k.casttarget = c.castsource);
     castsource     |    casttarget     | castfunc | castcontext 
 -------------------+-------------------+----------+-------------
- text              | character         |        0 | i
+ xml               | character varying |        0 | a
+ xml               | text              |        0 | a
  character varying | character         |        0 | i
- pg_node_tree      | text              |        0 | i
- pg_ndistinct      | bytea             |        0 | i
- pg_dependencies   | bytea             |        0 | i
+ text              | character         |        0 | i
+ xml               | character         |        0 | a
  pg_mcv_list       | bytea             |        0 | i
  cidr              | inet              |        0 | i
- xml               | text              |        0 | a
- xml               | character varying |        0 | a
- xml               | character         |        0 | a
+ pg_dependencies   | bytea             |        0 | i
+ pg_node_tree      | text              |        0 | i
+ pg_ndistinct      | bytea             |        0 | i
 (10 rows)
 
 -- **************** pg_conversion ****************
@@ -1456,7 +1482,7 @@ WHERE aggfnoid = 0 OR aggtransfn = 0 OR
     (aggkind = 'n' AND aggnumdirectargs > 0) OR
     aggfinalmodify NOT IN ('r', 's', 'w') OR
     aggmfinalmodify NOT IN ('r', 's', 'w') OR
-    aggtranstype = 0 OR aggtransspace < 0 OR aggmtransspace < 0;
+    aggtranstype = 0 OR aggmtransspace < 0;
  ctid | aggfnoid 
 ------+----------
 (0 rows)
@@ -1920,7 +1946,7 @@ WHERE p1.oid = a1.amhandler AND a1.amtype = 'i' AND
 -- Check for table amhandler functions with the wrong signature
 SELECT a1.oid, a1.amname, p1.oid, p1.proname
 FROM pg_am AS a1, pg_proc AS p1
-WHERE p1.oid = a1.amhandler AND a1.amtype = 's' AND
+WHERE p1.oid = a1.amhandler AND a1.amtype = 't' AND
     (p1.prorettype != 'table_am_handler'::regtype
      OR p1.proretset
      OR p1.pronargs != 1
@@ -2208,6 +2234,7 @@ ORDER BY 1, 2, 3;
                     | array_ops        | array_ops        | anyarray
                     | float_ops        | float4_ops       | real
                     | float_ops        | float8_ops       | double precision
+                    | interval_ops     | interval_ops     | interval
                     | jsonb_ops        | jsonb_ops        | jsonb
                     | multirange_ops   | multirange_ops   | anymultirange
                     | numeric_ops      | numeric_ops      | numeric
@@ -2216,7 +2243,7 @@ ORDER BY 1, 2, 3;
                     | record_ops       | record_ops       | record
                     | tsquery_ops      | tsquery_ops      | tsquery
                     | tsvector_ops     | tsvector_ops     | tsvector
-(15 rows)
+(16 rows)
 
 -- **************** pg_index ****************
 -- Look for illegal values in pg_index fields.

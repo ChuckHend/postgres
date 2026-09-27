@@ -2,7 +2,7 @@
  *
  * rmtree.c
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -64,7 +64,7 @@ rmtree(const char *path, bool rmtopdir)
 		return false;
 	}
 
-	dirnames = (char **) palloc(sizeof(char *) * dirnames_capacity);
+	dirnames = palloc_array(char *, dirnames_capacity);
 
 	while (errno = 0, (de = readdir(dir)))
 	{
@@ -85,8 +85,7 @@ rmtree(const char *path, bool rmtopdir)
 				 */
 				if (dirnames_size == dirnames_capacity)
 				{
-					dirnames = repalloc(dirnames,
-										sizeof(char *) * dirnames_capacity * 2);
+					dirnames = repalloc_array(dirnames, char *, dirnames_capacity * 2);
 					dirnames_capacity *= 2;
 				}
 				dirnames[dirnames_size++] = pstrdup(pathbuf);

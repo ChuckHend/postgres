@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 backend_sources += files(
   'atomics.c',
@@ -30,4 +30,4 @@ if host_system == 'windows'
 endif
 
 # autoconf generates the file there, ensure we get a conflict
-generated_sources_ac += {'src/backend/port': ['pg_sema.c', 'pg_shmem.c', 'tas.s']}
+generated_sources_ac += {'src/backend/port': ['pg_sema.c', 'pg_shmem.c']}

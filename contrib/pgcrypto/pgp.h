@@ -38,7 +38,7 @@ enum PGP_S2K_TYPE
 {
 	PGP_S2K_SIMPLE = 0,
 	PGP_S2K_SALTED = 1,
-	PGP_S2K_ISALTED = 3
+	PGP_S2K_ISALTED = 3,
 };
 
 enum PGP_PKT_TYPE
@@ -60,7 +60,7 @@ enum PGP_PKT_TYPE
 	PGP_PKT_USER_ATTR = 17,
 	PGP_PKT_SYMENCRYPTED_DATA_MDC = 18,
 	PGP_PKT_MDC = 19,
-	PGP_PKT_PRIV_61 = 61		/* occurs in gpg secring */
+	PGP_PKT_PRIV_61 = 61,		/* occurs in gpg secring */
 };
 
 enum PGP_PUB_ALGO_TYPE
@@ -69,7 +69,7 @@ enum PGP_PUB_ALGO_TYPE
 	PGP_PUB_RSA_ENCRYPT = 2,
 	PGP_PUB_RSA_SIGN = 3,
 	PGP_PUB_ELG_ENCRYPT = 16,
-	PGP_PUB_DSA_SIGN = 17
+	PGP_PUB_DSA_SIGN = 17,
 };
 
 enum PGP_SYMENC_TYPE
@@ -84,7 +84,7 @@ enum PGP_SYMENC_TYPE
 	PGP_SYM_AES_128 = 7,		/* should */
 	PGP_SYM_AES_192 = 8,
 	PGP_SYM_AES_256 = 9,
-	PGP_SYM_TWOFISH = 10
+	PGP_SYM_TWOFISH = 10,
 };
 
 enum PGP_COMPR_TYPE
@@ -92,7 +92,7 @@ enum PGP_COMPR_TYPE
 	PGP_COMPR_NONE = 0,			/* must */
 	PGP_COMPR_ZIP = 1,			/* should */
 	PGP_COMPR_ZLIB = 2,
-	PGP_COMPR_BZIP2 = 3
+	PGP_COMPR_BZIP2 = 3,
 };
 
 enum PGP_DIGEST_TYPE
@@ -106,7 +106,7 @@ enum PGP_DIGEST_TYPE
 	PGP_DIGEST_HAVAL5_160 = 7,	/* obsolete */
 	PGP_DIGEST_SHA256 = 8,
 	PGP_DIGEST_SHA384 = 9,
-	PGP_DIGEST_SHA512 = 10
+	PGP_DIGEST_SHA512 = 10,
 };
 
 #define PGP_MAX_KEY    (256/8)
@@ -150,10 +150,12 @@ struct PGP_Context
 	int			convert_crlf;
 	int			unicode_mode;
 
+	/* DANGEROUS recovery aid for CVE-2026-14663. Applies only to decryption. */
+	int			ignore_cipher_failure;
+
 	/*
 	 * internal variables
 	 */
-	int			mdc_checked;
 	int			corrupt_prefix; /* prefix failed RFC 4880 "quick check" */
 	int			unsupported_compr;	/* has bzip2 compression */
 	int			unexpected_binary;	/* binary data seen in text_mode */
@@ -258,6 +260,7 @@ int			pgp_set_compress_level(PGP_Context *ctx, int level);
 int			pgp_set_text_mode(PGP_Context *ctx, int mode);
 int			pgp_set_unicode_mode(PGP_Context *ctx, int mode);
 int			pgp_get_unicode_mode(PGP_Context *ctx);
+int			pgp_set_ignore_cipher_failure(PGP_Context *ctx, int ignore);
 
 int			pgp_set_symkey(PGP_Context *ctx, const uint8 *key, int len);
 int			pgp_set_pubkey(PGP_Context *ctx, MBuf *keypkt,
@@ -278,7 +281,8 @@ int			pgp_s2k_process(PGP_S2K *s2k, int cipher, const uint8 *key, int key_len);
 
 typedef struct PGP_CFB PGP_CFB;
 int			pgp_cfb_create(PGP_CFB **ctx_p, int algo,
-						   const uint8 *key, int key_len, int resync, uint8 *iv);
+						   const uint8 *key, int key_len, int resync, uint8 *iv,
+						   int ignore_decrypt_cipher_failure);
 void		pgp_cfb_free(PGP_CFB *ctx);
 int			pgp_cfb_encrypt(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst);
 int			pgp_cfb_decrypt(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst);

@@ -3,7 +3,7 @@
  * nodeMemoize.c
  *	  Routines to handle caching of results from parameterized nodes
  *
- * Portions Copyright (c) 2021-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,7 +13,7 @@
  * Memoize nodes are intended to sit above parameterized nodes in the plan
  * tree in order to cache results from them.  The intention here is that a
  * repeat scan with a parameter value that has already been seen by the node
- * can fetch tuples from the cache rather than having to re-scan the outer
+ * can fetch tuples from the cache rather than having to re-scan the inner
  * node all over again.  The query planner may choose to make use of one of
  * these when it thinks rescans for previously seen values are likely enough
  * to warrant adding the additional node.
@@ -66,6 +66,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
 #include "executor/nodeMemoize.h"
@@ -83,20 +84,18 @@
 #define MEMO_END_OF_SCAN			5	/* Ready for rescan */
 
 
+/*
+ * The number of extra bytes we request from ExecCopySlotMinimalTupleExtra to
+ * allow storage of the pointer to the next cached tuple for a MemoizeEntry.
+ */
+#define MEMOIZE_NEXT_TUPLE_EXTRA_BYTES MAXALIGN(sizeof(MinimalTuple))
+
 /* Helper macros for memory accounting */
 #define EMPTY_ENTRY_MEMORY_BYTES(e)		(sizeof(MemoizeEntry) + \
 										 sizeof(MemoizeKey) + \
-										 (e)->key->params->t_len);
-#define CACHE_TUPLE_BYTES(t)			(sizeof(MemoizeTuple) + \
-										 (t)->mintuple->t_len)
-
- /* MemoizeTuple Stores an individually cached tuple */
-typedef struct MemoizeTuple
-{
-	MinimalTuple mintuple;		/* Cached tuple */
-	struct MemoizeTuple *next;	/* The next tuple with the same parameter
-								 * values or NULL if it's the last one */
-} MemoizeTuple;
+										 (e)->key->params->t_len)
+#define CACHE_TUPLE_BYTES(t)			((t)->t_len + \
+										 MEMOIZE_NEXT_TUPLE_EXTRA_BYTES)
 
 /*
  * MemoizeKey
@@ -115,13 +114,46 @@ typedef struct MemoizeKey
 typedef struct MemoizeEntry
 {
 	MemoizeKey *key;			/* Hash key for hash table lookups */
-	MemoizeTuple *tuplehead;	/* Pointer to the first tuple or NULL if no
+	MinimalTuple tuplehead;		/* Pointer to the first tuple or NULL if no
 								 * tuples are cached for this entry */
 	uint32		hash;			/* Hash value (cached) */
 	char		status;			/* Hash status */
 	bool		complete;		/* Did we read the outer plan to completion? */
 } MemoizeEntry;
 
+/*
+ * Tuples stored in a MemoizeEntry are stored as MinimalTuples.  To allow
+ * these MinimalTuples to be formed into a linked list containing all tuples
+ * for the entry, we make use of ExecCopySlotMinimalTupleExtra() so that the
+ * palloc for the MinimalTuple has enough extra bytes to store the pointer to
+ * the next tuple for the cache entry, or NULL when it's the last tuple.
+ *
+ * The helper functions below allow us to avoid having to repeat the memory
+ * address calculations for the next tuple pointer and allow us to fetch and
+ * set the pointer to the next tuple.
+ */
+
+/*
+ * Calculate the address of the "next" pointer from the MinimalTuple
+ */
+#define MemoizeNextTupleAddress(t) \
+	((MinimalTuple *) ((char *) (t) - MEMOIZE_NEXT_TUPLE_EXTRA_BYTES))
+
+/* Fetch a pointer to the MinimalTupleData for the next tuple after 'tup' */
+static pg_always_inline MinimalTuple
+MemoizeGetNextTuple(MinimalTuple tup)
+{
+	return *MemoizeNextTupleAddress(tup);
+}
+
+/* Set the next pointer in 'tup' to 'next' or NULL when it's the last tuple */
+static pg_always_inline void
+MemoizeSetNextTuple(MinimalTuple tup, MinimalTuple next)
+{
+	MinimalTuple *next_ptr = MemoizeNextTupleAddress(tup);
+
+	*next_ptr = next;
+}
 
 #define SH_PREFIX memoize
 #define SH_ELEMENT_TYPE MemoizeEntry
@@ -175,10 +207,10 @@ MemoizeHash_hash(struct memoize_hash *tb, const MemoizeKey *key)
 
 			if (!pslot->tts_isnull[i])	/* treat nulls as having hash key 0 */
 			{
-				FormData_pg_attribute *attr;
+				CompactAttribute *attr;
 				uint32		hkey;
 
-				attr = &pslot->tts_tupleDescriptor->attrs[i];
+				attr = TupleDescCompactAttr(pslot->tts_tupleDescriptor, i);
 
 				hkey = datum_image_hash(pslot->tts_values[i], attr->attbyval, attr->attlen);
 
@@ -207,7 +239,6 @@ MemoizeHash_hash(struct memoize_hash *tb, const MemoizeKey *key)
 		}
 	}
 
-	ResetExprContext(econtext);
 	MemoryContextSwitchTo(oldcontext);
 	return murmurhash32(hashkey);
 }
@@ -243,7 +274,7 @@ MemoizeHash_equal(struct memoize_hash *tb, const MemoizeKey *key1,
 
 		for (int i = 0; i < numkeys; i++)
 		{
-			FormData_pg_attribute *attr;
+			CompactAttribute *attr;
 
 			if (tslot->tts_isnull[i] != pslot->tts_isnull[i])
 			{
@@ -256,7 +287,7 @@ MemoizeHash_equal(struct memoize_hash *tb, const MemoizeKey *key1,
 				continue;
 
 			/* perform binary comparison on the two datums */
-			attr = &tslot->tts_tupleDescriptor->attrs[i];
+			attr = TupleDescCompactAttr(tslot->tts_tupleDescriptor, i);
 			if (!datum_image_eq(tslot->tts_values[i], pslot->tts_values[i],
 								attr->attbyval, attr->attlen))
 			{
@@ -265,7 +296,6 @@ MemoizeHash_equal(struct memoize_hash *tb, const MemoizeKey *key1,
 			}
 		}
 
-		ResetExprContext(econtext);
 		MemoryContextSwitchTo(oldcontext);
 		return match;
 	}
@@ -273,16 +303,19 @@ MemoizeHash_equal(struct memoize_hash *tb, const MemoizeKey *key1,
 	{
 		econtext->ecxt_innertuple = tslot;
 		econtext->ecxt_outertuple = pslot;
-		return ExecQualAndReset(mstate->cache_eq_expr, econtext);
+		return ExecQual(mstate->cache_eq_expr, econtext);
 	}
 }
 
 /*
- * Initialize the hash table to empty.
+ * Initialize the hash table to empty.  The MemoizeState's hashtable field
+ * must point to NULL.
  */
 static void
 build_hash_table(MemoizeState *mstate, uint32 size)
 {
+	Assert(mstate->hashtable == NULL);
+
 	/* Make a guess at a good size when we're not given a valid size. */
 	if (size == 0)
 		size = 1024;
@@ -342,18 +375,17 @@ prepare_probe_slot(MemoizeState *mstate, MemoizeKey *key)
 static inline void
 entry_purge_tuples(MemoizeState *mstate, MemoizeEntry *entry)
 {
-	MemoizeTuple *tuple = entry->tuplehead;
+	MinimalTuple tuple = entry->tuplehead;
 	uint64		freed_mem = 0;
 
 	while (tuple != NULL)
 	{
-		MemoizeTuple *next = tuple->next;
+		MinimalTuple next = MemoizeGetNextTuple(tuple);
 
 		freed_mem += CACHE_TUPLE_BYTES(tuple);
 
 		/* Free memory used for this tuple */
-		pfree(tuple->mintuple);
-		pfree(tuple);
+		pfree(MemoizeNextTupleAddress(tuple));
 
 		tuple = next;
 	}
@@ -400,8 +432,10 @@ remove_cache_entry(MemoizeState *mstate, MemoizeEntry *entry)
 static void
 cache_purge_all(MemoizeState *mstate)
 {
-	uint64		evictions = mstate->hashtable->members;
-	PlanState  *pstate = (PlanState *) mstate;
+	uint64		evictions = 0;
+
+	if (mstate->hashtable != NULL)
+		evictions = mstate->hashtable->members;
 
 	/*
 	 * Likely the most efficient way to remove all items is to just reset the
@@ -410,8 +444,8 @@ cache_purge_all(MemoizeState *mstate)
 	 */
 	MemoryContextReset(mstate->tableContext);
 
-	/* Make the hash table the same size as the original size */
-	build_hash_table(mstate, ((Memoize *) pstate->plan)->est_entries);
+	/* NULLify so we recreate the table on the next call */
+	mstate->hashtable = NULL;
 
 	/* reset the LRU list */
 	dlist_init(&mstate->lru_list);
@@ -551,7 +585,7 @@ cache_lookup(MemoizeState *mstate, bool *found)
 	oldcontext = MemoryContextSwitchTo(mstate->tableContext);
 
 	/* Allocate a new key */
-	entry->key = key = (MemoizeKey *) palloc(sizeof(MemoizeKey));
+	entry->key = key = palloc_object(MemoizeKey);
 	key->params = ExecCopySlotMinimalTuple(mstate->probeslot);
 
 	/* Update the total cache memory utilization */
@@ -621,21 +655,30 @@ cache_lookup(MemoizeState *mstate, bool *found)
 static bool
 cache_store_tuple(MemoizeState *mstate, TupleTableSlot *slot)
 {
-	MemoizeTuple *tuple;
 	MemoizeEntry *entry = mstate->entry;
 	MemoryContext oldcontext;
+	MinimalTuple mintuple;
 
 	Assert(slot != NULL);
 	Assert(entry != NULL);
 
 	oldcontext = MemoryContextSwitchTo(mstate->tableContext);
 
-	tuple = (MemoizeTuple *) palloc(sizeof(MemoizeTuple));
-	tuple->mintuple = ExecCopySlotMinimalTuple(slot);
-	tuple->next = NULL;
+	/*
+	 * Form a MinimalTuple with extra space to store a "next" pointer so that
+	 * we can form a singly linked list of tuples belonging to this
+	 * MemoizeEntry.
+	 */
+	mintuple = ExecCopySlotMinimalTupleExtra(slot,
+											 MEMOIZE_NEXT_TUPLE_EXTRA_BYTES);
+
+	/*
+	 * No need to use MemoizeSetNextTuple to point the next tuple to NULL as
+	 * ExecCopySlotMinimalTupleExtra zeros the extra bytes.
+	 */
 
 	/* Account for the memory we just consumed */
-	mstate->mem_used += CACHE_TUPLE_BYTES(tuple);
+	mstate->mem_used += CACHE_TUPLE_BYTES(mintuple);
 
 	if (entry->tuplehead == NULL)
 	{
@@ -643,15 +686,15 @@ cache_store_tuple(MemoizeState *mstate, TupleTableSlot *slot)
 		 * This is the first tuple for this entry, so just point the list head
 		 * to it.
 		 */
-		entry->tuplehead = tuple;
+		entry->tuplehead = mintuple;
 	}
 	else
 	{
 		/* push this tuple onto the tail of the list */
-		mstate->last_tuple->next = tuple;
+		MemoizeSetNextTuple(mstate->last_tuple, mintuple);
 	}
 
-	mstate->last_tuple = tuple;
+	mstate->last_tuple = mintuple;
 	MemoryContextSwitchTo(oldcontext);
 
 	/*
@@ -694,8 +737,17 @@ static TupleTableSlot *
 ExecMemoize(PlanState *pstate)
 {
 	MemoizeState *node = castNode(MemoizeState, pstate);
+	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	PlanState  *outerNode;
 	TupleTableSlot *slot;
+
+	CHECK_FOR_INTERRUPTS();
+
+	/*
+	 * Reset per-tuple memory context to free any expression evaluation
+	 * storage allocated in the previous tuple cycle.
+	 */
+	ResetExprContext(econtext);
 
 	switch (node->mstatus)
 	{
@@ -706,6 +758,10 @@ ExecMemoize(PlanState *pstate)
 				bool		found;
 
 				Assert(node->entry == NULL);
+
+				/* first call? we'll need a hash table. */
+				if (unlikely(node->hashtable == NULL))
+					build_hash_table(node, ((Memoize *) pstate->plan)->est_entries);
 
 				/*
 				 * We're only ever in this state for the first call of the
@@ -741,8 +797,7 @@ ExecMemoize(PlanState *pstate)
 						node->mstatus = MEMO_CACHE_FETCH_NEXT_TUPLE;
 
 						slot = node->ss.ps.ps_ResultTupleSlot;
-						ExecStoreMinimalTuple(entry->tuplehead->mintuple,
-											  slot, false);
+						ExecStoreMinimalTuple(entry->tuplehead, slot, false);
 
 						return slot;
 					}
@@ -829,7 +884,7 @@ ExecMemoize(PlanState *pstate)
 				Assert(node->last_tuple != NULL);
 
 				/* Skip to the next tuple to output */
-				node->last_tuple = node->last_tuple->next;
+				node->last_tuple = MemoizeGetNextTuple(node->last_tuple);
 
 				/* No more tuples in the cache */
 				if (node->last_tuple == NULL)
@@ -839,8 +894,7 @@ ExecMemoize(PlanState *pstate)
 				}
 
 				slot = node->ss.ps.ps_ResultTupleSlot;
-				ExecStoreMinimalTuple(node->last_tuple->mintuple, slot,
-									  false);
+				ExecStoreMinimalTuple(node->last_tuple, slot, false);
 
 				return slot;
 			}
@@ -984,12 +1038,12 @@ ExecInitMemoize(Memoize *node, EState *estate, int eflags)
 	mstate->probeslot = MakeSingleTupleTableSlot(mstate->hashkeydesc,
 												 &TTSOpsVirtual);
 
-	mstate->param_exprs = (ExprState **) palloc(nkeys * sizeof(ExprState *));
+	mstate->param_exprs = palloc_array(ExprState *, nkeys);
 	mstate->collations = node->collations;	/* Just point directly to the plan
 											 * data */
-	mstate->hashfunctions = (FmgrInfo *) palloc(nkeys * sizeof(FmgrInfo));
+	mstate->hashfunctions = palloc_array(FmgrInfo, nkeys);
 
-	eqfuncoids = palloc(nkeys * sizeof(Oid));
+	eqfuncoids = palloc_array(Oid, nkeys);
 
 	for (i = 0; i < nkeys; i++)
 	{
@@ -1051,8 +1105,11 @@ ExecInitMemoize(Memoize *node, EState *estate, int eflags)
 	/* Zero the statistics counters */
 	memset(&mstate->stats, 0, sizeof(MemoizeInstrumentation));
 
-	/* Allocate and set up the actual cache */
-	build_hash_table(mstate, node->est_entries);
+	/*
+	 * Because it may require a large allocation, we delay building of the
+	 * hash table until executor run.
+	 */
+	mstate->hashtable = NULL;
 
 	return mstate;
 }
@@ -1062,6 +1119,7 @@ ExecEndMemoize(MemoizeState *node)
 {
 #ifdef USE_ASSERT_CHECKING
 	/* Validate the memory accounting code is correct in assert builds. */
+	if (node->hashtable != NULL)
 	{
 		int			count;
 		uint64		mem = 0;
@@ -1073,13 +1131,13 @@ ExecEndMemoize(MemoizeState *node)
 		count = 0;
 		while ((entry = memoize_iterate(node->hashtable, &i)) != NULL)
 		{
-			MemoizeTuple *tuple = entry->tuplehead;
+			MinimalTuple tuple = entry->tuplehead;
 
 			mem += EMPTY_ENTRY_MEMORY_BYTES(entry);
 			while (tuple != NULL)
 			{
 				mem += CACHE_TUPLE_BYTES(tuple);
-				tuple = tuple->next;
+				tuple = MemoizeGetNextTuple(tuple);
 			}
 			count++;
 		}
@@ -1102,7 +1160,7 @@ ExecEndMemoize(MemoizeState *node)
 		if (node->stats.mem_peak == 0)
 			node->stats.mem_peak = node->mem_used;
 
-		Assert(ParallelWorkerNumber <= node->shared_info->num_workers);
+		Assert(ParallelWorkerNumber < node->shared_info->num_workers);
 		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
 		memcpy(si, &node->stats, sizeof(MemoizeInstrumentation));
 	}
@@ -1146,13 +1204,14 @@ ExecReScanMemoize(MemoizeState *node)
 /*
  * ExecEstimateCacheEntryOverheadBytes
  *		For use in the query planner to help it estimate the amount of memory
- *		required to store a single entry in the cache.
+ *		required to store a single entry in the cache and each of the tuples
+ *		for that entry.
  */
 double
 ExecEstimateCacheEntryOverheadBytes(double ntuples)
 {
-	return sizeof(MemoizeEntry) + sizeof(MemoizeKey) + sizeof(MemoizeTuple) *
-		ntuples;
+	return sizeof(MemoizeEntry) + sizeof(MemoizeKey) +
+		MEMOIZE_NEXT_TUPLE_EXTRA_BYTES * ntuples;
 }
 
 /* ----------------------------------------------------------------

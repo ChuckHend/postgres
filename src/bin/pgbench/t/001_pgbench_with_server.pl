@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -67,6 +67,34 @@ $node->pgbench(
 		'001_pgbench_concurrent_insert' =>
 		  "CREATE TYPE pg_temp.e AS ENUM ($labels); DROP TYPE pg_temp.e;"
 	});
+
+# Test inplace updates from VACUUM concurrent with heap_update from GRANT.
+# The PROC_IN_VACUUM environment can't finish MVCC table scans consistently,
+# so this fails rarely.  To reproduce consistently, add a sleep after
+# GetCatalogSnapshot(non-catalog-rel).
+Test::More->builder->todo_start('PROC_IN_VACUUM scan breakage');
+$node->safe_psql('postgres', 'CREATE TABLE ddl_target ()');
+$node->pgbench(
+	'--no-vacuum --client=5 --protocol=prepared --transactions=50',
+	0,
+	[qr{processed: 250/250}],
+	[qr{^$}],
+	'concurrent GRANT/VACUUM',
+	{
+		'001_pgbench_grant@9' => q(
+			DO $$
+			BEGIN
+				PERFORM pg_advisory_xact_lock(42);
+				FOR i IN 1 .. 10 LOOP
+					GRANT SELECT ON ddl_target TO PUBLIC;
+					REVOKE SELECT ON ddl_target FROM PUBLIC;
+				END LOOP;
+			END
+			$$;
+),
+		'001_pgbench_vacuum_ddl_target@1' => "VACUUM ddl_target;",
+	});
+Test::More->builder->todo_end;
 
 # Trigger various connection errors
 $node->pgbench(
@@ -185,7 +213,7 @@ my $nthreads = 2;
 
 {
 	my ($stderr);
-	run_log([ 'pgbench', '-j', '2', '--bad-option' ], '2>', \$stderr);
+	run_log([ 'pgbench', '--jobs' => '2', '--bad-option' ], '2>' => \$stderr);
 	$nthreads = 1 if $stderr =~ m/threads are not supported on this platform/;
 }
 
@@ -290,7 +318,7 @@ select column1::jsonb from (values (:value), (:long)) as q;
 my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 unlike(
 	$log,
-	qr[DETAIL:  parameters: \$1 = '\{ invalid ',],
+	qr[DETAIL:  Parameters: \$1 = '\{ invalid ',],
 	"no parameters logged");
 $log = undef;
 
@@ -331,7 +359,7 @@ select column1::jsonb from (values (:value), (:long)) as q;
 $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 like(
 	$log,
-	qr[DETAIL:  parameters: \$1 = '\{ invalid ', \$2 = '''Valame Dios!'' dijo Sancho; ''no le dije yo a vuestra merced que mirase bien lo que hacia\?'''],
+	qr[DETAIL:  Parameters: \$1 = '\{ invalid ', \$2 = '''Valame Dios!'' dijo Sancho; ''no le dije yo a vuestra merced que mirase bien lo que hacia\?'''],
 	"parameter report does not truncate");
 $log = undef;
 
@@ -376,7 +404,7 @@ select column1::jsonb from (values (:value), (:long)) as q;
 $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 like(
 	$log,
-	qr[DETAIL:  parameters: \$1 = '\{ inval\.\.\.', \$2 = '''Valame\.\.\.'],
+	qr[DETAIL:  Parameters: \$1 = '\{ inval\.\.\.', \$2 = '''Valame\.\.\.'],
 	"parameter report truncates");
 $log = undef;
 
@@ -640,6 +668,56 @@ SELECT :v0, :v1, :v2, :v3;
 }
 	});
 
+# test nested \if constructs
+$node->pgbench(
+	'--no-vacuum --client=1 --exit-on-abort --transactions=1',
+	0,
+	[qr{actually processed}],
+	[qr{^$}],
+	'nested ifs',
+	{
+		'pgbench_nested_if' => q(
+			\if false
+				SELECT 1 / 0;
+				\if true
+					SELECT 1 / 0;
+				\elif true
+					SELECT 1 / 0;
+				\else
+					SELECT 1 / 0;
+				\endif
+				SELECT 1 / 0;
+			\elif false
+				\if true
+					SELECT 1 / 0;
+				\elif true
+					SELECT 1 / 0;
+				\else
+					SELECT 1 / 0;
+				\endif
+			\else
+				\if false
+					SELECT 1 / 0;
+				\elif false
+					SELECT 1 / 0;
+				\else
+					SELECT 'correct';
+				\endif
+			\endif
+			\if true
+				SELECT 'correct';
+			\else
+				\if true
+					SELECT 1 / 0;
+				\elif true
+					SELECT 1 / 0;
+				\else
+					SELECT 1 / 0;
+				\endif
+			\endif
+		)
+	});
+
 # random determinism when seeded
 $node->safe_psql('postgres',
 	'CREATE UNLOGGED TABLE seeded_random(seed INT8 NOT NULL, rand TEXT NOT NULL, val INTEGER NOT NULL);'
@@ -675,15 +753,23 @@ my ($ret, $out, $err) = $node->psql('postgres',
 	'SELECT seed, rand, val, COUNT(*) FROM seeded_random GROUP BY seed, rand, val'
 );
 
-ok($ret == 0, "psql seeded_random count ok");
-ok($err eq '', "psql seeded_random count stderr is empty");
-ok($out =~ /\b$seed\|uniform\|1\d\d\d\|2/,
+is($ret, 0, "psql seeded_random count ok");
+is($err, '', "psql seeded_random count stderr is empty");
+like(
+	$out,
+	qr/\b$seed\|uniform\|1\d\d\d\|2/,
 	"psql seeded_random count uniform");
-ok( $out =~ /\b$seed\|exponential\|2\d\d\d\|2/,
+like(
+	$out,
+	qr/\b$seed\|exponential\|2\d\d\d\|2/,
 	"psql seeded_random count exponential");
-ok( $out =~ /\b$seed\|gaussian\|3\d\d\d\|2/,
+like(
+	$out,
+	qr/\b$seed\|gaussian\|3\d\d\d\|2/,
 	"psql seeded_random count gaussian");
-ok($out =~ /\b$seed\|zipfian\|4\d\d\d\|2/,
+like(
+	$out,
+	qr/\b$seed\|zipfian\|4\d\d\d\|2/,
 	"psql seeded_random count zipfian");
 
 $node->safe_psql('postgres', 'DROP TABLE seeded_random;');
@@ -764,6 +850,20 @@ SELECT 5432 AS fail UNION SELECT 5433 ORDER BY 1 \gset
 }
 	});
 
+# \gset stores a SQL NULL as the null value.
+$node->pgbench(
+	'-t 1', 0,
+	[ qr{type: .*/001_pgbench_gset_null}, qr{processed: 1/1} ],
+	[ qr{command=2.: null\b}, qr{command=3.: boolean true\b} ],
+	'pgbench gset command with NULL',
+	{
+		'001_pgbench_gset_null' => q{-- NULL is stored as the null value
+SELECT NULL AS nv \gset
+\set i debug(:nv)
+\set i debug(:nv IS NULL)
+}
+	});
+
 # working \aset
 # Valid cases.
 $node->pgbench(
@@ -810,6 +910,27 @@ $node->pgbench(
 -- test startpipeline
 \startpipeline
 } . "select 1;\n" x 10 . q{
+\endpipeline
+}
+	});
+
+# Working \startpipeline with \syncpipeline
+$node->pgbench(
+	'-t 1 -n -M extended',
+	0,
+	[ qr{type: .*/001_pgbench_pipeline_sync}, qr{actually processed: 1/1} ],
+	[],
+	'working \startpipeline with \syncpipeline',
+	{
+		'001_pgbench_pipeline_sync' => q{
+-- test startpipeline
+\startpipeline
+select 1;
+\syncpipeline
+\syncpipeline
+select 2;
+\syncpipeline
+select 3;
 \endpipeline
 }
 	});
@@ -876,9 +997,226 @@ select 1 \gset f
 }
 	});
 
+# Try \startpipeline without \endpipeline in a single transaction
+$node->pgbench(
+	'-t 1 -n -M extended',
+	2,
+	[],
+	[qr{end of script reached with pipeline open}],
+	'error: call \startpipeline without \endpipeline in a single transaction',
+	{
+		'001_pgbench_pipeline_5' => q{
+-- startpipeline only with single transaction
+\startpipeline
+}
+	});
+
+# Try \startpipeline without \endpipeline
+$node->pgbench(
+	'-t 2 -n -M extended',
+	2,
+	[],
+	[qr{end of script reached with pipeline open}],
+	'error: call \startpipeline without \endpipeline',
+	{
+		'001_pgbench_pipeline_6' => q{
+-- startpipeline only
+\startpipeline
+}
+	});
+
+# Try \startpipeline with \syncpipeline without \endpipeline
+$node->pgbench(
+	'-t 2 -n -M extended',
+	2,
+	[],
+	[qr{end of script reached with pipeline open}],
+	'error: call \startpipeline and \syncpipeline without \endpipeline',
+	{
+		'001_pgbench_pipeline_7' => q{
+-- startpipeline with \syncpipeline only
+\startpipeline
+\syncpipeline
+}
+	});
+
+# Try SET LOCAL as first pipeline command.  This succeeds and the first
+# command is not executed inside an implicit transaction block, causing
+# a WARNING.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	0,
+	[],
+	[qr{WARNING:  SET LOCAL can only be used in transaction blocks}],
+	'SET LOCAL outside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_set_local_1' => q{
+\startpipeline
+SET LOCAL statement_timeout='1h';
+\endpipeline
+}
+	});
+
+# Try SET LOCAL as second pipeline command.  This succeeds and the second
+# command does not cause a WARNING to be generated.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	0,
+	[],
+	[qr{^$}],
+	'SET LOCAL inside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_set_local_2' => q{
+\startpipeline
+SELECT 1;
+SET LOCAL statement_timeout='1h';
+\endpipeline
+}
+	});
+
+# Try SET LOCAL with \syncpipeline.  This succeeds and the command
+# launched after the sync is outside the implicit transaction block
+# of the pipeline, causing a WARNING.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	0,
+	[],
+	[qr{WARNING:  SET LOCAL can only be used in transaction blocks}],
+	'SET LOCAL and \syncpipeline',
+	{
+		'001_pgbench_pipeline_set_local_3' => q{
+\startpipeline
+SELECT 1;
+\syncpipeline
+SET LOCAL statement_timeout='1h';
+\endpipeline
+}
+	});
+
+# Try REINDEX CONCURRENTLY as first pipeline command.  This succeeds
+# as the first command is outside the implicit transaction block of
+# a pipeline.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	0,
+	[],
+	[],
+	'REINDEX CONCURRENTLY outside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_reindex_1' => q{
+\startpipeline
+REINDEX TABLE CONCURRENTLY pgbench_accounts;
+SELECT 1;
+\endpipeline
+}
+	});
+
+# Try REINDEX CONCURRENTLY as second pipeline command.  This fails
+# as the second command is inside an implicit transaction block.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	2,
+	[],
+	[],
+	'error: REINDEX CONCURRENTLY inside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_reindex_2' => q{
+\startpipeline
+SELECT 1;
+REINDEX TABLE CONCURRENTLY pgbench_accounts;
+\endpipeline
+}
+	});
+
+# Try VACUUM as first pipeline command.  Like REINDEX CONCURRENTLY, this
+# succeeds as this is outside the implicit transaction block of a pipeline.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	0,
+	[],
+	[],
+	'VACUUM outside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_vacuum_1' => q{
+\startpipeline
+VACUUM pgbench_accounts;
+\endpipeline
+}
+	});
+
+# Try VACUUM as second pipeline command.  This fails, as the second command
+# of a pipeline is inside an implicit transaction block.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	2,
+	[],
+	[],
+	'error: VACUUM inside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_vacuum_2' => q{
+\startpipeline
+SELECT 1;
+VACUUM pgbench_accounts;
+\endpipeline
+}
+	});
+
+# Try subtransactions in a pipeline.  These are forbidden in implicit
+# transaction blocks.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	2,
+	[],
+	[],
+	'error: subtransactions not allowed in pipeline',
+	{
+		'001_pgbench_pipeline_subtrans' => q{
+\startpipeline
+SAVEPOINT a;
+SELECT 1;
+ROLLBACK TO SAVEPOINT a;
+SELECT 2;
+\endpipeline
+}
+	});
+
+# Try LOCK TABLE as first pipeline command.  This fails as LOCK is outside
+# an implicit transaction block.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	2,
+	[],
+	[],
+	'error: LOCK TABLE outside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_lock_1' => q{
+\startpipeline
+LOCK pgbench_accounts;
+SELECT 1;
+\endpipeline
+}
+	});
+
+# Try LOCK TABLE as second pipeline command.  This succeeds as LOCK is inside
+# an implicit transaction block.
+$node->pgbench(
+	'-t 1 -n -M extended',
+	0,
+	[],
+	[],
+	'LOCK TABLE inside implicit transaction block of pipeline',
+	{
+		'001_pgbench_pipeline_lock_2' => q{
+\startpipeline
+SELECT 1;
+LOCK pgbench_accounts;
+\endpipeline
+}
+	});
+
 # Working \startpipeline in prepared query mode with serializable
 $node->pgbench(
-	'-c4 -j2 -t 10 -n -M prepared',
+	'-c4 -t 10 -n -M prepared',
 	0,
 	[
 		qr{type: .*/001_pgbench_pipeline_serializable},
@@ -1205,8 +1543,9 @@ sub check_pgbench_logs
 
 	# $prefix is simple enough, thus does not need escaping
 	my @logs = list_files($dir, qr{^$prefix\..*$});
-	ok(@logs == $nb, "number of log files");
-	ok(grep(/\/$prefix\.\d+(\.\d+)?$/, @logs) == $nb, "file name format");
+	is(scalar(@logs), $nb, "number of log files");
+	is(scalar(grep(/\/$prefix\.\d+(\.\d+)?$/, @logs)),
+		$nb, "file name format");
 
 	my $log_number = 0;
 	for my $log (sort @logs)
@@ -1216,10 +1555,12 @@ sub check_pgbench_logs
 
 		my @contents = split(/\n/, $contents_raw);
 		my $clen = @contents;
-		ok( $min <= $clen && $clen <= $max,
-			"transaction count for $log ($clen)");
+		cmp_ok($clen, '>=', $min,
+			"transaction count for $log ($clen) is above min");
+		cmp_ok($clen, '<=', $max,
+			"transaction count for $log ($clen) is below max");
 		my $clen_match = grep(/$re/, @contents);
-		ok($clen_match == $clen, "transaction format for $prefix");
+		is($clen_match, $clen, "transaction format for $prefix");
 
 		# Show more information if some logs don't match
 		# to help with debugging.
@@ -1288,7 +1629,7 @@ my $err_pattern =
   . "\\1";
 
 $node->pgbench(
-	"-n -c 2 -t 1 -d --verbose-errors --max-tries 2",
+	"-n -c 2 -t 1 --debug --verbose-errors --max-tries 2",
 	0,
 	[
 		qr{processed: 2/2\b},
@@ -1477,18 +1818,13 @@ $node->safe_psql('postgres', 'DROP TABLE first_client_table, xy;');
 
 # Test --exit-on-abort
 $node->safe_psql('postgres',
-	'CREATE TABLE counter(i int); '.
-	'INSERT INTO counter VALUES (0);'
-);
+	'CREATE TABLE counter(i int); ' . 'INSERT INTO counter VALUES (0);');
 
 $node->pgbench(
 	'-t 10 -c 2 -j 2 --exit-on-abort',
 	2,
 	[],
-	[
-		qr{division by zero},
-		qr{Run was aborted due to an error in thread}
-	],
+	[ qr{division by zero}, qr{Run was aborted due to an error in thread} ],
 	'test --exit-on-abort',
 	{
 		'001_exit_on_abort' => q{
@@ -1499,8 +1835,36 @@ update counter set i = i+1 returning i \gset
 }
 	});
 
+# Test copy in pgbench
+$node->pgbench(
+	'-t 10', 2,
+	[],
+	[qr{COPY is not supported in pgbench, aborting}],
+	'Test copy in script',
+	{
+		'001_copy' => q{ COPY pgbench_accounts FROM stdin }
+	});
+
 # Clean up
 $node->safe_psql('postgres', 'DROP TABLE counter;');
+
+# Test --continue-on-error
+$node->safe_psql('postgres', 'CREATE TABLE unique_table(i int unique);');
+
+$node->pgbench(
+	'-n -t 10 --continue-on-error --failures-detailed',
+	0,
+	[ qr{processed: 1/10\b}, qr{other failures: 9\b} ],
+	[],
+	'test --continue-on-error',
+	{
+		'001_continue_on_error' => q{
+		INSERT INTO unique_table VALUES(0);
+		}
+	});
+
+# Clean up
+$node->safe_psql('postgres', 'DROP TABLE unique_table;');
 
 # done
 $node->safe_psql('postgres', 'DROP TABLESPACE regress_pgbench_tap_1_ts');

@@ -3,7 +3,7 @@
  * testlo64.c
  *	  test using large objects with libpq using 64-bit APIs
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -12,6 +12,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -36,8 +37,8 @@ importFile(PGconn *conn, char *filename)
 	Oid			lobjId;
 	int			lobj_fd;
 	char		buf[BUFSIZE];
-	int			nbytes,
-				tmp;
+	ssize_t		nbytes;
+	int			tmp;
 	int			fd;
 
 	/*
@@ -75,7 +76,7 @@ importFile(PGconn *conn, char *filename)
 }
 
 static void
-pickout(PGconn *conn, Oid lobjId, pg_int64 start, int len)
+pickout(PGconn *conn, Oid lobjId, int64_t start, int len)
 {
 	int			lobj_fd;
 	char	   *buf;
@@ -110,7 +111,7 @@ pickout(PGconn *conn, Oid lobjId, pg_int64 start, int len)
 }
 
 static void
-overwrite(PGconn *conn, Oid lobjId, pg_int64 start, int len)
+overwrite(PGconn *conn, Oid lobjId, int64_t start, int len)
 {
 	int			lobj_fd;
 	char	   *buf;
@@ -148,7 +149,7 @@ overwrite(PGconn *conn, Oid lobjId, pg_int64 start, int len)
 }
 
 static void
-my_truncate(PGconn *conn, Oid lobjId, pg_int64 len)
+my_truncate(PGconn *conn, Oid lobjId, int64_t len)
 {
 	int			lobj_fd;
 
@@ -173,8 +174,7 @@ exportFile(PGconn *conn, Oid lobjId, char *filename)
 {
 	int			lobj_fd;
 	char		buf[BUFSIZE];
-	int			nbytes,
-				tmp;
+	int			nbytes;
 	int			fd;
 
 	/*
@@ -199,6 +199,8 @@ exportFile(PGconn *conn, Oid lobjId, char *filename)
 	 */
 	while ((nbytes = lo_read(conn, lobj_fd, buf, BUFSIZE)) > 0)
 	{
+		ssize_t		tmp;
+
 		tmp = write(fd, buf, nbytes);
 		if (tmp < nbytes)
 		{

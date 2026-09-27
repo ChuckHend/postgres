@@ -32,14 +32,12 @@
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/relation.h"
-#include "access/table.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
-#include "storage/lmgr.h"
-#include "utils/builtins.h"
+#include "storage/read_stream.h"
 #include "utils/rel.h"
 #include "utils/varlena.h"
 
@@ -220,6 +218,9 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 	BlockNumber blkno;
 	BTIndexStat indexStat;
 	BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_BULKREAD);
+	BlockRangeReadStreamPrivate p;
+	ReadStream *stream;
+	BlockNumber startblk;
 
 	if (!IS_INDEX(rel) || !IS_BTREE(rel))
 		ereport(ERROR,
@@ -236,6 +237,18 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary tables of other sessions")));
+
+	/*
+	 * A !indisready index could lead to ERRCODE_DATA_CORRUPTED later, so exit
+	 * early.  We're capable of assessing an indisready&&!indisvalid index,
+	 * but the results could be confusing.  For example, the index's size
+	 * could be too low for a valid index of the table.
+	 */
+	if (!rel->rd_index->indisvalid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("index \"%s\" is not valid",
+						RelationGetRelationName(rel))));
 
 	/*
 	 * Read metapage
@@ -264,11 +277,28 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 	indexStat.fragments = 0;
 
 	/*
-	 * Scan all blocks except the metapage
+	 * Scan all blocks except the metapage (0th page) using streaming reads
 	 */
 	nblocks = RelationGetNumberOfBlocks(rel);
+	startblk = BTREE_METAPAGE + 1;
 
-	for (blkno = 1; blkno < nblocks; blkno++)
+	p.current_blocknum = startblk;
+	p.last_exclusive = nblocks;
+
+	/*
+	 * It is safe to use batchmode as block_range_read_stream_cb takes no
+	 * locks.
+	 */
+	stream = read_stream_begin_relation(READ_STREAM_FULL |
+										READ_STREAM_USE_BATCHING,
+										bstrategy,
+										rel,
+										MAIN_FORKNUM,
+										block_range_read_stream_cb,
+										&p,
+										0);
+
+	for (blkno = startblk; blkno < nblocks; blkno++)
 	{
 		Buffer		buffer;
 		Page		page;
@@ -276,8 +306,7 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 
 		CHECK_FOR_INTERRUPTS();
 
-		/* Read and lock buffer */
-		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
+		buffer = read_stream_next_buffer(stream, NULL);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 
 		page = BufferGetPage(buffer);
@@ -299,7 +328,7 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 
 			max_avail = BLCKSZ - (BLCKSZ - ((PageHeader) page)->pd_special + SizeOfPageHeaderData);
 			indexStat.max_avail += max_avail;
-			indexStat.free_space += PageGetFreeSpace(page);
+			indexStat.free_space += PageGetExactFreeSpace(page);
 
 			indexStat.leaf_pages++;
 
@@ -313,10 +342,11 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 		else
 			indexStat.internal_pages++;
 
-		/* Unlock and release buffer */
-		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		ReleaseBuffer(buffer);
+		UnlockReleaseBuffer(buffer);
 	}
+
+	Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
+	read_stream_end(stream);
 
 	relation_close(rel, AccessShareLock);
 
@@ -505,6 +535,10 @@ pgstatginindex_internal(Oid relid, FunctionCallInfo fcinfo)
 	bool		nulls[3] = {false, false, false};
 	Datum		result;
 
+	/*
+	 * This uses relation_open() and not index_open().  The latter allows
+	 * partitioned indexes, and these are forbidden here.
+	 */
 	rel = relation_open(relid, AccessShareLock);
 
 	if (!IS_INDEX(rel) || !IS_GIN(rel))
@@ -522,6 +556,13 @@ pgstatginindex_internal(Oid relid, FunctionCallInfo fcinfo)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary indexes of other sessions")));
+
+	/* see pgstatindex_impl */
+	if (!rel->rd_index->indisvalid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("index \"%s\" is not valid",
+						RelationGetRelationName(rel))));
 
 	/*
 	 * Read metapage
@@ -545,7 +586,7 @@ pgstatginindex_internal(Oid relid, FunctionCallInfo fcinfo)
 		elog(ERROR, "return type must be a row type");
 
 	values[0] = Int32GetDatum(stats.version);
-	values[1] = UInt32GetDatum(stats.pending_pages);
+	values[1] = Int32GetDatum(stats.pending_pages);
 	values[2] = Int64GetDatum(stats.pending_tuples);
 
 	/*
@@ -580,11 +621,17 @@ pgstathashindex(PG_FUNCTION_ARGS)
 	HashMetaPage metap;
 	float8		free_percent;
 	uint64		total_space;
+	BlockRangeReadStreamPrivate p;
+	ReadStream *stream;
+	BlockNumber startblk;
 
-	rel = index_open(relid, AccessShareLock);
+	/*
+	 * This uses relation_open() and not index_open().  The latter allows
+	 * partitioned indexes, and these are forbidden here.
+	 */
+	rel = relation_open(relid, AccessShareLock);
 
-	/* index_open() checks that it's an index */
-	if (!IS_HASH(rel))
+	if (!IS_INDEX(rel) || !IS_HASH(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" is not a hash index",
@@ -600,6 +647,13 @@ pgstathashindex(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary indexes of other sessions")));
 
+	/* see pgstatindex_impl */
+	if (!rel->rd_index->indisvalid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("index \"%s\" is not valid",
+						RelationGetRelationName(rel))));
+
 	/* Get the information we need from the metapage. */
 	memset(&stats, 0, sizeof(stats));
 	metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
@@ -614,18 +668,35 @@ pgstathashindex(PG_FUNCTION_ARGS)
 	/* prepare access strategy for this index */
 	bstrategy = GetAccessStrategy(BAS_BULKREAD);
 
-	/* Start from blkno 1 as 0th block is metapage */
-	for (blkno = 1; blkno < nblocks; blkno++)
+	/* Scan all blocks except the metapage (0th page) using streaming reads */
+	startblk = HASH_METAPAGE + 1;
+
+	p.current_blocknum = startblk;
+	p.last_exclusive = nblocks;
+
+	/*
+	 * It is safe to use batchmode as block_range_read_stream_cb takes no
+	 * locks.
+	 */
+	stream = read_stream_begin_relation(READ_STREAM_FULL |
+										READ_STREAM_USE_BATCHING,
+										bstrategy,
+										rel,
+										MAIN_FORKNUM,
+										block_range_read_stream_cb,
+										&p,
+										0);
+
+	for (blkno = startblk; blkno < nblocks; blkno++)
 	{
 		Buffer		buf;
 		Page		page;
 
 		CHECK_FOR_INTERRUPTS();
 
-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-								 bstrategy);
+		buf = read_stream_next_buffer(stream, NULL);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = (Page) BufferGetPage(buf);
+		page = BufferGetPage(buf);
 
 		if (PageIsNew(page))
 			stats.unused_pages++;
@@ -668,8 +739,11 @@ pgstathashindex(PG_FUNCTION_ARGS)
 		UnlockReleaseBuffer(buf);
 	}
 
+	Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
+	read_stream_end(stream);
+
 	/* Done accessing the index */
-	index_close(rel, AccessShareLock);
+	relation_close(rel, AccessShareLock);
 
 	/* Count unused pages as free space. */
 	stats.free_space += (uint64) stats.unused_pages * stats.space_per_page;

@@ -9,7 +9,7 @@
  * always use NAMEDATALEN as the symbolic constant!   - jolly 8/21/95
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -299,7 +299,7 @@ current_schemas(PG_FUNCTION_ARGS)
 	int			i;
 	ArrayType  *array;
 
-	names = (Datum *) palloc(list_length(search_path) * sizeof(Datum));
+	names = palloc_array(Datum, list_length(search_path));
 	i = 0;
 	foreach(l, search_path)
 	{

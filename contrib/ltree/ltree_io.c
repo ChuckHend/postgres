@@ -7,10 +7,10 @@
 
 #include <ctype.h>
 
+#include "common/int.h"
 #include "crc32.h"
 #include "libpq/pqformat.h"
 #include "ltree.h"
-#include "utils/memutils.h"
 #include "varatt.h"
 
 
@@ -55,7 +55,7 @@ parse_ltree(const char *buf, struct Node *escontext)
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 		if (t_iseq(ptr, '.'))
 			num++;
 		ptr += charlen;
@@ -66,11 +66,11 @@ parse_ltree(const char *buf, struct Node *escontext)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("number of ltree labels (%d) exceeds the maximum allowed (%d)",
 						num + 1, LTREE_MAX_LEVELS)));
-	list = lptr = (nodeitem *) palloc(sizeof(nodeitem) * (num + 1));
+	list = lptr = palloc_array(nodeitem, num + 1);
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 
 		switch (state)
 		{
@@ -292,7 +292,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 
 		if (t_iseq(ptr, '.'))
 			num++;
@@ -312,21 +312,21 @@ parse_lquery(const char *buf, struct Node *escontext)
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 
 		switch (state)
 		{
 			case LQPRS_WAITLEVEL:
 				if (ISLABEL(ptr))
 				{
-					GETVAR(curqlevel) = lptr = (nodeitem *) palloc0(sizeof(nodeitem) * (numOR + 1));
+					GETVAR(curqlevel) = lptr = palloc0_array(nodeitem, numOR + 1);
 					lptr->start = ptr;
 					state = LQPRS_WAITDELIM;
 					curqlevel->numvar = 1;
 				}
 				else if (t_iseq(ptr, '!'))
 				{
-					GETVAR(curqlevel) = lptr = (nodeitem *) palloc0(sizeof(nodeitem) * (numOR + 1));
+					GETVAR(curqlevel) = lptr = palloc0_array(nodeitem, numOR + 1);
 					lptr->start = ptr + 1;
 					lptr->wlen = -1;	/* compensate for counting ! below */
 					state = LQPRS_WAITDELIM;
@@ -345,7 +345,12 @@ parse_lquery(const char *buf, struct Node *escontext)
 					lptr++;
 					lptr->start = ptr;
 					state = LQPRS_WAITDELIM;
-					curqlevel->numvar++;
+					if (pg_add_u16_overflow(curqlevel->numvar, 1, &curqlevel->numvar))
+						ereturn(escontext, NULL,
+								(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+								 errmsg("lquery level has too many variants"),
+								 errdetail("Number of variants exceeds the maximum allowed (%d).",
+										   PG_UINT16_MAX)));
 				}
 				else
 					UNCHAR;
@@ -412,7 +417,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 			case LQPRS_WAITFNUM:
 				if (t_iseq(ptr, ','))
 					state = LQPRS_WAITSNUM;
-				else if (t_isdigit(ptr))
+				else if (isdigit((unsigned char) *ptr))
 				{
 					int			low = atoi(ptr);
 
@@ -430,7 +435,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 					UNCHAR;
 				break;
 			case LQPRS_WAITSNUM:
-				if (t_isdigit(ptr))
+				if (isdigit((unsigned char) *ptr))
 				{
 					int			high = atoi(ptr);
 
@@ -461,7 +466,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 			case LQPRS_WAITCLOSE:
 				if (t_iseq(ptr, '}'))
 					state = LQPRS_WAITEND;
-				else if (!t_isdigit(ptr))
+				else if (!isdigit((unsigned char) *ptr))
 					UNCHAR;
 				break;
 			case LQPRS_WAITND:
@@ -472,7 +477,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 				}
 				else if (t_iseq(ptr, ','))
 					state = LQPRS_WAITSNUM;
-				else if (!t_isdigit(ptr))
+				else if (!isdigit((unsigned char) *ptr))
 					UNCHAR;
 				break;
 			case LQPRS_WAITEND:
@@ -543,7 +548,16 @@ parse_lquery(const char *buf, struct Node *escontext)
 			lptr = GETVAR(curqlevel);
 			while (lptr - GETVAR(curqlevel) < curqlevel->numvar)
 			{
-				cur->totallen += MAXALIGN(LVAR_HDRSIZE + lptr->len);
+				int			newlen = cur->totallen + MAXALIGN(LVAR_HDRSIZE + lptr->len);
+
+				if (newlen > PG_UINT16_MAX)
+					ereturn(escontext, NULL,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("lquery level is too large"),
+							 errdetail("Total size of level exceeds the maximum allowed (%d bytes).",
+									   PG_UINT16_MAX)));
+				cur->totallen = (uint16) newlen;
+
 				lrptr->len = lptr->len;
 				lrptr->flag = lptr->flag;
 				lrptr->val = ltree_crc32_sz(lptr->start, lptr->len);

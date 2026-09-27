@@ -12,7 +12,7 @@
  * check_subscripts function and just let the fetch and assign functions
  * do everything.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,6 +23,7 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_type_d.h"
 #include "executor/execExpr.h"
 #include "hstore.h"
 #include "nodes/nodeFuncs.h"
@@ -74,7 +75,7 @@ hstore_subscript_transform(SubscriptingRef *sbsref,
 				 errmsg("hstore subscript must have type text"),
 				 parser_errposition(pstate, exprLocation(ai->uidx))));
 
-	/* ... and store the transformed subscript into the SubscriptRef node */
+	/* ... and store the transformed subscript into the SubscriptingRef node */
 	sbsref->refupperindexpr = list_make1(subexpr);
 	sbsref->reflowerindexpr = NIL;
 
@@ -191,7 +192,7 @@ hstore_subscript_assign(ExprState *state,
 		HStore	   *hs = DatumGetHStoreP(*op->resvalue);
 		int			s1count = HS_COUNT(hs);
 		int			outcount = 0;
-		int			vsize;
+		Size		vsize;
 		char	   *ps1,
 				   *bufd,
 				   *pd;
@@ -201,7 +202,7 @@ hstore_subscript_assign(ExprState *state,
 		int			s2idx;
 
 		/* Allocate result without considering possibility of duplicate */
-		vsize = CALCDATASIZE(s1count + 1, VARSIZE(hs) + p.keylen + p.vallen);
+		vsize = hstoreCalcDataSize(s1count + 1, VARSIZE(hs) + p.keylen + p.vallen);
 		out = palloc(vsize);
 		SET_VARSIZE(out, vsize);
 		HS_SETCOUNT(out, s1count + 1);

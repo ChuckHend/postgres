@@ -3,7 +3,7 @@
  * nodeIndexscan.c
  *	  Routines to support indexed scans of relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,7 +33,8 @@
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "catalog/pg_am.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeIndexscan.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
@@ -41,8 +42,8 @@
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/sortsupport.h"
 
 /*
  * When an ordering operator is used, tuples fetched from the index that
@@ -66,7 +67,7 @@ static int	cmp_orderbyvals(const Datum *adist, const bool *anulls,
 static int	reorderqueue_cmp(const pairingheap_node *a,
 							 const pairingheap_node *b, void *arg);
 static void reorderqueue_push(IndexScanState *node, TupleTableSlot *slot,
-							  Datum *orderbyvals, bool *orderbynulls);
+							  const Datum *orderbyvals, const bool *orderbynulls);
 static HeapTuple reorderqueue_pop(IndexScanState *node);
 
 
@@ -109,9 +110,13 @@ IndexNext(IndexScanState *node)
 		 */
 		scandesc = index_beginscan(node->ss.ss_currentRelation,
 								   node->iss_RelationDesc,
+								   false,
 								   estate->es_snapshot,
+								   node->iss_Instrument,
 								   node->iss_NumScanKeys,
-								   node->iss_NumOrderByKeys);
+								   node->iss_NumOrderByKeys,
+								   ScanRelIsReadOnly(&node->ss) ?
+								   SO_HINT_REL_READ_ONLY : SO_NONE);
 
 		node->iss_ScanDesc = scandesc;
 
@@ -128,7 +133,7 @@ IndexNext(IndexScanState *node)
 	/*
 	 * ok, now that we have what we need, fetch the next tuple.
 	 */
-	while (index_getnext_slot(scandesc, direction, slot))
+	while (table_index_getnext_slot(scandesc, direction, slot))
 	{
 		CHECK_FOR_INTERRUPTS();
 
@@ -204,9 +209,13 @@ IndexNextWithReorder(IndexScanState *node)
 		 */
 		scandesc = index_beginscan(node->ss.ss_currentRelation,
 								   node->iss_RelationDesc,
+								   false,
 								   estate->es_snapshot,
+								   node->iss_Instrument,
 								   node->iss_NumScanKeys,
-								   node->iss_NumOrderByKeys);
+								   node->iss_NumOrderByKeys,
+								   ScanRelIsReadOnly(&node->ss) ?
+								   SO_HINT_REL_READ_ONLY : SO_NONE);
 
 		node->iss_ScanDesc = scandesc;
 
@@ -259,7 +268,7 @@ IndexNextWithReorder(IndexScanState *node)
 		 * Fetch next tuple from the index.
 		 */
 next_indextuple:
-		if (!index_getnext_slot(scandesc, ForwardScanDirection, slot))
+		if (!table_index_getnext_slot(scandesc, ForwardScanDirection, slot))
 		{
 			/*
 			 * No more tuples from the index.  But we still need to drain any
@@ -442,8 +451,8 @@ static int
 reorderqueue_cmp(const pairingheap_node *a, const pairingheap_node *b,
 				 void *arg)
 {
-	ReorderTuple *rta = (ReorderTuple *) a;
-	ReorderTuple *rtb = (ReorderTuple *) b;
+	const ReorderTuple *rta = (const ReorderTuple *) a;
+	const ReorderTuple *rtb = (const ReorderTuple *) b;
 	IndexScanState *node = (IndexScanState *) arg;
 
 	/* exchange argument order to invert the sort order */
@@ -457,7 +466,7 @@ reorderqueue_cmp(const pairingheap_node *a, const pairingheap_node *b,
  */
 static void
 reorderqueue_push(IndexScanState *node, TupleTableSlot *slot,
-				  Datum *orderbyvals, bool *orderbynulls)
+				  const Datum *orderbyvals, const bool *orderbynulls)
 {
 	IndexScanDesc scandesc = node->iss_ScanDesc;
 	EState	   *estate = node->ss.ps.state;
@@ -465,12 +474,10 @@ reorderqueue_push(IndexScanState *node, TupleTableSlot *slot,
 	ReorderTuple *rt;
 	int			i;
 
-	rt = (ReorderTuple *) palloc(sizeof(ReorderTuple));
+	rt = palloc_object(ReorderTuple);
 	rt->htup = ExecCopySlotHeapTuple(slot);
-	rt->orderbyvals =
-		(Datum *) palloc(sizeof(Datum) * scandesc->numberOfOrderBys);
-	rt->orderbynulls =
-		(bool *) palloc(sizeof(bool) * scandesc->numberOfOrderBys);
+	rt->orderbyvals = palloc_array(Datum, scandesc->numberOfOrderBys);
+	rt->orderbynulls = palloc_array(bool, scandesc->numberOfOrderBys);
 	for (i = 0; i < node->iss_NumOrderByKeys; i++)
 	{
 		if (!orderbynulls[i])
@@ -795,6 +802,28 @@ ExecEndIndexScan(IndexScanState *node)
 	indexScanDesc = node->iss_ScanDesc;
 
 	/*
+	 * When ending a parallel worker, copy the statistics gathered by the
+	 * worker back into shared memory so that it can be picked up by the main
+	 * process to report in EXPLAIN ANALYZE
+	 */
+	if (node->iss_SharedInfo != NULL && IsParallelWorker())
+	{
+		IndexScanInstrumentation *winstrument;
+
+		Assert(ParallelWorkerNumber < node->iss_SharedInfo->num_workers);
+		winstrument = &node->iss_SharedInfo->winstrument[ParallelWorkerNumber];
+
+		/*
+		 * We have to accumulate the stats rather than performing a memcpy.
+		 * When a Gather/GatherMerge node finishes it will perform planner
+		 * shutdown on the workers.  On rescan it will spin up new workers
+		 * which will have a new IndexOnlyScanState and zeroed stats.
+		 */
+		winstrument->nsearches += node->iss_Instrument->nsearches;
+		Assert(node->iss_Instrument->ntabletuplefetches == 0);
+	}
+
+	/*
 	 * close the index relation (no-op if we didn't open it)
 	 */
 	if (indexScanDesc)
@@ -918,7 +947,8 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	 */
 	ExecInitScanTupleSlot(estate, &indexstate->ss,
 						  RelationGetDescr(currentRelation),
-						  table_slot_callbacks(currentRelation));
+						  table_slot_callbacks(currentRelation),
+						  TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS);
 
 	/*
 	 * Initialize result type and projection.
@@ -950,6 +980,10 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	 */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return indexstate;
+
+	/* Set up instrumentation of index scans if requested */
+	if (estate->es_instrument)
+		indexstate->iss_Instrument = palloc0_object(IndexScanInstrumentation);
 
 	/* Open the index relation. */
 	lockmode = exec_rt_fetch(node->scan.scanrelid, estate)->rellockmode;
@@ -1004,12 +1038,9 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 		 */
 		Assert(numOrderByKeys == list_length(node->indexorderbyops));
 		Assert(numOrderByKeys == list_length(node->indexorderbyorig));
-		indexstate->iss_SortSupport = (SortSupportData *)
-			palloc0(numOrderByKeys * sizeof(SortSupportData));
-		indexstate->iss_OrderByTypByVals = (bool *)
-			palloc(numOrderByKeys * sizeof(bool));
-		indexstate->iss_OrderByTypLens = (int16 *)
-			palloc(numOrderByKeys * sizeof(int16));
+		indexstate->iss_SortSupport = palloc0_array(SortSupportData, numOrderByKeys);
+		indexstate->iss_OrderByTypByVals = palloc_array(bool, numOrderByKeys);
+		indexstate->iss_OrderByTypLens = palloc_array(int16, numOrderByKeys);
 		i = 0;
 		forboth(lco, node->indexorderbyops, lcx, node->indexorderbyorig)
 		{
@@ -1037,10 +1068,8 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 		}
 
 		/* allocate arrays to hold the re-calculated distances */
-		indexstate->iss_OrderByValues = (Datum *)
-			palloc(numOrderByKeys * sizeof(Datum));
-		indexstate->iss_OrderByNulls = (bool *)
-			palloc(numOrderByKeys * sizeof(bool));
+		indexstate->iss_OrderByValues = palloc_array(Datum, numOrderByKeys);
+		indexstate->iss_OrderByNulls = palloc_array(bool, numOrderByKeys);
 
 		/* and initialize the reorder queue */
 		indexstate->iss_ReorderQueue = pairingheap_allocate(reorderqueue_cmp,
@@ -1151,7 +1180,7 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 
 	/* Allocate array for ScanKey structs: one per qual */
 	n_scan_keys = list_length(quals);
-	scan_keys = (ScanKey) palloc(n_scan_keys * sizeof(ScanKeyData));
+	scan_keys = palloc_array(ScanKeyData, n_scan_keys);
 
 	/*
 	 * runtime_keys array is dynamically resized as needed.  We handle it this
@@ -1164,8 +1193,7 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 	n_runtime_keys = max_runtime_keys = *numRuntimeKeys;
 
 	/* Allocate array_keys as large as it could possibly need to be */
-	array_keys = (IndexArrayKeyInfo *)
-		palloc0(n_scan_keys * sizeof(IndexArrayKeyInfo));
+	array_keys = palloc0_array(IndexArrayKeyInfo, n_scan_keys);
 	n_array_keys = 0;
 
 	/*
@@ -1255,14 +1283,13 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 					if (max_runtime_keys == 0)
 					{
 						max_runtime_keys = 8;
-						runtime_keys = (IndexRuntimeKeyInfo *)
-							palloc(max_runtime_keys * sizeof(IndexRuntimeKeyInfo));
+						runtime_keys = palloc_array(IndexRuntimeKeyInfo, max_runtime_keys);
 					}
 					else
 					{
 						max_runtime_keys *= 2;
-						runtime_keys = (IndexRuntimeKeyInfo *)
-							repalloc(runtime_keys, max_runtime_keys * sizeof(IndexRuntimeKeyInfo));
+						runtime_keys = repalloc_array(runtime_keys,
+													  IndexRuntimeKeyInfo, max_runtime_keys);
 					}
 				}
 				runtime_keys[n_runtime_keys].scan_key = this_scan_key;
@@ -1299,8 +1326,7 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 
 			Assert(!isorderby);
 
-			first_sub_key = (ScanKey)
-				palloc(list_length(rc->opnos) * sizeof(ScanKeyData));
+			first_sub_key = palloc_array(ScanKeyData, list_length(rc->opnos));
 			n_sub_key = 0;
 
 			/* Scan RowCompare columns and generate subsidiary ScanKey items */
@@ -1332,10 +1358,10 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 				varattno = ((Var *) leftop)->varattno;
 
 				/*
-				 * We have to look up the operator's associated btree support
+				 * We have to look up the operator's associated support
 				 * function
 				 */
-				if (index->rd_rel->relam != BTREE_AM_OID ||
+				if (!index->rd_indam->amcanorder ||
 					varattno < 1 || varattno > indnkeyatts)
 					elog(ERROR, "bogus RowCompare index qualification");
 				opfamily = index->rd_opfamily[varattno - 1];
@@ -1345,7 +1371,7 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 										   &op_lefttype,
 										   &op_righttype);
 
-				if (op_strategy != rc->rctype)
+				if (op_strategy != rc->cmptype)
 					elog(ERROR, "RowCompare index qualification contains wrong operator");
 
 				opfuncid = get_opfamily_proc(opfamily,
@@ -1379,14 +1405,13 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 						if (max_runtime_keys == 0)
 						{
 							max_runtime_keys = 8;
-							runtime_keys = (IndexRuntimeKeyInfo *)
-								palloc(max_runtime_keys * sizeof(IndexRuntimeKeyInfo));
+							runtime_keys = palloc_array(IndexRuntimeKeyInfo, max_runtime_keys);
 						}
 						else
 						{
 							max_runtime_keys *= 2;
-							runtime_keys = (IndexRuntimeKeyInfo *)
-								repalloc(runtime_keys, max_runtime_keys * sizeof(IndexRuntimeKeyInfo));
+							runtime_keys = repalloc_array(runtime_keys,
+														  IndexRuntimeKeyInfo, max_runtime_keys);
 						}
 					}
 					runtime_keys[n_runtime_keys].scan_key = this_sub_key;
@@ -1422,7 +1447,7 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 			MemSet(this_scan_key, 0, sizeof(ScanKeyData));
 			this_scan_key->sk_flags = SK_ROW_HEADER;
 			this_scan_key->sk_attno = first_sub_key->sk_attno;
-			this_scan_key->sk_strategy = rc->rctype;
+			this_scan_key->sk_strategy = rc->cmptype;
 			/* sk_subtype, sk_collation, sk_func not used in a header */
 			this_scan_key->sk_argument = PointerGetDatum(first_sub_key);
 		}
@@ -1497,14 +1522,13 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 						if (max_runtime_keys == 0)
 						{
 							max_runtime_keys = 8;
-							runtime_keys = (IndexRuntimeKeyInfo *)
-								palloc(max_runtime_keys * sizeof(IndexRuntimeKeyInfo));
+							runtime_keys = palloc_array(IndexRuntimeKeyInfo, max_runtime_keys);
 						}
 						else
 						{
 							max_runtime_keys *= 2;
-							runtime_keys = (IndexRuntimeKeyInfo *)
-								repalloc(runtime_keys, max_runtime_keys * sizeof(IndexRuntimeKeyInfo));
+							runtime_keys = repalloc_array(runtime_keys,
+														  IndexRuntimeKeyInfo, max_runtime_keys);
 						}
 					}
 					runtime_keys[n_runtime_keys].scan_key = this_scan_key;
@@ -1645,6 +1669,8 @@ ExecIndexScanEstimate(IndexScanState *node,
 	EState	   *estate = node->ss.ps.state;
 
 	node->iss_PscanLen = index_parallelscan_estimate(node->iss_RelationDesc,
+													 node->iss_NumScanKeys,
+													 node->iss_NumOrderByKeys,
 													 estate->es_snapshot);
 	shm_toc_estimate_chunk(&pcxt->estimator, node->iss_PscanLen);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
@@ -1669,12 +1695,17 @@ ExecIndexScanInitializeDSM(IndexScanState *node,
 								  estate->es_snapshot,
 								  piscan);
 	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, piscan);
+
 	node->iss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->iss_RelationDesc,
+								 false,
+								 node->iss_Instrument,
 								 node->iss_NumScanKeys,
 								 node->iss_NumOrderByKeys,
-								 piscan);
+								 piscan,
+								 ScanRelIsReadOnly(&node->ss) ?
+								 SO_HINT_REL_READ_ONLY : SO_NONE);
 
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass
@@ -1696,6 +1727,7 @@ void
 ExecIndexScanReInitializeDSM(IndexScanState *node,
 							 ParallelContext *pcxt)
 {
+	Assert(node->ss.ps.plan->parallel_aware);
 	index_parallelrescan(node->iss_ScanDesc);
 }
 
@@ -1712,12 +1744,17 @@ ExecIndexScanInitializeWorker(IndexScanState *node,
 	ParallelIndexScanDesc piscan;
 
 	piscan = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
+
 	node->iss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->iss_RelationDesc,
+								 false,
+								 node->iss_Instrument,
 								 node->iss_NumScanKeys,
 								 node->iss_NumOrderByKeys,
-								 piscan);
+								 piscan,
+								 ScanRelIsReadOnly(&node->ss) ?
+								 SO_HINT_REL_READ_ONLY : SO_NONE);
 
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass
@@ -1727,4 +1764,93 @@ ExecIndexScanInitializeWorker(IndexScanState *node,
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+}
+
+/*
+ * Compute the amount of space we'll need for the shared instrumentation and
+ * inform pcxt->estimator.
+ */
+void
+ExecIndexScanInstrumentEstimate(IndexScanState *node,
+								ParallelContext *pcxt)
+{
+	Size		size;
+
+	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
+		return;
+
+	/*
+	 * This size calculation is trivial enough that we don't bother saving it
+	 * in the IndexScanState. We'll recalculate the needed size in
+	 * ExecIndexScanInstrumentInitDSM().
+	 */
+	size = add_size(offsetof(SharedIndexScanInstrumentation, winstrument),
+					mul_size(pcxt->nworkers, sizeof(IndexScanInstrumentation)));
+	shm_toc_estimate_chunk(&pcxt->estimator, size);
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+}
+
+/*
+ * Set up parallel index scan instrumentation.
+ */
+void
+ExecIndexScanInstrumentInitDSM(IndexScanState *node,
+							   ParallelContext *pcxt)
+{
+	Size		size;
+
+	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
+		return;
+
+	size = add_size(offsetof(SharedIndexScanInstrumentation, winstrument),
+					mul_size(pcxt->nworkers, sizeof(IndexScanInstrumentation)));
+	node->iss_SharedInfo =
+		(SharedIndexScanInstrumentation *) shm_toc_allocate(pcxt->toc, size);
+
+	/* Each per-worker area must start out as zeroes */
+	memset(node->iss_SharedInfo, 0, size);
+	node->iss_SharedInfo->num_workers = pcxt->nworkers;
+	shm_toc_insert(pcxt->toc,
+				   node->ss.ps.plan->plan_node_id +
+				   PARALLEL_KEY_SCAN_INSTRUMENT_OFFSET,
+				   node->iss_SharedInfo);
+}
+
+/*
+ * Look up and save the location of the shared instrumentation.
+ */
+void
+ExecIndexScanInstrumentInitWorker(IndexScanState *node,
+								  ParallelWorkerContext *pwcxt)
+{
+	if (!node->ss.ps.instrument)
+		return;
+
+	node->iss_SharedInfo = (SharedIndexScanInstrumentation *)
+		shm_toc_lookup(pwcxt->toc,
+					   node->ss.ps.plan->plan_node_id +
+					   PARALLEL_KEY_SCAN_INSTRUMENT_OFFSET,
+					   false);
+}
+
+/* ----------------------------------------------------------------
+ * ExecIndexScanRetrieveInstrumentation
+ *
+ *		Transfer index scan statistics from DSM to private memory.
+ * ----------------------------------------------------------------
+ */
+void
+ExecIndexScanRetrieveInstrumentation(IndexScanState *node)
+{
+	SharedIndexScanInstrumentation *SharedInfo = node->iss_SharedInfo;
+	size_t		size;
+
+	if (SharedInfo == NULL)
+		return;
+
+	/* Create a copy of SharedInfo in backend-local memory */
+	size = offsetof(SharedIndexScanInstrumentation, winstrument) +
+		SharedInfo->num_workers * sizeof(IndexScanInstrumentation);
+	node->iss_SharedInfo = palloc(size);
+	memcpy(node->iss_SharedInfo, SharedInfo, size);
 }

@@ -5,7 +5,7 @@
  *	  wherein you authenticate a user by seeing what IP address the system
  *	  says he comes from and choosing authentication method based on it).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,24 +26,20 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-#include "access/htup_details.h"
 #include "catalog/pg_collation.h"
-#include "catalog/pg_type.h"
 #include "common/ip.h"
 #include "common/string.h"
-#include "funcapi.h"
+#include "libpq/hba.h"
 #include "libpq/ifaddr.h"
-#include "libpq/libpq.h"
-#include "miscadmin.h"
+#include "libpq/libpq-be.h"
+#include "libpq/oauth.h"
 #include "postmaster/postmaster.h"
 #include "regex/regex.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
 #include "utils/conffiles.h"
 #include "utils/guc.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/varlena.h"
 
@@ -118,8 +114,8 @@ static const char *const UserAuthName[] =
 	"bsd",
 	"ldap",
 	"cert",
-	"radius",
-	"peer"
+	"peer",
+	"oauth",
 };
 
 /*
@@ -141,14 +137,11 @@ static int	regexec_auth_token(const char *match, AuthToken *token,
 static void tokenize_error_callback(void *arg);
 
 
-/*
- * isblank() exists in the ISO C99 spec, but it's not very portable yet,
- * so provide our own version.
- */
-bool
+static bool
 pg_isblank(const char c)
 {
-	return c == ' ' || c == '\t' || c == '\r';
+	/* don't accept non-ASCII data */
+	return (!IS_HIGHBIT_SET(c) && isblank(c));
 }
 
 
@@ -315,8 +308,8 @@ regcomp_auth_token(AuthToken *token, char *filename, int line_num,
 	if (token->string[0] != '/')
 		return 0;				/* nothing to compile */
 
-	token->regex = (regex_t *) palloc0(sizeof(regex_t));
-	wstr = palloc((strlen(token->string + 1) + 1) * sizeof(pg_wchar));
+	token->regex = palloc0_object(regex_t);
+	wstr = palloc_array(pg_wchar, strlen(token->string + 1) + 1);
 	wlen = pg_mb2wchar_with_len(token->string + 1,
 								wstr, strlen(token->string + 1));
 
@@ -357,7 +350,7 @@ regexec_auth_token(const char *match, AuthToken *token, size_t nmatch,
 
 	Assert(token->string[0] == '/' && token->regex);
 
-	wmatchstr = palloc((strlen(match) + 1) * sizeof(pg_wchar));
+	wmatchstr = palloc_array(pg_wchar, strlen(match) + 1);
 	wmatchlen = pg_mb2wchar_with_len(match, wmatchstr, strlen(match));
 
 	r = pg_regexec(token->regex, wmatchstr, wmatchlen, 0, NULL, nmatch, pmatch, 0);
@@ -629,8 +622,11 @@ open_auth_file(const char *filename, int elevel, int depth,
 				 errmsg("could not open file \"%s\": %m",
 						filename)));
 		if (err_msg)
-			*err_msg = psprintf("could not open file \"%s\": %s",
-								filename, strerror(save_errno));
+		{
+			errno = save_errno;
+			*err_msg = psprintf("could not open file \"%s\": %m",
+								filename);
+		}
 		/* the caller may care about some specific errno */
 		errno = save_errno;
 		return NULL;
@@ -704,7 +700,7 @@ tokenize_auth_file(const char *filename, FILE *file, List **tok_lines,
 	callback_arg.linenum = line_number;
 
 	tokenerrcontext.callback = tokenize_error_callback;
-	tokenerrcontext.arg = (void *) &callback_arg;
+	tokenerrcontext.arg = &callback_arg;
 	tokenerrcontext.previous = error_context_stack;
 	error_context_stack = &tokenerrcontext;
 
@@ -767,8 +763,9 @@ tokenize_auth_file(const char *filename, FILE *file, List **tok_lines,
 			ereport(elevel,
 					(errcode_for_file_access(),
 					 errmsg("could not read file \"%s\": %m", filename)));
-			err_msg = psprintf("could not read file \"%s\": %s",
-							   filename, strerror(save_errno));
+			errno = save_errno;
+			err_msg = psprintf("could not read file \"%s\": %m",
+							   filename);
 			break;
 		}
 
@@ -893,7 +890,7 @@ process_line:
 		 * to this list.
 		 */
 		oldcxt = MemoryContextSwitchTo(tokenize_context);
-		tok_line = (TokenizedAuthLine *) palloc0(sizeof(TokenizedAuthLine));
+		tok_line = palloc0_object(TokenizedAuthLine);
 		tok_line->fields = current_line;
 		tok_line->file_name = pstrdup(filename);
 		tok_line->line_num = line_number;
@@ -1074,7 +1071,7 @@ hostname_match(const char *pattern, const char *actual_hostname)
  * Check to see if a connecting IP matches a given host name.
  */
 static bool
-check_hostname(hbaPort *port, const char *hostname)
+check_hostname(Port *port, const char *hostname)
 {
 	struct addrinfo *gai_result,
 			   *gai;
@@ -1341,7 +1338,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 	AuthToken  *token;
 	HbaLine    *parsedline;
 
-	parsedline = palloc0(sizeof(HbaLine));
+	parsedline = palloc0_object(HbaLine);
 	parsedline->sourcefile = pstrdup(file_name);
 	parsedline->linenumber = line_num;
 	parsedline->rawline = pstrdup(tok_line->raw_line);
@@ -1383,7 +1380,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				ereport(elevel,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("hostssl record cannot match because SSL is disabled"),
-						 errhint("Set ssl = on in postgresql.conf."),
+						 errhint("Set \"ssl = on\" in postgresql.conf."),
 						 errcontext("line %d of configuration file \"%s\"",
 									line_num, file_name)));
 				*err_msg = "hostssl record cannot match because SSL is disabled";
@@ -1746,8 +1743,8 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 #else
 		unsupauth = "cert";
 #endif
-	else if (strcmp(token->string, "radius") == 0)
-		parsedline->auth_method = uaRADIUS;
+	else if (strcmp(token->string, "oauth") == 0)
+		parsedline->auth_method = uaOAuth;
 	else
 	{
 		ereport(elevel,
@@ -1912,10 +1909,10 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 			{
 				ereport(elevel,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
-						 errmsg("cannot use ldapbasedn, ldapbinddn, ldapbindpasswd, ldapsearchattribute, ldapsearchfilter, or ldapurl together with ldapprefix"),
+						 errmsg("cannot mix options for simple bind and search+bind modes"),
 						 errcontext("line %d of configuration file \"%s\"",
 									line_num, file_name)));
-				*err_msg = "cannot use ldapbasedn, ldapbinddn, ldapbindpasswd, ldapsearchattribute, ldapsearchfilter, or ldapurl together with ldapprefix";
+				*err_msg = "cannot mix options for simple bind and search+bind modes";
 				return NULL;
 			}
 		}
@@ -1947,87 +1944,6 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 		}
 	}
 
-	if (parsedline->auth_method == uaRADIUS)
-	{
-		MANDATORY_AUTH_ARG(parsedline->radiusservers, "radiusservers", "radius");
-		MANDATORY_AUTH_ARG(parsedline->radiussecrets, "radiussecrets", "radius");
-
-		if (parsedline->radiusservers == NIL)
-		{
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("list of RADIUS servers cannot be empty"),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			*err_msg = "list of RADIUS servers cannot be empty";
-			return NULL;
-		}
-
-		if (parsedline->radiussecrets == NIL)
-		{
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("list of RADIUS secrets cannot be empty"),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			*err_msg = "list of RADIUS secrets cannot be empty";
-			return NULL;
-		}
-
-		/*
-		 * Verify length of option lists - each can be 0 (except for secrets,
-		 * but that's already checked above), 1 (use the same value
-		 * everywhere) or the same as the number of servers.
-		 */
-		if (!(list_length(parsedline->radiussecrets) == 1 ||
-			  list_length(parsedline->radiussecrets) == list_length(parsedline->radiusservers)))
-		{
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("the number of RADIUS secrets (%d) must be 1 or the same as the number of RADIUS servers (%d)",
-							list_length(parsedline->radiussecrets),
-							list_length(parsedline->radiusservers)),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			*err_msg = psprintf("the number of RADIUS secrets (%d) must be 1 or the same as the number of RADIUS servers (%d)",
-								list_length(parsedline->radiussecrets),
-								list_length(parsedline->radiusservers));
-			return NULL;
-		}
-		if (!(list_length(parsedline->radiusports) == 0 ||
-			  list_length(parsedline->radiusports) == 1 ||
-			  list_length(parsedline->radiusports) == list_length(parsedline->radiusservers)))
-		{
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("the number of RADIUS ports (%d) must be 1 or the same as the number of RADIUS servers (%d)",
-							list_length(parsedline->radiusports),
-							list_length(parsedline->radiusservers)),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			*err_msg = psprintf("the number of RADIUS ports (%d) must be 1 or the same as the number of RADIUS servers (%d)",
-								list_length(parsedline->radiusports),
-								list_length(parsedline->radiusservers));
-			return NULL;
-		}
-		if (!(list_length(parsedline->radiusidentifiers) == 0 ||
-			  list_length(parsedline->radiusidentifiers) == 1 ||
-			  list_length(parsedline->radiusidentifiers) == list_length(parsedline->radiusservers)))
-		{
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("the number of RADIUS identifiers (%d) must be 1 or the same as the number of RADIUS servers (%d)",
-							list_length(parsedline->radiusidentifiers),
-							list_length(parsedline->radiusservers)),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			*err_msg = psprintf("the number of RADIUS identifiers (%d) must be 1 or the same as the number of RADIUS servers (%d)",
-								list_length(parsedline->radiusidentifiers),
-								list_length(parsedline->radiusservers));
-			return NULL;
-		}
-	}
-
 	/*
 	 * Enforce any parameters implied by other settings.
 	 */
@@ -2038,6 +1954,36 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 		 * and it implies the level of verify-full.
 		 */
 		parsedline->clientcert = clientCertFull;
+	}
+
+	/*
+	 * Enforce proper configuration of OAuth authentication.
+	 */
+	if (parsedline->auth_method == uaOAuth)
+	{
+		MANDATORY_AUTH_ARG(parsedline->oauth_scope, "scope", "oauth");
+		MANDATORY_AUTH_ARG(parsedline->oauth_issuer, "issuer", "oauth");
+
+		/* Ensure a validator library is set and permitted by the config. */
+		if (!check_oauth_validator(parsedline, elevel, err_msg))
+			return NULL;
+
+		/*
+		 * Supplying a usermap combined with the option to skip usermapping is
+		 * nonsensical and indicates a configuration error.
+		 */
+		if (parsedline->oauth_skip_usermap && parsedline->usermap != NULL)
+		{
+			ereport(elevel,
+					errcode(ERRCODE_CONFIG_FILE_ERROR),
+			/* translator: strings are replaced with hba options */
+					errmsg("%s cannot be used in combination with %s",
+						   "map", "delegate_ident_mapping"),
+					errcontext("line %d of configuration file \"%s\"",
+							   line_num, file_name));
+			*err_msg = "map cannot be used in combination with delegate_ident_mapping";
+			return NULL;
+		}
 	}
 
 	return parsedline;
@@ -2067,8 +2013,9 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 			hbaline->auth_method != uaPeer &&
 			hbaline->auth_method != uaGSS &&
 			hbaline->auth_method != uaSSPI &&
-			hbaline->auth_method != uaCert)
-			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, and cert"));
+			hbaline->auth_method != uaCert &&
+			hbaline->auth_method != uaOAuth)
+			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, cert, and oauth"));
 		hbaline->usermap = pstrdup(val);
 	}
 	else if (strcmp(name, "clientcert") == 0)
@@ -2319,137 +2266,54 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 		else
 			hbaline->upn_username = false;
 	}
-	else if (strcmp(name, "radiusservers") == 0)
+	else if (strcmp(name, "issuer") == 0)
 	{
-		struct addrinfo *gai_result;
-		struct addrinfo hints;
-		int			ret;
-		List	   *parsed_servers;
-		ListCell   *l;
-		char	   *dupval = pstrdup(val);
-
-		REQUIRE_AUTH_OPTION(uaRADIUS, "radiusservers", "radius");
-
-		if (!SplitGUCList(dupval, ',', &parsed_servers))
-		{
-			/* syntax error in list */
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("could not parse RADIUS server list \"%s\"",
-							val),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			return false;
-		}
-
-		/* For each entry in the list, translate it */
-		foreach(l, parsed_servers)
-		{
-			MemSet(&hints, 0, sizeof(hints));
-			hints.ai_socktype = SOCK_DGRAM;
-			hints.ai_family = AF_UNSPEC;
-
-			ret = pg_getaddrinfo_all((char *) lfirst(l), NULL, &hints, &gai_result);
-			if (ret || !gai_result)
-			{
-				ereport(elevel,
-						(errcode(ERRCODE_CONFIG_FILE_ERROR),
-						 errmsg("could not translate RADIUS server name \"%s\" to address: %s",
-								(char *) lfirst(l), gai_strerror(ret)),
-						 errcontext("line %d of configuration file \"%s\"",
-									line_num, file_name)));
-				if (gai_result)
-					pg_freeaddrinfo_all(hints.ai_family, gai_result);
-
-				list_free(parsed_servers);
-				return false;
-			}
-			pg_freeaddrinfo_all(hints.ai_family, gai_result);
-		}
-
-		/* All entries are OK, so store them */
-		hbaline->radiusservers = parsed_servers;
-		hbaline->radiusservers_s = pstrdup(val);
+		REQUIRE_AUTH_OPTION(uaOAuth, "issuer", "oauth");
+		hbaline->oauth_issuer = pstrdup(val);
 	}
-	else if (strcmp(name, "radiusports") == 0)
+	else if (strcmp(name, "scope") == 0)
 	{
-		List	   *parsed_ports;
-		ListCell   *l;
-		char	   *dupval = pstrdup(val);
-
-		REQUIRE_AUTH_OPTION(uaRADIUS, "radiusports", "radius");
-
-		if (!SplitGUCList(dupval, ',', &parsed_ports))
-		{
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("could not parse RADIUS port list \"%s\"",
-							val),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			*err_msg = psprintf("invalid RADIUS port number: \"%s\"", val);
-			return false;
-		}
-
-		foreach(l, parsed_ports)
-		{
-			if (atoi(lfirst(l)) == 0)
-			{
-				ereport(elevel,
-						(errcode(ERRCODE_CONFIG_FILE_ERROR),
-						 errmsg("invalid RADIUS port number: \"%s\"", val),
-						 errcontext("line %d of configuration file \"%s\"",
-									line_num, file_name)));
-
-				return false;
-			}
-		}
-		hbaline->radiusports = parsed_ports;
-		hbaline->radiusports_s = pstrdup(val);
+		REQUIRE_AUTH_OPTION(uaOAuth, "scope", "oauth");
+		hbaline->oauth_scope = pstrdup(val);
 	}
-	else if (strcmp(name, "radiussecrets") == 0)
+	else if (strcmp(name, "validator") == 0)
 	{
-		List	   *parsed_secrets;
-		char	   *dupval = pstrdup(val);
-
-		REQUIRE_AUTH_OPTION(uaRADIUS, "radiussecrets", "radius");
-
-		if (!SplitGUCList(dupval, ',', &parsed_secrets))
-		{
-			/* syntax error in list */
-			ereport(elevel,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("could not parse RADIUS secret list \"%s\"",
-							val),
-					 errcontext("line %d of configuration file \"%s\"",
-								line_num, file_name)));
-			return false;
-		}
-
-		hbaline->radiussecrets = parsed_secrets;
-		hbaline->radiussecrets_s = pstrdup(val);
+		REQUIRE_AUTH_OPTION(uaOAuth, "validator", "oauth");
+		hbaline->oauth_validator = pstrdup(val);
 	}
-	else if (strcmp(name, "radiusidentifiers") == 0)
+	else if (strncmp(name, "validator.", strlen("validator.")) == 0)
 	{
-		List	   *parsed_identifiers;
-		char	   *dupval = pstrdup(val);
+		const char *key = name + strlen("validator.");
 
-		REQUIRE_AUTH_OPTION(uaRADIUS, "radiusidentifiers", "radius");
+		REQUIRE_AUTH_OPTION(uaOAuth, name, "oauth");
 
-		if (!SplitGUCList(dupval, ',', &parsed_identifiers))
+		/*
+		 * Validator modules may register their own per-HBA-line options.
+		 * Unfortunately, since we don't want to require these modules to be
+		 * loaded into the postmaster, we don't know if the options are valid
+		 * yet and must store them for later. Perform only a basic syntax
+		 * check here.
+		 */
+		if (!valid_oauth_hba_option_name(key))
 		{
-			/* syntax error in list */
 			ereport(elevel,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("could not parse RADIUS identifiers list \"%s\"",
-							val),
+					 errmsg("invalid OAuth validator option name: \"%s\"", name),
 					 errcontext("line %d of configuration file \"%s\"",
 								line_num, file_name)));
 			return false;
 		}
 
-		hbaline->radiusidentifiers = parsed_identifiers;
-		hbaline->radiusidentifiers_s = pstrdup(val);
+		hbaline->oauth_opt_keys = lappend(hbaline->oauth_opt_keys, pstrdup(key));
+		hbaline->oauth_opt_vals = lappend(hbaline->oauth_opt_vals, pstrdup(val));
+	}
+	else if (strcmp(name, "delegate_ident_mapping") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaOAuth, "delegate_ident_mapping", "oauth");
+		if (strcmp(val, "1") == 0)
+			hbaline->oauth_skip_usermap = true;
+		else
+			hbaline->oauth_skip_usermap = false;
 	}
 	else
 	{
@@ -2471,7 +2335,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
  *	request.
  */
 static void
-check_hba(hbaPort *port)
+check_hba(Port *port)
 {
 	Oid			roleid;
 	ListCell   *line;
@@ -2568,7 +2432,7 @@ check_hba(hbaPort *port)
 	}
 
 	/* If no matching entry was found, then implicitly reject. */
-	hba = palloc0(sizeof(HbaLine));
+	hba = palloc0_object(HbaLine);
 	hba->auth_method = uaImplicitReject;
 	port->hba = hba;
 }
@@ -2704,7 +2568,7 @@ parse_ident_line(TokenizedAuthLine *tok_line, int elevel)
 	Assert(tok_line->fields != NIL);
 	field = list_head(tok_line->fields);
 
-	parsedline = palloc0(sizeof(IdentLine));
+	parsedline = palloc0_object(IdentLine);
 	parsedline->linenumber = line_num;
 
 	/* Get the map token (must exist) */
@@ -2816,8 +2680,11 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 			!token_has_regexp(identLine->pg_user) &&
 			(ofs = strstr(identLine->pg_user->string, "\\1")) != NULL)
 		{
+			const char *repl_str;
+			size_t		repl_len;
+			char	   *old_pg_user;
 			char	   *expanded_pg_user;
-			int			offset;
+			size_t		offset;
 
 			/* substitution of the first argument requested */
 			if (matches[1].rm_so < 0)
@@ -2829,18 +2696,33 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 				*error_p = true;
 				return;
 			}
+			repl_str = system_user + matches[1].rm_so;
+			repl_len = matches[1].rm_eo - matches[1].rm_so;
 
 			/*
-			 * length: original length minus length of \1 plus length of match
-			 * plus null terminator
+			 * It's allowed to have more than one \1 in the string, and we'll
+			 * replace them all.  But that's pretty unusual so we optimize on
+			 * the assumption of only one occurrence, which motivates doing
+			 * repeated replacements instead of making two passes over the
+			 * string to determine the final length right away.
 			 */
-			expanded_pg_user = palloc0(strlen(identLine->pg_user->string) - 2 + (matches[1].rm_eo - matches[1].rm_so) + 1);
-			offset = ofs - identLine->pg_user->string;
-			memcpy(expanded_pg_user, identLine->pg_user->string, offset);
-			memcpy(expanded_pg_user + offset,
-				   system_user + matches[1].rm_so,
-				   matches[1].rm_eo - matches[1].rm_so);
-			strcat(expanded_pg_user, ofs + 2);
+			old_pg_user = identLine->pg_user->string;
+			do
+			{
+				/*
+				 * length: current length minus length of \1 plus length of
+				 * replacement plus null terminator
+				 */
+				expanded_pg_user = palloc(strlen(old_pg_user) - 2 + repl_len + 1);
+				/* ofs points into the old_pg_user string at this point */
+				offset = ofs - old_pg_user;
+				memcpy(expanded_pg_user, old_pg_user, offset);
+				memcpy(expanded_pg_user + offset, repl_str, repl_len);
+				strcpy(expanded_pg_user + offset + repl_len, ofs + 2);
+				if (old_pg_user != identLine->pg_user->string)
+					pfree(old_pg_user);
+				old_pg_user = expanded_pg_user;
+			} while ((ofs = strstr(old_pg_user + offset + repl_len, "\\1")) != NULL);
 
 			/*
 			 * Mark the token as quoted, so it will only be compared literally
@@ -3050,7 +2932,7 @@ load_ident(void)
  *	method = uaImplicitReject.
  */
 void
-hba_getauthmethod(hbaPort *port)
+hba_getauthmethod(Port *port)
 {
 	check_hba(port);
 }

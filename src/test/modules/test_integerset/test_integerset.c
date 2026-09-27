@@ -3,7 +3,7 @@
  * test_integerset.c
  *		Test integer set data structure.
  *
- * Copyright (c) 2019-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_integerset/test_integerset.c
@@ -15,10 +15,6 @@
 #include "common/pg_prng.h"
 #include "fmgr.h"
 #include "lib/integerset.h"
-#include "miscadmin.h"
-#include "nodes/bitmapset.h"
-#include "storage/block.h"
-#include "storage/itemptr.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -120,7 +116,7 @@ test_integerset(PG_FUNCTION_ARGS)
 	test_single_value_and_filler(PG_UINT64_MAX, 1000, 2000);
 
 	/* Test different test patterns, with lots of entries */
-	for (int i = 0; i < lengthof(test_specs); i++)
+	for (size_t i = 0; i < lengthof(test_specs); i++)
 	{
 		test_pattern(&test_specs[i]);
 	}
@@ -151,7 +147,7 @@ test_pattern(const test_spec *spec)
 
 	/* Pre-process the pattern, creating an array of integers from it. */
 	patternlen = strlen(spec->pattern_str);
-	pattern_values = palloc(patternlen * sizeof(uint64));
+	pattern_values = palloc_array(uint64, patternlen);
 	pattern_num_values = 0;
 	for (int i = 0; i < patternlen; i++)
 	{
@@ -186,7 +182,7 @@ test_pattern(const test_spec *spec)
 	{
 		uint64		x = 0;
 
-		for (int i = 0; i < pattern_num_values && n < spec->num_values; i++)
+		for (uint64 i = 0; i < pattern_num_values && n < spec->num_values; i++)
 		{
 			x = last_int + pattern_values[i];
 
@@ -287,7 +283,7 @@ test_pattern(const test_spec *spec)
 	last_int = 0;
 	while (n < spec->num_values)
 	{
-		for (int i = 0; i < pattern_num_values && n < spec->num_values; i++)
+		for (uint64 i = 0; i < pattern_num_values && n < spec->num_values; i++)
 		{
 			uint64		expected = last_int + pattern_values[i];
 			uint64		x;
@@ -389,7 +385,7 @@ test_single_value_and_filler(uint64 value, uint64 filler_min, uint64 filler_max)
 
 	intset = intset_create();
 
-	iter_expected = palloc(sizeof(uint64) * (filler_max - filler_min + 1));
+	iter_expected = palloc_array(uint64, filler_max - filler_min + 1);
 	if (value < filler_min)
 	{
 		intset_add_member(intset, value);

@@ -4,7 +4,7 @@
  *	  Support routines for scanning Values lists
  *	  ("VALUES (...), (...), ..." in rangetable).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,7 +18,6 @@
  *		ExecValuesScan			scans a values list.
  *		ExecValuesNext			retrieve next tuple in sequential order.
  *		ExecInitValuesScan		creates and initializes a valuesscan node.
- *		ExecEndValuesScan		releases any storage allocated.
  *		ExecReScanValuesScan	rescans the values list
  */
 #include "postgres.h"
@@ -142,11 +141,11 @@ ValuesNext(ValuesScanState *node)
 		resind = 0;
 		foreach(lc, exprstatelist)
 		{
-			ExprState  *estate = (ExprState *) lfirst(lc);
-			Form_pg_attribute attr = TupleDescAttr(slot->tts_tupleDescriptor,
-												   resind);
+			ExprState  *exprstate = (ExprState *) lfirst(lc);
+			CompactAttribute *attr = TupleDescCompactAttr(slot->tts_tupleDescriptor,
+														  resind);
 
-			values[resind] = ExecEvalExpr(estate,
+			values[resind] = ExecEvalExpr(exprstate,
 										  econtext,
 										  &isnull[resind]);
 
@@ -248,7 +247,7 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
 	 * Get info about values list, initialize scan slot with it.
 	 */
 	tupdesc = ExecTypeFromExprList((List *) linitial(node->values_lists));
-	ExecInitScanTupleSlot(estate, &scanstate->ss, tupdesc, &TTSOpsVirtual);
+	ExecInitScanTupleSlot(estate, &scanstate->ss, tupdesc, &TTSOpsVirtual, 0);
 
 	/*
 	 * Initialize result type and projection.
@@ -278,10 +277,8 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
 	 * and/or leaked resources if we try to handle SubPlans the same as
 	 * simpler expressions.)
 	 */
-	scanstate->exprlists = (List **)
-		palloc(scanstate->array_len * sizeof(List *));
-	scanstate->exprstatelists = (List **)
-		palloc0(scanstate->array_len * sizeof(List *));
+	scanstate->exprlists = palloc_array(List *, scanstate->array_len);
+	scanstate->exprstatelists = palloc0_array(List *, scanstate->array_len);
 	i = 0;
 	foreach(vtl, node->values_lists)
 	{

@@ -195,6 +195,7 @@
    &refreshMaterializedView;
    &reindex;
    &releaseSavepoint;
+   &repack;
    &reset;
    &revoke;
    &rollback;
@@ -216,6 +217,7 @@
    &update;
    &vacuum;
    &values;
+   &wait;
 
  </reference>
 
@@ -250,6 +252,7 @@
    &pgamcheck;
    &pgBasebackup;
    &pgbench;
+   &pgCombinebackup;
    &pgConfig;
    &pgDump;
    &pgDumpall;
@@ -281,6 +284,7 @@
    &pgarchivecleanup;
    &pgChecksums;
    &pgControldata;
+   &pgCreateSubscriber;
    &pgCtl;
    &pgResetwal;
    &pgRewind;
@@ -288,6 +292,7 @@
    &pgtesttiming;
    &pgupgrade;
    &pgwaldump;
+   &pgwalsummary;
    &postgres;
 
  </reference>

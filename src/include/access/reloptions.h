@@ -9,7 +9,7 @@
  * into a lot of low-level code.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/reloptions.h
@@ -23,16 +23,16 @@
 #include "access/htup.h"
 #include "access/tupdesc.h"
 #include "nodes/pg_list.h"
-#include "storage/lock.h"
 
 /* types supported by reloptions */
 typedef enum relopt_type
 {
 	RELOPT_TYPE_BOOL,
+	RELOPT_TYPE_TERNARY,		/* on, off, unset */
 	RELOPT_TYPE_INT,
 	RELOPT_TYPE_REAL,
 	RELOPT_TYPE_ENUM,
-	RELOPT_TYPE_STRING
+	RELOPT_TYPE_STRING,
 } relopt_type;
 
 /* kinds supported by reloptions */
@@ -66,7 +66,7 @@ typedef struct relopt_gen
 	const char *name;			/* must be first (used as list termination
 								 * marker) */
 	const char *desc;
-	bits32		kinds;
+	uint32		kinds;
 	LOCKMODE	lockmode;
 	int			namelen;
 	relopt_type type;
@@ -80,11 +80,12 @@ typedef struct relopt_value
 	union
 	{
 		bool		bool_val;
+		pg_ternary	ternary_val;
 		int			int_val;
 		double		real_val;
 		int			enum_val;
 		char	   *string_val; /* allocated separately */
-	}			values;
+	};
 } relopt_value;
 
 /* reloptions records for specific variable types */
@@ -93,6 +94,12 @@ typedef struct relopt_bool
 	relopt_gen	gen;
 	bool		default_val;
 } relopt_bool;
+
+typedef struct relopt_ternary
+{
+	relopt_gen	gen;
+	/* ternaries have no default_val: otherwise they'd just be bools */
+} relopt_ternary;
 
 typedef struct relopt_int
 {
@@ -180,18 +187,20 @@ typedef struct local_relopts
 	 (char *)(optstruct) + (optstruct)->member)
 
 extern relopt_kind add_reloption_kind(void);
-extern void add_bool_reloption(bits32 kinds, const char *name, const char *desc,
+extern void add_bool_reloption(uint32 kinds, const char *name, const char *desc,
 							   bool default_val, LOCKMODE lockmode);
-extern void add_int_reloption(bits32 kinds, const char *name, const char *desc,
+extern void add_ternary_reloption(uint32 kinds, const char *name,
+								  const char *desc, LOCKMODE lockmode);
+extern void add_int_reloption(uint32 kinds, const char *name, const char *desc,
 							  int default_val, int min_val, int max_val,
 							  LOCKMODE lockmode);
-extern void add_real_reloption(bits32 kinds, const char *name, const char *desc,
+extern void add_real_reloption(uint32 kinds, const char *name, const char *desc,
 							   double default_val, double min_val, double max_val,
 							   LOCKMODE lockmode);
-extern void add_enum_reloption(bits32 kinds, const char *name, const char *desc,
+extern void add_enum_reloption(uint32 kinds, const char *name, const char *desc,
 							   relopt_enum_elt_def *members, int default_val,
 							   const char *detailmsg, LOCKMODE lockmode);
-extern void add_string_reloption(bits32 kinds, const char *name, const char *desc,
+extern void add_string_reloption(uint32 kinds, const char *name, const char *desc,
 								 const char *default_val, validate_string_relopt validator,
 								 LOCKMODE lockmode);
 
@@ -201,6 +210,9 @@ extern void register_reloptions_validator(local_relopts *relopts,
 extern void add_local_bool_reloption(local_relopts *relopts, const char *name,
 									 const char *desc, bool default_val,
 									 int offset);
+extern void add_local_ternary_reloption(local_relopts *relopts,
+										const char *name, const char *desc,
+										int offset);
 extern void add_local_int_reloption(local_relopts *relopts, const char *name,
 									const char *desc, int default_val,
 									int min_val, int max_val, int offset);
@@ -220,7 +232,7 @@ extern void add_local_string_reloption(local_relopts *relopts, const char *name,
 									   fill_string_relopt filler, int offset);
 
 extern Datum transformRelOptions(Datum oldOptions, List *defList,
-								 const char *namspace, char *validnsps[],
+								 const char *nameSpace, const char *const validnsps[],
 								 bool acceptOidsOff, bool isReset);
 extern List *untransformRelOptions(Datum options);
 extern bytea *extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
@@ -235,6 +247,8 @@ extern void *build_local_reloptions(local_relopts *relopts, Datum options,
 
 extern bytea *default_reloptions(Datum reloptions, bool validate,
 								 relopt_kind kind);
+extern struct StdRdOptions *merge_toast_reloptions(const struct StdRdOptions *toast_opts,
+												   const struct StdRdOptions *main_opts);
 extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
 extern bytea *view_reloptions(Datum reloptions, bool validate);
 extern bytea *partitioned_table_reloptions(Datum reloptions, bool validate);

@@ -6,18 +6,40 @@
 # when packages are installed or removed.  Any package this script is
 # not instructed to install, will be removed again.
 #
-# This currently expects to be run in a macos cirrus-ci environment.
+# This currently expects to be run in a GitHub Actions macOS environment.
 
 set -e
 # set -x
 
 packages="$@"
 
-macports_url="https://github.com/macports/macports-base/releases/download/v2.8.1/MacPorts-2.8.1-13-Ventura.pkg"
+macos_major_version="` sw_vers -productVersion | sed 's/\..*//' `"
+echo "macOS major version: $macos_major_version"
+
+# Scan the available MacPorts releases to find one that matches the running
+# macOS release.
+macports_release_list_url="https://api.github.com/repos/macports/macports-base/releases"
+macports_version_pattern="2\.10\.1"
+# Authenticate the GitHub API request when a token is available (e.g. on
+# GitHub Actions). Unauthenticated requests share a 60/h/IP rate limit
+# with every other job on the runner's IP and frequently return an error
+# JSON, leaving $macports_url empty and breaking the subsequent curl.
+auth_header=""
+if [ -n "$GITHUB_TOKEN" ]; then
+    auth_header="Authorization: Bearer $GITHUB_TOKEN"
+fi
+macports_url="$( curl -fsSL ${auth_header:+-H "$auth_header"} "$macports_release_list_url" | grep "\"https://github.com/macports/macports-base/releases/download/v$macports_version_pattern/MacPorts-$macports_version_pattern-$macos_major_version-[A-Za-z]*\.pkg\"" | sed 's/.*: "//;s/".*//' | head -1 )"
+echo "MacPorts package URL: $macports_url"
+
+if [ -z "$macports_url" ]; then
+    echo "error: could not determine MacPorts package URL for macOS $macos_major_version (version pattern: $macports_version_pattern)" 1>&2
+    exit 1
+fi
+
 cache_dmg="macports.hfs.dmg"
 
-if [ "$CIRRUS_CI" != "true" ]; then
-    echo "expect to be called within cirrus-ci" 1>2
+if [ "$GITHUB_ACTIONS" != "true" ]; then
+    echo "expect to be called within GitHub Actions" 1>&2
     exit 1
 fi
 
@@ -50,11 +72,18 @@ if [ -n "$(port -q installed installed)" ] ; then
     sudo port unsetrequested installed
 fi
 
-# if setting all the required packages as requested fails, we need
-# to install at least one of them
-if ! sudo port setrequested $packages > /dev/null 2>&1 ; then
-    echo not all required packages installed, doing so now
+# If setting all the required packages as requested fails, we need
+# to install at least one of them. Need to do so one-by-one as
+# port setrequested only reports failures for the first package.
+echo "checking if all required packages are installed"
+for package in $packages ; do
+  if ! sudo port setrequested $package > /dev/null 2>&1 ; then
     update_cached_image=1
+  fi
+done
+echo "done"
+if [ "$update_cached_image" -eq 1 ]; then
+    echo not all required packages installed, doing so now
     # to keep the image small, we deleted the ports tree from the image...
     sudo port selfupdate
     # XXX likely we'll need some other way to force an upgrade at some
@@ -66,7 +95,7 @@ fi
 
 # check if any ports should be uninstalled
 if [ -n "$(port -q installed rleaves)" ] ; then
-    echo superflous packages installed
+    echo superfluous packages installed
     update_cached_image=1
     sudo port uninstall --follow-dependencies rleaves
 

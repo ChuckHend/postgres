@@ -5,7 +5,7 @@
  * Routines to expose the contents of the control data file via
  * a set of SQL functions.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,10 +20,10 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
-#include "catalog/pg_type.h"
 #include "common/controldata_utils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/lwlock.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
@@ -42,7 +42,9 @@ pg_control_system(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* read the control file */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -67,8 +69,8 @@ pg_control_system(PG_FUNCTION_ARGS)
 Datum
 pg_control_checkpoint(PG_FUNCTION_ARGS)
 {
-	Datum		values[18];
-	bool		nulls[18];
+	Datum		values[20];
+	bool		nulls[20];
 	TupleDesc	tupdesc;
 	HeapTuple	htup;
 	ControlFileData *ControlFile;
@@ -80,7 +82,9 @@ pg_control_checkpoint(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* Read the control file. */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -112,43 +116,49 @@ pg_control_checkpoint(PG_FUNCTION_ARGS)
 	values[5] = BoolGetDatum(ControlFile->checkPointCopy.fullPageWrites);
 	nulls[5] = false;
 
-	values[6] = CStringGetTextDatum(psprintf("%u:%u",
-											 EpochFromFullTransactionId(ControlFile->checkPointCopy.nextXid),
-											 XidFromFullTransactionId(ControlFile->checkPointCopy.nextXid)));
+	values[6] = BoolGetDatum(ControlFile->checkPointCopy.logicalDecodingEnabled);
 	nulls[6] = false;
 
-	values[7] = ObjectIdGetDatum(ControlFile->checkPointCopy.nextOid);
+	values[7] = CStringGetTextDatum(psprintf("%u:%u",
+											 EpochFromFullTransactionId(ControlFile->checkPointCopy.nextXid),
+											 XidFromFullTransactionId(ControlFile->checkPointCopy.nextXid)));
 	nulls[7] = false;
 
-	values[8] = TransactionIdGetDatum(ControlFile->checkPointCopy.nextMulti);
+	values[8] = ObjectId8GetDatum(ControlFile->checkPointCopy.nextOid);
 	nulls[8] = false;
 
-	values[9] = TransactionIdGetDatum(ControlFile->checkPointCopy.nextMultiOffset);
+	values[9] = TransactionIdGetDatum(ControlFile->checkPointCopy.nextMulti);
 	nulls[9] = false;
 
-	values[10] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestXid);
+	values[10] = Int64GetDatum(ControlFile->checkPointCopy.nextMultiOffset);
 	nulls[10] = false;
 
-	values[11] = ObjectIdGetDatum(ControlFile->checkPointCopy.oldestXidDB);
+	values[11] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestXid);
 	nulls[11] = false;
 
-	values[12] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestActiveXid);
+	values[12] = ObjectIdGetDatum(ControlFile->checkPointCopy.oldestXidDB);
 	nulls[12] = false;
 
-	values[13] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestMulti);
+	values[13] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestActiveXid);
 	nulls[13] = false;
 
-	values[14] = ObjectIdGetDatum(ControlFile->checkPointCopy.oldestMultiDB);
+	values[14] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestMulti);
 	nulls[14] = false;
 
-	values[15] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestCommitTsXid);
+	values[15] = ObjectIdGetDatum(ControlFile->checkPointCopy.oldestMultiDB);
 	nulls[15] = false;
 
-	values[16] = TransactionIdGetDatum(ControlFile->checkPointCopy.newestCommitTsXid);
+	values[16] = TransactionIdGetDatum(ControlFile->checkPointCopy.oldestCommitTsXid);
 	nulls[16] = false;
 
-	values[17] = TimestampTzGetDatum(time_t_to_timestamptz(ControlFile->checkPointCopy.time));
+	values[17] = TransactionIdGetDatum(ControlFile->checkPointCopy.newestCommitTsXid);
 	nulls[17] = false;
+
+	values[18] = Int32GetDatum(ControlFile->checkPointCopy.dataChecksumState);
+	nulls[18] = false;
+
+	values[19] = TimestampTzGetDatum(time_t_to_timestamptz(ControlFile->checkPointCopy.time));
+	nulls[19] = false;
 
 	htup = heap_form_tuple(tupdesc, values, nulls);
 
@@ -169,7 +179,9 @@ pg_control_recovery(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* read the control file */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -197,8 +209,8 @@ pg_control_recovery(PG_FUNCTION_ARGS)
 Datum
 pg_control_init(PG_FUNCTION_ARGS)
 {
-	Datum		values[11];
-	bool		nulls[11];
+	Datum		values[12];
+	bool		nulls[12];
 	TupleDesc	tupdesc;
 	HeapTuple	htup;
 	ControlFileData *ControlFile;
@@ -208,7 +220,9 @@ pg_control_init(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* read the control file */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -243,8 +257,11 @@ pg_control_init(PG_FUNCTION_ARGS)
 	values[9] = BoolGetDatum(ControlFile->float8ByVal);
 	nulls[9] = false;
 
-	values[10] = Int32GetDatum(ControlFile->data_checksum_version);
+	values[10] = Int32GetDatum(ControlFile->data_checksum_version_init);
 	nulls[10] = false;
+
+	values[11] = BoolGetDatum(ControlFile->default_char_signedness);
+	nulls[11] = false;
 
 	htup = heap_form_tuple(tupdesc, values, nulls);
 

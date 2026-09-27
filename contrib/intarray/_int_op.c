@@ -5,7 +5,10 @@
 
 #include "_int.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "intarray",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(_int_different);
 PG_FUNCTION_INFO_V1(_int_same);
@@ -93,7 +96,8 @@ _int_same(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(result);
 }
 
-/*	_int_overlap -- does a overlap b?
+/*
+ * _int_overlap -- does a overlap b?
  */
 Datum
 _int_overlap(PG_FUNCTION_ARGS)
@@ -105,7 +109,7 @@ _int_overlap(PG_FUNCTION_ARGS)
 	CHECKARRVALID(a);
 	CHECKARRVALID(b);
 	if (ARRISEMPTY(a) || ARRISEMPTY(b))
-		return false;
+		PG_RETURN_BOOL(false);
 
 	SORT(a);
 	SORT(b);

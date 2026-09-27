@@ -1,8 +1,8 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 # Test logical replication behavior with subscriber using available index
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -14,7 +14,7 @@ $node_publisher->start;
 
 # create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->start;
 
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
@@ -479,6 +479,65 @@ $node_subscriber->safe_psql('postgres', "DROP TABLE test_replica_id_full");
 # =============================================================================
 
 # =============================================================================
+# Testcase start: Subscription does not use an invalid index
+#
+# A failed CREATE INDEX CONCURRENTLY leaves behind a live but invalid
+# index, which is not required to contain every row.  The apply worker
+# must not choose it for REPLICA IDENTITY FULL lookups.
+#
+
+# create tables pub and sub
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE test_invalid (x int, y int)");
+$node_publisher->safe_psql('postgres',
+	"ALTER TABLE test_invalid REPLICA IDENTITY FULL");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE test_invalid (x int, y int)");
+
+# insert some initial data, including the row the index build trips over
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO test_invalid SELECT i, i FROM generate_series(1,10) i");
+
+# create pub/sub
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_invalid FOR TABLE test_invalid");
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION tap_sub_invalid CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub_invalid"
+);
+
+# wait for initial table synchronization to finish
+$node_subscriber->wait_for_subscription_sync($node_publisher, $appname);
+
+# leave an invalid index behind: the build fails on the y = 5 row
+my ($cic_ret, $cic_out, $cic_err) = $node_subscriber->psql('postgres',
+	"CREATE INDEX CONCURRENTLY test_invalid_idx ON test_invalid (x, (1/(y-5)))"
+);
+isnt($cic_ret, 0, 'CREATE INDEX CONCURRENTLY fails');
+$result = $node_subscriber->safe_psql('postgres',
+		"SELECT indisvalid FROM pg_index"
+	  . " WHERE indexrelid = 'test_invalid_idx'::regclass");
+is($result, qq(f), 'and leaves an invalid index behind');
+
+# the update must still be applied
+$node_publisher->safe_psql('postgres',
+	"UPDATE test_invalid SET y = 99 WHERE x = 7");
+$node_publisher->wait_for_catchup($appname);
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT y FROM test_invalid WHERE x = 7");
+is($result, qq(99),
+	'ensure subscriber has the correct data at the end of the test');
+
+# cleanup pub
+$node_publisher->safe_psql('postgres', "DROP PUBLICATION tap_pub_invalid");
+$node_publisher->safe_psql('postgres', "DROP TABLE test_invalid");
+# cleanup sub
+$node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub_invalid");
+$node_subscriber->safe_psql('postgres', "DROP TABLE test_invalid");
+
+# Testcase end: Subscription does not use an invalid index
+# =============================================================================
+
+# =============================================================================
 # Testcase start: Subscription can use hash index
 #
 
@@ -490,7 +549,8 @@ $node_publisher->safe_psql('postgres',
 $node_subscriber->safe_psql('postgres',
 	"CREATE TABLE test_replica_id_full (x int, y text)");
 $node_subscriber->safe_psql('postgres',
-	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full USING HASH (x)");
+	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full USING HASH (x)"
+);
 
 # insert some initial data
 $node_publisher->safe_psql('postgres',

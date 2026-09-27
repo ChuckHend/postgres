@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 test_install_data += files(
   'test_ext1--1.0.sql',
@@ -15,9 +15,13 @@ test_install_data += files(
   'test_ext6.control',
   'test_ext7--1.0--2.0.sql',
   'test_ext7--1.0.sql',
+  'test_ext7--2.0--2.1bad.sql',
+  'test_ext7--2.0--2.2bad.sql',
   'test_ext7.control',
   'test_ext8--1.0.sql',
   'test_ext8.control',
+  'test_ext9--1.0.sql',
+  'test_ext9.control',
   'test_ext_cine--1.0.sql',
   'test_ext_cine--1.0--1.1.sql',
   'test_ext_cine.control',
@@ -38,6 +42,21 @@ test_install_data += files(
   'test_ext_req_schema2.control',
   'test_ext_req_schema3--1.0.sql',
   'test_ext_req_schema3.control',
+  'test_ext_set_schema--1.0.sql',
+  'test_ext_set_schema.control',
+)
+
+test_ext_sources = files('test_ext.c')
+
+if host_system == 'windows'
+  test_ext_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
+    '--NAME', 'test_ext',
+    '--FILEDESC', 'test_ext - test C extension for pg_upgrade',])
+endif
+
+test_ext = shared_module('test_ext',
+  test_ext_sources,
+  kwargs: pg_test_mod_args,
 )
 
 tests += {
@@ -50,5 +69,10 @@ tests += {
       'test_extdepend',
     ],
     'regress_args': ['--no-locale'],
+  },
+  'tap': {
+    'tests': [
+      't/001_extension_control_path.pl',
+    ],
   },
 }

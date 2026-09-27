@@ -3,7 +3,7 @@
  * int8.c
  *	  Internal 64-bit integer operations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -24,8 +24,7 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "utils/builtins.h"
-#include "utils/lsyscache.h"
-
+#include "utils/fmgroids.h"
 
 typedef struct
 {
@@ -45,7 +44,8 @@ typedef struct
  * Formatting and conversion routines.
  *---------------------------------------------------------*/
 
-/* int8in()
+/*
+ * int8in()
  */
 Datum
 int8in(PG_FUNCTION_ARGS)
@@ -56,7 +56,8 @@ int8in(PG_FUNCTION_ARGS)
 }
 
 
-/* int8out()
+/*
+ * int8out()
  */
 Datum
 int8out(PG_FUNCTION_ARGS)
@@ -107,7 +108,8 @@ int8send(PG_FUNCTION_ARGS)
  *	Relational operators for int8s, including cross-data-type comparisons.
  *---------------------------------------------------------*/
 
-/* int8relop()
+/*
+ * int8relop()
  * Is val1 relop val2?
  */
 Datum
@@ -164,7 +166,8 @@ int8ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int84relop()
+/*
+ * int84relop()
  * Is 64-bit val1 relop 32-bit val2?
  */
 Datum
@@ -221,7 +224,8 @@ int84ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int48relop()
+/*
+ * int48relop()
  * Is 32-bit val1 relop 64-bit val2?
  */
 Datum
@@ -278,7 +282,8 @@ int48ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int82relop()
+/*
+ * int82relop()
  * Is 64-bit val1 relop 16-bit val2?
  */
 Datum
@@ -335,7 +340,8 @@ int82ge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(val1 >= val2);
 }
 
-/* int28relop()
+/*
+ * int28relop()
  * Is 16-bit val1 relop 64-bit val2?
  */
 Datum
@@ -443,11 +449,10 @@ int8um(PG_FUNCTION_ARGS)
 	int64		arg = PG_GETARG_INT64(0);
 	int64		result;
 
-	if (unlikely(arg == PG_INT64_MIN))
+	if (pg_neg_s64_overflow(arg, &result))
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("bigint out of range")));
-	result = -arg;
 	PG_RETURN_INT64(result);
 }
 
@@ -525,11 +530,10 @@ int8div(PG_FUNCTION_ARGS)
 	 */
 	if (arg2 == -1)
 	{
-		if (unlikely(arg1 == PG_INT64_MIN))
+		if (pg_neg_s64_overflow(arg1, &result))
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("bigint out of range")));
-		result = -arg1;
 		PG_RETURN_INT64(result);
 	}
 
@@ -540,7 +544,8 @@ int8div(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(result);
 }
 
-/* int8abs()
+/*
+ * int8abs()
  * Absolute value
  */
 Datum
@@ -557,7 +562,8 @@ int8abs(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(result);
 }
 
-/* int8mod()
+/*
+ * int8mod()
  * Modulo operation.
  */
 Datum
@@ -719,76 +725,29 @@ int8lcm(PG_FUNCTION_ARGS)
 Datum
 int8inc(PG_FUNCTION_ARGS)
 {
-	/*
-	 * When int8 is pass-by-reference, we provide this special case to avoid
-	 * palloc overhead for COUNT(): when called as an aggregate, we know that
-	 * the argument is modifiable local storage, so just update it in-place.
-	 * (If int8 is pass-by-value, then of course this is useless as well as
-	 * incorrect, so just ifdef it out.)
-	 */
-#ifndef USE_FLOAT8_BYVAL		/* controls int8 too */
-	if (AggCheckCallContext(fcinfo, NULL))
-	{
-		int64	   *arg = (int64 *) PG_GETARG_POINTER(0);
+	int64		arg = PG_GETARG_INT64(0);
+	int64		result;
 
-		if (unlikely(pg_add_s64_overflow(*arg, 1, arg)))
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("bigint out of range")));
+	if (unlikely(pg_add_s64_overflow(arg, 1, &result)))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("bigint out of range")));
 
-		PG_RETURN_POINTER(arg);
-	}
-	else
-#endif
-	{
-		/* Not called as an aggregate, so just do it the dumb way */
-		int64		arg = PG_GETARG_INT64(0);
-		int64		result;
-
-		if (unlikely(pg_add_s64_overflow(arg, 1, &result)))
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("bigint out of range")));
-
-		PG_RETURN_INT64(result);
-	}
+	PG_RETURN_INT64(result);
 }
 
 Datum
 int8dec(PG_FUNCTION_ARGS)
 {
-	/*
-	 * When int8 is pass-by-reference, we provide this special case to avoid
-	 * palloc overhead for COUNT(): when called as an aggregate, we know that
-	 * the argument is modifiable local storage, so just update it in-place.
-	 * (If int8 is pass-by-value, then of course this is useless as well as
-	 * incorrect, so just ifdef it out.)
-	 */
-#ifndef USE_FLOAT8_BYVAL		/* controls int8 too */
-	if (AggCheckCallContext(fcinfo, NULL))
-	{
-		int64	   *arg = (int64 *) PG_GETARG_POINTER(0);
+	int64		arg = PG_GETARG_INT64(0);
+	int64		result;
 
-		if (unlikely(pg_sub_s64_overflow(*arg, 1, arg)))
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("bigint out of range")));
-		PG_RETURN_POINTER(arg);
-	}
-	else
-#endif
-	{
-		/* Not called as an aggregate, so just do it the dumb way */
-		int64		arg = PG_GETARG_INT64(0);
-		int64		result;
+	if (unlikely(pg_sub_s64_overflow(arg, 1, &result)))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("bigint out of range")));
 
-		if (unlikely(pg_sub_s64_overflow(arg, 1, &result)))
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("bigint out of range")));
-
-		PG_RETURN_INT64(result);
-	}
+	PG_RETURN_INT64(result);
 }
 
 
@@ -834,8 +793,38 @@ int8inc_support(PG_FUNCTION_ARGS)
 		MonotonicFunction monotonic = MONOTONICFUNC_NONE;
 		int			frameOptions = req->window_clause->frameOptions;
 
-		/* No ORDER BY clause then all rows are peers */
-		if (req->window_clause->orderClause == NIL)
+		/*
+		 * Because an EXCLUDE clauses in the window definition can exclude
+		 * rows that have previously been included in the aggregate result for
+		 * prior rows, this can break the monotonic properties that might
+		 * otherwise be guaranteed.  There's a narrow set of circumstances
+		 * that can be guaranteed, which we check for below.
+		 */
+		if (frameOptions & FRAMEOPTION_EXCLUSION)
+		{
+			WindowFunc *wfunc = req->window_func;
+
+			/*
+			 * To add handling for all valid monotonic cases with an EXCLUDE
+			 * clause is complex and likely not worth troubling over.  For
+			 * now, just bail unless we see EXCLUDE CURRENT ROW with COUNT(*)
+			 * and no FILTER.  Excluding the current row is fine when using
+			 * COUNT(*) as this always reduces the count by 1.  The same isn't
+			 * true for COUNY(ANY) as a NULL won't be counted, and a
+			 * subsequent non-NULL could make the count decrease.
+			 */
+			if ((frameOptions & FRAMEOPTION_EXCLUDE_CURRENT_ROW) == 0 ||
+				wfunc->winfnoid != F_COUNT_ ||
+				wfunc->aggfilter != NULL)
+			{
+				req->monotonic = MONOTONICFUNC_NONE;
+				PG_RETURN_POINTER(req);
+			}
+		}
+
+		/* No ORDER BY clause and RANGE mode means all rows are peers. */
+		if (req->window_clause->orderClause == NIL &&
+			(frameOptions & FRAMEOPTION_RANGE))
 			monotonic = MONOTONICFUNC_BOTH;
 		else
 		{
@@ -857,6 +846,53 @@ int8inc_support(PG_FUNCTION_ARGS)
 
 		req->monotonic = monotonic;
 		PG_RETURN_POINTER(req);
+	}
+
+	if (IsA(rawreq, SupportRequestSimplifyAggref))
+	{
+		SupportRequestSimplifyAggref *req = (SupportRequestSimplifyAggref *) rawreq;
+		Aggref	   *agg = req->aggref;
+
+		/*
+		 * Check for COUNT(ANY) and try to convert to COUNT(*). The input
+		 * argument cannot be NULL, we can't have an ORDER BY / DISTINCT in
+		 * the aggregate, and agglevelsup must be 0.
+		 *
+		 * Technically COUNT(ANY) must have 1 arg, but be paranoid and check.
+		 */
+		if (agg->aggfnoid == F_COUNT_ANY && list_length(agg->args) == 1)
+		{
+			TargetEntry *tle = (TargetEntry *) linitial(agg->args);
+			Expr	   *arg = tle->expr;
+
+			/* Check for unsupported cases */
+			if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+				agg->agglevelsup != 0)
+				PG_RETURN_POINTER(NULL);
+
+			/* If the arg isn't NULLable, do the conversion */
+			if (expr_is_nonnullable(req->root, arg, NOTNULL_SOURCE_HASHTABLE))
+			{
+				Aggref	   *newagg;
+
+				/* We don't expect these to have been set yet */
+				Assert(agg->aggtransno == -1);
+				Assert(agg->aggtranstype == InvalidOid);
+
+				/* Convert COUNT(ANY) to COUNT(*) by making a new Aggref */
+				newagg = makeNode(Aggref);
+				memcpy(newagg, agg, sizeof(Aggref));
+				newagg->aggfnoid = F_COUNT_;
+
+				/* count(*) has no args */
+				newagg->aggargtypes = NULL;
+				newagg->args = NULL;
+				newagg->aggstar = true;
+				newagg->location = -1;
+
+				PG_RETURN_POINTER(newagg);
+			}
+		}
 	}
 
 	PG_RETURN_POINTER(NULL);
@@ -953,11 +989,10 @@ int84div(PG_FUNCTION_ARGS)
 	 */
 	if (arg2 == -1)
 	{
-		if (unlikely(arg1 == PG_INT64_MIN))
+		if (pg_neg_s64_overflow(arg1, &result))
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("bigint out of range")));
-		result = -arg1;
 		PG_RETURN_INT64(result);
 	}
 
@@ -1095,11 +1130,10 @@ int82div(PG_FUNCTION_ARGS)
 	 */
 	if (arg2 == -1)
 	{
-		if (unlikely(arg1 == PG_INT64_MIN))
+		if (pg_neg_s64_overflow(arg1, &result))
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("bigint out of range")));
-		result = -arg1;
 		PG_RETURN_INT64(result);
 	}
 
@@ -1171,7 +1205,8 @@ int28div(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) arg1 / arg2);
 }
 
-/* Binary arithmetics
+/*
+ * Binary arithmetics
  *
  *		int8and		- returns arg1 & arg2
  *		int8or		- returns arg1 | arg2
@@ -1252,7 +1287,7 @@ int84(PG_FUNCTION_ARGS)
 	int64		arg = PG_GETARG_INT64(0);
 
 	if (unlikely(arg < PG_INT32_MIN) || unlikely(arg > PG_INT32_MAX))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("integer out of range")));
 
@@ -1273,7 +1308,7 @@ int82(PG_FUNCTION_ARGS)
 	int64		arg = PG_GETARG_INT64(0);
 
 	if (unlikely(arg < PG_INT16_MIN) || unlikely(arg > PG_INT16_MAX))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
@@ -1291,7 +1326,8 @@ i8tod(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
-/* dtoi8()
+/*
+ * dtoi8()
  * Convert float8 to 8-byte integer.
  */
 Datum
@@ -1308,7 +1344,7 @@ dtoi8(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT8_FITS_IN_INT64(num)))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("bigint out of range")));
 
@@ -1326,7 +1362,8 @@ i8tof(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT4(result);
 }
 
-/* ftoi8()
+/*
+ * ftoi8()
  * Convert float4 to 8-byte integer.
  */
 Datum
@@ -1343,7 +1380,7 @@ ftoi8(PG_FUNCTION_ARGS)
 
 	/* Range check */
 	if (unlikely(isnan(num) || !FLOAT4_FITS_IN_INT64(num)))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("bigint out of range")));
 
@@ -1356,7 +1393,7 @@ i8tooid(PG_FUNCTION_ARGS)
 	int64		arg = PG_GETARG_INT64(0);
 
 	if (unlikely(arg < 0) || unlikely(arg > PG_UINT32_MAX))
-		ereport(ERROR,
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("OID out of range")));
 
@@ -1369,6 +1406,14 @@ oidtoi8(PG_FUNCTION_ARGS)
 	Oid			arg = PG_GETARG_OID(0);
 
 	PG_RETURN_INT64((int64) arg);
+}
+
+Datum
+oidtooid8(PG_FUNCTION_ARGS)
+{
+	Oid			arg = PG_GETARG_OID(0);
+
+	PG_RETURN_OID8((Oid8) arg);
 }
 
 /*
@@ -1412,7 +1457,7 @@ generate_series_step_int8(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* allocate memory for user context */
-		fctx = (generate_series_fctx *) palloc(sizeof(generate_series_fctx));
+		fctx = palloc_object(generate_series_fctx);
 
 		/*
 		 * Use fctx to keep state from call to call. Seed current with the

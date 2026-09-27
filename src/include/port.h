@@ -3,7 +3,7 @@
  * port.h
  *	  Header for src/port/ compatibility functions.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port.h
@@ -53,10 +53,12 @@ extern char *first_path_var_separator(const char *pathlist);
 extern void join_path_components(char *ret_path,
 								 const char *head, const char *tail);
 extern void canonicalize_path(char *path);
+extern void canonicalize_path_enc(char *path, int encoding);
 extern void make_native_path(char *filename);
 extern void cleanup_path(char *path);
 extern bool path_contains_parent_reference(const char *path);
 extern bool path_is_relative_and_below_cwd(const char *path);
+extern bool path_is_safe_for_extraction(const char *path);
 extern bool path_is_prefix_of_path(const char *path1, const char *path2);
 extern char *make_absolute_path(const char *path);
 extern const char *get_progname(const char *argv0);
@@ -137,7 +139,7 @@ extern int	validate_exec(const char *path);
 extern int	find_my_exec(const char *argv0, char *retpath);
 extern int	find_other_exec(const char *argv0, const char *target,
 							const char *versionstr, char *retpath);
-extern char *pipe_read_line(char *cmd, char *line, int maxsize);
+extern char *pipe_read_line(char *cmd);
 
 /* Doesn't belong here, but this is used with find_other_exec(), so... */
 #define PG_BACKEND_VERSIONSTR "postgres (PostgreSQL) " PG_VERSION "\n"
@@ -168,8 +170,29 @@ extern int	pg_strcasecmp(const char *s1, const char *s2);
 extern int	pg_strncasecmp(const char *s1, const char *s2, size_t n);
 extern unsigned char pg_toupper(unsigned char ch);
 extern unsigned char pg_tolower(unsigned char ch);
-extern unsigned char pg_ascii_toupper(unsigned char ch);
-extern unsigned char pg_ascii_tolower(unsigned char ch);
+
+/*
+ * Fold a character to upper case, following C/POSIX locale rules.
+ */
+static inline unsigned char
+pg_ascii_toupper(unsigned char ch)
+{
+	if (ch >= 'a' && ch <= 'z')
+		ch += 'A' - 'a';
+	return ch;
+}
+
+/*
+ * Fold a character to lower case, following C/POSIX locale rules.
+ */
+static inline unsigned char
+pg_ascii_tolower(unsigned char ch)
+{
+	if (ch >= 'A' && ch <= 'Z')
+		ch += 'a' - 'A';
+	return ch;
+}
+
 
 /*
  * Beginning in v12, we always replace snprintf() and friends with our own
@@ -209,13 +232,13 @@ extern unsigned char pg_ascii_tolower(unsigned char ch);
 #endif
 
 extern int	pg_vsnprintf(char *str, size_t count, const char *fmt, va_list args) pg_attribute_printf(3, 0);
-extern int	pg_snprintf(char *str, size_t count, const char *fmt,...) pg_attribute_printf(3, 4);
+extern int	pg_snprintf(char *str, size_t count, const char *fmt, ...) pg_attribute_printf(3, 4);
 extern int	pg_vsprintf(char *str, const char *fmt, va_list args) pg_attribute_printf(2, 0);
-extern int	pg_sprintf(char *str, const char *fmt,...) pg_attribute_printf(2, 3);
+extern int	pg_sprintf(char *str, const char *fmt, ...) pg_attribute_printf(2, 3);
 extern int	pg_vfprintf(FILE *stream, const char *fmt, va_list args) pg_attribute_printf(2, 0);
-extern int	pg_fprintf(FILE *stream, const char *fmt,...) pg_attribute_printf(2, 3);
+extern int	pg_fprintf(FILE *stream, const char *fmt, ...) pg_attribute_printf(2, 3);
 extern int	pg_vprintf(const char *fmt, va_list args) pg_attribute_printf(1, 0);
-extern int	pg_printf(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	pg_printf(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 #ifndef WIN32
 /*
@@ -296,7 +319,7 @@ extern int	pgunlink(const char *path);
  */
 #if defined(WIN32) && !defined(__CYGWIN__)
 extern int	pgsymlink(const char *oldpath, const char *newpath);
-extern int	pgreadlink(const char *path, char *buf, size_t size);
+extern ssize_t pgreadlink(const char *path, char *buf, size_t size);
 
 #define symlink(oldpath, newpath)	pgsymlink(oldpath, newpath)
 #define readlink(path, buf, size)	pgreadlink(path, buf, size)
@@ -307,12 +330,38 @@ extern bool rmtree(const char *path, bool rmtopdir);
 #if defined(WIN32) && !defined(__CYGWIN__)
 
 /*
+ * We want the 64-bit variant of lseek().
+ *
+ * For Visual Studio, this must be after <io.h> to avoid messing up its
+ * lseek() and _lseeki64() function declarations.
+ *
+ * For MinGW there is already a macro, so we have to undefine it (depending on
+ * _FILE_OFFSET_BITS, it may point at its own lseek64, but we don't want to
+ * count on that being set).
+ */
+#undef lseek
+#define lseek(a,b,c) _lseeki64((a),(b),(c))
+
+/*
+ * We want the 64-bit variant of chsize().  It sets errno and also returns it,
+ * so convert non-zero result to -1 to match POSIX.
+ *
+ * Prevent MinGW from declaring functions, and undefine its macro before we
+ * define our own.
+ */
+#ifndef _MSC_VER
+#define FTRUNCATE_DEFINED
+#include <unistd.h>
+#undef ftruncate
+#endif
+#define ftruncate(a,b) (_chsize_s((a),(b)) == 0 ? 0 : -1)
+
+/*
  * open() and fopen() replacements to allow deletion of open files and
  * passing of other special options.
  */
-#define		O_DIRECT	0x80000000
 extern HANDLE pgwin32_open_handle(const char *, int, bool);
-extern int	pgwin32_open(const char *, int,...);
+extern int	pgwin32_open(const char *, int, ...);
 extern FILE *pgwin32_fopen(const char *, const char *);
 #define		open(a,b,c) pgwin32_open(a,b,c)
 #define		fopen(a,b) pgwin32_fopen(a,b)
@@ -370,7 +419,7 @@ extern FILE *pgwin32_popen(const char *command, const char *type);
 
 /* Type to use with fseeko/ftello */
 #ifndef WIN32					/* WIN32 is handled in port/win32_port.h */
-#define pgoff_t off_t
+typedef off_t pgoff_t;
 #endif
 
 #ifndef HAVE_GETPEEREID
@@ -428,16 +477,18 @@ extern size_t strlcat(char *dst, const char *src, size_t siz);
 extern size_t strlcpy(char *dst, const char *src, size_t siz);
 #endif
 
-#if !HAVE_DECL_STRNLEN
-extern size_t strnlen(const char *str, size_t maxlen);
+#if !HAVE_DECL_STRSEP
+extern char *strsep(char **stringp, const char *delim);
 #endif
 
-/* port/user.c */
-#ifndef WIN32
-extern bool pg_get_user_name(uid_t user_id, char *buffer, size_t buflen);
-extern bool pg_get_user_home_dir(uid_t user_id, char *buffer, size_t buflen);
+#if !HAVE_DECL_TIMINGSAFE_BCMP
+extern int	timingsafe_bcmp(const void *b1, const void *b2, size_t n);
 #endif
 
+/*
+ * Callers should use the qsort() macro defined below instead of calling
+ * pg_qsort() directly.
+ */
 extern void pg_qsort(void *base, size_t nel, size_t elsize,
 					 int (*cmp) (const void *, const void *));
 extern int	pg_qsort_strcmp(const void *a, const void *b);
@@ -456,6 +507,12 @@ extern void *bsearch_arg(const void *key, const void *base0,
 						 size_t nmemb, size_t size,
 						 int (*compar) (const void *, const void *, void *),
 						 void *arg);
+
+/* port/pg_localeconv_r.c */
+extern int	pg_localeconv_r(const char *lc_monetary,
+							const char *lc_numeric,
+							struct lconv *output);
+extern void pg_localeconv_free(struct lconv *lconv);
 
 /* port/chklocale.c */
 extern int	pg_get_encoding_from_locale(const char *ctype, bool write_message);
@@ -484,9 +541,17 @@ extern int	pg_check_dir(const char *dir);
 /* port/pgmkdirp.c */
 extern int	pg_mkdir_p(char *path, int omode);
 
-/* port/pqsignal.c */
+/* port/pqsignal.c (see also interfaces/libpq/legacy-pqsignal.c) */
+#ifdef FRONTEND
+#define pqsignal pqsignal_fe
+#else
+#define pqsignal pqsignal_be
+#endif
+
+#define PG_SIG_DFL (pqsigfunc) (pg_funcptr_t) SIG_DFL
+#define PG_SIG_IGN (pqsigfunc) (pg_funcptr_t) SIG_IGN
 typedef void (*pqsigfunc) (SIGNAL_ARGS);
-extern pqsigfunc pqsignal(int signo, pqsigfunc func);
+extern void pqsignal(int signo, pqsigfunc func);
 
 /* port/quotes.c */
 extern char *escape_single_quotes_ascii(const char *src);

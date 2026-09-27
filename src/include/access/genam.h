@@ -4,7 +4,7 @@
  *	  POSTGRES generalized index access method definitions.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/genam.h
@@ -14,15 +14,23 @@
 #ifndef GENAM_H
 #define GENAM_H
 
+#include "access/htup.h"
 #include "access/sdir.h"
 #include "access/skey.h"
-#include "nodes/tidbitmap.h"
+#include "executor/instrument_node.h"
+#include "storage/buf.h"
 #include "storage/lockdefs.h"
-#include "utils/relcache.h"
 #include "utils/snapshot.h"
 
-/* We don't want this file to depend on execnodes.h. */
-struct IndexInfo;
+
+/*
+ * forward references in this file
+ */
+typedef struct IndexInfo IndexInfo;
+typedef struct RelationData *Relation;
+typedef struct TIDBitmap TIDBitmap;
+typedef struct TupleTableSlot TupleTableSlot;
+
 
 /*
  * Struct for statistics returned by ambuild
@@ -46,6 +54,7 @@ typedef struct IndexVacuumInfo
 	Relation	index;			/* the index being vacuumed */
 	Relation	heaprel;		/* the heap relation the index belongs to */
 	bool		analyze_only;	/* ANALYZE (without any actual vacuum) */
+	bool		is_autovacuum;	/* VACUUM/ANALYZE initiated by autovacuum */
 	bool		report_progress;	/* emit progress.h status reports */
 	bool		estimated_count;	/* num_heap_tuples is an estimate */
 	int			message_level;	/* ereport level for progress messages */
@@ -117,7 +126,7 @@ typedef enum IndexUniqueCheck
 	UNIQUE_CHECK_NO,			/* Don't do any uniqueness checking */
 	UNIQUE_CHECK_YES,			/* Enforce uniqueness at insertion time */
 	UNIQUE_CHECK_PARTIAL,		/* Test uniqueness, but no error */
-	UNIQUE_CHECK_EXISTING		/* Check if existing tuple is unique */
+	UNIQUE_CHECK_EXISTING,		/* Check if existing tuple is unique */
 } IndexUniqueCheck;
 
 
@@ -132,13 +141,8 @@ typedef struct IndexOrderByDistance
  * generalized index_ interface routines (in indexam.c)
  */
 
-/*
- * IndexScanIsValid
- *		True iff the index scan is valid.
- */
-#define IndexScanIsValid(scan) PointerIsValid(scan)
-
 extern Relation index_open(Oid relationId, LOCKMODE lockmode);
+extern Relation try_index_open(Oid relationId, LOCKMODE lockmode);
 extern void index_close(Relation relation, LOCKMODE lockmode);
 
 extern bool index_insert(Relation indexRelation,
@@ -147,14 +151,20 @@ extern bool index_insert(Relation indexRelation,
 						 Relation heapRelation,
 						 IndexUniqueCheck checkUnique,
 						 bool indexUnchanged,
-						 struct IndexInfo *indexInfo);
+						 IndexInfo *indexInfo);
+extern void index_insert_cleanup(Relation indexRelation,
+								 IndexInfo *indexInfo);
 
 extern IndexScanDesc index_beginscan(Relation heapRelation,
 									 Relation indexRelation,
+									 bool index_only_scan,
 									 Snapshot snapshot,
-									 int nkeys, int norderbys);
+									 IndexScanInstrumentation *instrument,
+									 int nkeys, int norderbys,
+									 uint32 flags);
 extern IndexScanDesc index_beginscan_bitmap(Relation indexRelation,
 											Snapshot snapshot,
+											IndexScanInstrumentation *instrument,
 											int nkeys);
 extern void index_rescan(IndexScanDesc scan,
 						 ScanKey keys, int nkeys,
@@ -162,20 +172,19 @@ extern void index_rescan(IndexScanDesc scan,
 extern void index_endscan(IndexScanDesc scan);
 extern void index_markpos(IndexScanDesc scan);
 extern void index_restrpos(IndexScanDesc scan);
-extern Size index_parallelscan_estimate(Relation indexRelation, Snapshot snapshot);
+extern Size index_parallelscan_estimate(Relation indexRelation,
+										int nkeys, int norderbys, Snapshot snapshot);
 extern void index_parallelscan_initialize(Relation heapRelation,
 										  Relation indexRelation, Snapshot snapshot,
 										  ParallelIndexScanDesc target);
 extern void index_parallelrescan(IndexScanDesc scan);
 extern IndexScanDesc index_beginscan_parallel(Relation heaprel,
-											  Relation indexrel, int nkeys, int norderbys,
-											  ParallelIndexScanDesc pscan);
-extern ItemPointer index_getnext_tid(IndexScanDesc scan,
-									 ScanDirection direction);
-struct TupleTableSlot;
-extern bool index_fetch_heap(IndexScanDesc scan, struct TupleTableSlot *slot);
-extern bool index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
-							   struct TupleTableSlot *slot);
+											  Relation indexrel,
+											  bool index_only_scan,
+											  IndexScanInstrumentation *instrument,
+											  int nkeys, int norderbys,
+											  ParallelIndexScanDesc pscan,
+											  uint32 flags);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
 
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
@@ -204,7 +213,7 @@ extern IndexScanDesc RelationGetIndexScan(Relation indexRelation,
 										  int nkeys, int norderbys);
 extern void IndexScanEnd(IndexScanDesc scan);
 extern char *BuildIndexValueDescription(Relation indexRelation,
-										Datum *values, bool *isnull);
+										const Datum *values, const bool *isnull);
 extern TransactionId index_compute_xid_horizon_for_tuples(Relation irel,
 														  Relation hrel,
 														  Buffer ibuf,
@@ -229,5 +238,14 @@ extern SysScanDesc systable_beginscan_ordered(Relation heapRelation,
 extern HeapTuple systable_getnext_ordered(SysScanDesc sysscan,
 										  ScanDirection direction);
 extern void systable_endscan_ordered(SysScanDesc sysscan);
+extern void systable_inplace_update_begin(Relation relation,
+										  Oid indexId,
+										  bool indexOK,
+										  Snapshot snapshot,
+										  int nkeys, const ScanKeyData *key,
+										  HeapTuple *oldtupcopy,
+										  void **state);
+extern void systable_inplace_update_finish(void *state, HeapTuple tuple);
+extern void systable_inplace_update_cancel(void *state);
 
 #endif							/* GENAM_H */

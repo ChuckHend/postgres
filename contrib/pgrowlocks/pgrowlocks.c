@@ -37,12 +37,16 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 #include "utils/varlena.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pgrowlocks",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(pgrowlocks);
 
@@ -81,10 +85,6 @@ pgrowlocks(PG_FUNCTION_ARGS)
 	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel = relation_openrv(relrv, AccessShareLock);
 
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("only heap AM is supported")));
-
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -96,6 +96,10 @@ pgrowlocks(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table",
 						RelationGetRelationName(rel))));
+	else if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("only heap AM is supported")));
 
 	/*
 	 * check permissions: must have SELECT on table or be in
@@ -111,12 +115,12 @@ pgrowlocks(PG_FUNCTION_ARGS)
 					   RelationGetRelationName(rel));
 
 	/* Scan the relation */
-	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, SO_NONE);
 	hscan = (HeapScanDesc) scan;
 
 	attinmeta = TupleDescGetAttInMetadata(rsinfo->setDesc);
 
-	values = (char **) palloc(rsinfo->setDesc->natts * sizeof(char *));
+	values = palloc_array(char *, rsinfo->setDesc->natts);
 
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
@@ -138,10 +142,10 @@ pgrowlocks(PG_FUNCTION_ARGS)
 		 */
 		if (htsu == TM_BeingModified)
 		{
-			values[Atnum_tid] = (char *) DirectFunctionCall1(tidout,
-															 PointerGetDatum(&tuple->t_self));
+			values[Atnum_tid] = DatumGetCString(DirectFunctionCall1(tidout,
+																	PointerGetDatum(&tuple->t_self)));
 
-			values[Atnum_xmax] = palloc(NCHARS * sizeof(char));
+			values[Atnum_xmax] = palloc_array(char, NCHARS);
 			snprintf(values[Atnum_xmax], NCHARS, "%u", xmax);
 			if (infomask & HEAP_XMAX_IS_MULTI)
 			{
@@ -223,7 +227,7 @@ pgrowlocks(PG_FUNCTION_ARGS)
 			{
 				values[Atnum_ismulti] = pstrdup("false");
 
-				values[Atnum_xids] = palloc(NCHARS * sizeof(char));
+				values[Atnum_xids] = palloc_array(char, NCHARS);
 				snprintf(values[Atnum_xids], NCHARS, "{%u}", xmax);
 
 				values[Atnum_modes] = palloc(NCHARS);
@@ -253,7 +257,7 @@ pgrowlocks(PG_FUNCTION_ARGS)
 						snprintf(values[Atnum_modes], NCHARS, "{No Key Update}");
 				}
 
-				values[Atnum_pids] = palloc(NCHARS * sizeof(char));
+				values[Atnum_pids] = palloc_array(char, NCHARS);
 				snprintf(values[Atnum_pids], NCHARS, "{%d}",
 						 BackendXidGetPid(xmax));
 			}

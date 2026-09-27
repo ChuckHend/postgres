@@ -26,6 +26,9 @@ SELECT pg_replication_origin_create('regress_test_decoding: regression_slot');
 -- ensure duplicate creations fail
 SELECT pg_replication_origin_create('regress_test_decoding: regression_slot');
 
+-- ensure inactive origin cannot be set as session one if pid is specified
+SELECT pg_replication_origin_session_setup('regress_test_decoding: regression_slot', -1);
+
 --ensure deletions work (once)
 SELECT pg_replication_origin_create('regress_test_decoding: temp');
 SELECT pg_replication_origin_drop('regress_test_decoding: temp');
@@ -134,6 +137,9 @@ SELECT pg_replication_origin_create('regress_test_decoding: regression_slot');
 SELECT pg_replication_origin_session_setup('regress_test_decoding: regression_slot');
 
 INSERT INTO target_tbl(data) VALUES ('test data');
+
+-- invalid proto_version
+SELECT pg_logical_slot_peek_binary_changes('regression_slot', NULL, NULL, 'proto_version', '', 'publication_names', 'pub', 'origin', 'none');
 
 -- The replayed change will be filtered.
 SELECT count(*) = 0 FROM pg_logical_slot_peek_binary_changes('regression_slot', NULL, NULL, 'proto_version', '4', 'publication_names', 'pub', 'origin', 'none');

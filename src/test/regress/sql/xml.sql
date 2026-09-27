@@ -5,7 +5,14 @@ CREATE TABLE xmltest (
 
 INSERT INTO xmltest VALUES (1, '<value>one</value>');
 INSERT INTO xmltest VALUES (2, '<value>two</value>');
-INSERT INTO xmltest VALUES (3, '<wrong');
+INSERT INTO xmltest VALUES (3, '<value>three</wrong>  ');
+
+-- If no XML data could be inserted, skip the tests as the server has been
+-- compiled without libxml support.
+SELECT count(*) = 0 AS skip_test FROM xmltest \gset
+\if :skip_test
+\quit
+\endif
 
 SELECT * FROM xmltest;
 
@@ -30,7 +37,7 @@ SELECT xmlconcat(xmlcomment('hello'),
 
 SELECT xmlconcat('hello', 'you');
 SELECT xmlconcat(1, 2);
-SELECT xmlconcat('bad', '<syntax');
+SELECT xmlconcat('bad', '<wrong></syntax>  ');
 SELECT xmlconcat('<foo/>', NULL, '<?xml version="1.1" standalone="no"?><bar/>');
 SELECT xmlconcat('<?xml version="1.1"?><foo/>', NULL, '<?xml version="1.1" standalone="no"?><bar/>');
 SELECT xmlconcat(NULL);
@@ -75,17 +82,17 @@ SELECT xmlparse(content '<invalidentity>&</invalidentity>');
 SELECT xmlparse(content '<undefinedentity>&idontexist;</undefinedentity>');
 SELECT xmlparse(content '<invalidns xmlns=''&lt;''/>');
 SELECT xmlparse(content '<relativens xmlns=''relative''/>');
-SELECT xmlparse(content '<twoerrors>&idontexist;</unbalanced>');
+SELECT xmlparse(content '<twoerrors>&idontexist;</unbalanced>  ');
 SELECT xmlparse(content '<nosuchprefix:tag/>');
 
-SELECT xmlparse(document '   ');
+SELECT xmlparse(document '!');
 SELECT xmlparse(document 'abc');
 SELECT xmlparse(document '<abc>x</abc>');
-SELECT xmlparse(document '<invalidentity>&</abc>');
-SELECT xmlparse(document '<undefinedentity>&idontexist;</abc>');
+SELECT xmlparse(document '<invalidentity>&</abc>  ');
+SELECT xmlparse(document '<undefinedentity>&idontexist;</abc>  ');
 SELECT xmlparse(document '<invalidns xmlns=''&lt;''/>');
 SELECT xmlparse(document '<relativens xmlns=''relative''/>');
-SELECT xmlparse(document '<twoerrors>&idontexist;</unbalanced>');
+SELECT xmlparse(document '<twoerrors>&idontexist;</unbalanced>  ');
 SELECT xmlparse(document '<nosuchprefix:tag/>');
 
 
@@ -168,12 +175,22 @@ SELECT xmlserialize(CONTENT  '<foo><bar></bar></foo>' AS text INDENT);
 -- 'no indent' = not using 'no indent'
 SELECT xmlserialize(DOCUMENT '<foo><bar><val x="y">42</val></bar></foo>' AS text) = xmlserialize(DOCUMENT '<foo><bar><val x="y">42</val></bar></foo>' AS text NO INDENT);
 SELECT xmlserialize(CONTENT  '<foo><bar><val x="y">42</val></bar></foo>' AS text) = xmlserialize(CONTENT '<foo><bar><val x="y">42</val></bar></foo>' AS text NO INDENT);
+-- indent xml strings containing blank nodes
+SELECT xmlserialize(DOCUMENT '<foo>   <bar></bar>    </foo>' AS text INDENT);
+SELECT xmlserialize(CONTENT  'text node<foo>    <bar></bar>   </foo>' AS text INDENT);
 
 SELECT xml '<foo>bar</foo>' IS DOCUMENT;
 SELECT xml '<foo>bar</foo><bar>foo</bar>' IS DOCUMENT;
 SELECT xml '<abc/>' IS NOT DOCUMENT;
 SELECT xml 'abc' IS NOT DOCUMENT;
 SELECT '<>' IS NOT DOCUMENT;
+
+-- Check that IS DOCUMENT is known immutable, so that we don't reach the
+-- incorrect xpath() call at plan time.
+SELECT CASE WHEN ('2019-12-16T00:00:00.000'::xml) IS DOCUMENT
+    THEN (xpath('/*/text()', '2019-12-16T00:00:00.000'::xml))[1]
+    ELSE '2019-12-16T00:00:00.000'::xml
+END;
 
 
 SELECT xmlagg(data) FROM xmltest;
@@ -216,6 +233,8 @@ CREATE VIEW xmlview6 AS SELECT xmlpi(name foo, 'bar');
 CREATE VIEW xmlview7 AS SELECT xmlroot(xml '<foo/>', version no value, standalone yes);
 CREATE VIEW xmlview8 AS SELECT xmlserialize(content 'good' as char(10));
 CREATE VIEW xmlview9 AS SELECT xmlserialize(content 'good' as text);
+CREATE VIEW xmlview10 AS SELECT xmlserialize(document '<foo><bar>42</bar></foo>' AS text indent);
+CREATE VIEW xmlview11 AS SELECT xmlserialize(document '<foo><bar>42</bar></foo>' AS character varying no indent);
 
 SELECT table_name, view_definition FROM information_schema.views
   WHERE table_name LIKE 'xmlview%' ORDER BY 1;
@@ -239,6 +258,7 @@ SELECT xpath('count(//*)=3', '<root><sub/><sub/></root>');
 SELECT xpath('name(/*)', '<root><sub/><sub/></root>');
 SELECT xpath('/nosuchtag', '<root/>');
 SELECT xpath('root', '<root/>');
+SELECT xpath('//namespace::foo', '<root xmlns:foo="http://127.0.0.1"/>');
 
 -- Round-trip non-ASCII data through xpath().
 DO $$
@@ -267,9 +287,7 @@ BEGIN
   END IF;
 EXCEPTION
   -- character with byte sequence 0xc2 0xb0 in encoding "UTF8" has no equivalent in encoding "LATIN8"
-  WHEN untranslatable_character
-  -- default conversion function for encoding "UTF8" to "MULE_INTERNAL" does not exist
-  OR undefined_function
+  WHEN undefined_function
   -- unsupported XML feature
   OR feature_not_supported THEN
     RAISE LOG 'skip: %', SQLERRM;
@@ -430,18 +448,22 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM xmltableview1;
 -- errors
 SELECT * FROM XMLTABLE (ROW () PASSING null COLUMNS v1 timestamp) AS f (v1, v2);
 
+SELECT * FROM XMLTABLE (ROW () PASSING null COLUMNS v1 timestamp __pg__is_not_null 1) AS f (v1);
+
 -- XMLNAMESPACES tests
 SELECT * FROM XMLTABLE(XMLNAMESPACES('http://x.y' AS zz),
                       '/zz:rows/zz:row'
                       PASSING '<rows xmlns="http://x.y"><row><a>10</a></row></rows>'
                       COLUMNS a int PATH 'zz:a');
 
-CREATE VIEW xmltableview2 AS SELECT * FROM XMLTABLE(XMLNAMESPACES('http://x.y' AS zz),
-                      '/zz:rows/zz:row'
+CREATE VIEW xmltableview2 AS SELECT * FROM XMLTABLE(XMLNAMESPACES('http://x.y' AS "Zz"),
+                      '/Zz:rows/Zz:row'
                       PASSING '<rows xmlns="http://x.y"><row><a>10</a></row></rows>'
-                      COLUMNS a int PATH 'zz:a');
+                      COLUMNS a int PATH 'Zz:a');
 
 SELECT * FROM xmltableview2;
+
+\sv xmltableview2
 
 SELECT * FROM XMLTABLE(XMLNAMESPACES(DEFAULT 'http://x.y'),
                       '/rows/row'
@@ -505,7 +527,10 @@ SELECT  xmltable.*
 SELECT xmltable.* FROM xmldata, LATERAL xmltable('/ROWS/ROW[COUNTRY_NAME="Japan" or COUNTRY_NAME="India"]' PASSING data COLUMNS "COUNTRY_NAME" text, "REGION_ID" int) WHERE "COUNTRY_NAME" = 'Japan';
 
 EXPLAIN (VERBOSE, COSTS OFF)
-SELECT xmltable.* FROM xmldata, LATERAL xmltable('/ROWS/ROW[COUNTRY_NAME="Japan" or COUNTRY_NAME="India"]' PASSING data COLUMNS "COUNTRY_NAME" text, "REGION_ID" int) WHERE "COUNTRY_NAME" = 'Japan';
+SELECT f.* FROM xmldata, LATERAL xmltable('/ROWS/ROW[COUNTRY_NAME="Japan" or COUNTRY_NAME="India"]' PASSING data COLUMNS "COUNTRY_NAME" text, "REGION_ID" int) AS f WHERE "COUNTRY_NAME" = 'Japan';
+
+EXPLAIN (VERBOSE, FORMAT JSON, COSTS OFF)
+SELECT f.* FROM xmldata, LATERAL xmltable('/ROWS/ROW[COUNTRY_NAME="Japan" or COUNTRY_NAME="India"]' PASSING data COLUMNS "COUNTRY_NAME" text, "REGION_ID" int) AS f WHERE "COUNTRY_NAME" = 'Japan';
 
 -- should to work with more data
 INSERT INTO xmldata VALUES('<ROWS>
@@ -660,3 +685,10 @@ SELECT * FROM XMLTABLE('*' PASSING '<e>pre<!--c1--><?pi arg?><![CDATA[&ent1]]><n
 \x
 
 SELECT * FROM XMLTABLE('.' PASSING XMLELEMENT(NAME a) columns a varchar(20) PATH '"<foo/>"', b xml PATH '"<foo/>"');
+
+SELECT xmltext(NULL);
+SELECT xmltext('');
+SELECT xmltext('  ');
+SELECT xmltext('foo `$_-+?=*^%!|/\()[]{}');
+SELECT xmltext('foo & <"bar">');
+SELECT xmltext('x'|| '<P>73</P>'::xml || .42 || true || 'j'::char);

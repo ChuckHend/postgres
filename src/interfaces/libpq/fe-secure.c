@@ -6,7 +6,7 @@
  *	  message integrity and endpoint authentication.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -108,42 +108,27 @@ PQsslInUse(PGconn *conn)
 }
 
 /*
- *	Exported function to allow application to tell us it's already
- *	initialized OpenSSL.
+ *	Exported function to allow application to tell us it's already initialized
+ *	OpenSSL.  Since OpenSSL 1.1.0 it is no longer required to explicitly
+ *	initialize libssl and libcrypto, so this is a no-op.  This function remains
+ *	for backwards API compatibility.
  */
 void
 PQinitSSL(int do_init)
 {
-#ifdef USE_SSL
-	pgtls_init_library(do_init, do_init);
-#endif
+	/* no-op */
 }
 
 /*
- *	Exported function to allow application to tell us it's already
- *	initialized OpenSSL and/or libcrypto.
+ *	Exported function to allow application to tell us it's already initialized
+ *	OpenSSL.  Since OpenSSL 1.1.0 it is no longer required to explicitly
+ *	initialize libssl and libcrypto, so this is a no-op.  This function remains
+ *	for backwards API compatibility.
  */
 void
 PQinitOpenSSL(int do_ssl, int do_crypto)
 {
-#ifdef USE_SSL
-	pgtls_init_library(do_ssl, do_crypto);
-#endif
-}
-
-/*
- *	Initialize global SSL context
- */
-int
-pqsecure_initialize(PGconn *conn, bool do_ssl, bool do_crypto)
-{
-	int			r = 0;
-
-#ifdef USE_SSL
-	r = pgtls_init(conn, do_ssl, do_crypto);
-#endif
-
-	return r;
+	/* no-op */
 }
 
 /*
@@ -211,6 +196,8 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 	int			result_errno = 0;
 	char		sebuf[PG_STRERROR_R_BUFLEN];
 
+	SOCK_ERRNO_SET(0);
+
 	n = recv(conn->sock, ptr, len, 0);
 
 	if (n < 0)
@@ -237,6 +224,11 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 										"\tbefore or while processing the request.");
 				break;
 
+			case 0:
+				/* If errno didn't get set, treat it as regular EOF */
+				n = 0;
+				break;
+
 			default:
 				libpq_append_conn_error(conn, "could not receive data from server: %s",
 										SOCK_STRERROR(result_errno,
@@ -249,6 +241,30 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 	SOCK_ERRNO_SET(result_errno);
 
 	return n;
+}
+
+/*
+ *	Return the number of bytes available in the transport buffer.
+ *
+ * If pqsecure_read() is called for this number of bytes, it's guaranteed to
+ * return successfully with the same number of bytes, without reading from the
+ * underlying socket.  See pqDrainPending() for a more complete discussion of
+ * the concepts involved.
+ */
+ssize_t
+pqsecure_bytes_pending(PGconn *conn)
+{
+#ifdef USE_SSL
+	if (conn->ssl_in_use)
+		return pgtls_bytes_pending(conn);
+#endif
+#ifdef ENABLE_GSS
+	if (conn->gssenc)
+		return pg_GSS_bytes_pending(conn);
+#endif
+
+	/* Plaintext connections have no transport buffer. */
+	return 0;
 }
 
 /*
@@ -387,7 +403,7 @@ retry_masked:
 				/* Set flag for EPIPE */
 				REMEMBER_EPIPE(spinfo, true);
 
-				/* FALL THRU */
+				pg_fallthrough;
 
 			case ECONNRESET:
 				conn->write_failed = true;

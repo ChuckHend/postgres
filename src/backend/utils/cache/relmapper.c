@@ -28,7 +28,7 @@
  * all these files commit in a single map file update rather than being tied
  * to transaction commit.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -46,7 +46,6 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
-#include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
@@ -55,6 +54,7 @@
 #include "storage/lwlock.h"
 #include "utils/inval.h"
 #include "utils/relmapper.h"
+#include "utils/wait_event.h"
 
 
 /*
@@ -303,14 +303,15 @@ RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath)
 	 * Write the same data into the destination database's relmap file.
 	 *
 	 * No sinval is needed because no one can be connected to the destination
-	 * database yet. For the same reason, there is no need to acquire
-	 * RelationMappingLock.
+	 * database yet.
 	 *
 	 * There's no point in trying to preserve files here. The new database
 	 * isn't usable yet anyway, and won't ever be if we can't install a relmap
 	 * file.
 	 */
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 	write_relmap_file(&map, true, false, false, dbid, tsid, dstdbpath);
+	LWLockRelease(RelationMappingLock);
 }
 
 /*
@@ -633,10 +634,12 @@ RelationMapFinishBootstrap(void)
 	Assert(pending_local_updates.num_mappings == 0);
 
 	/* Write the files; no WAL or sinval needed */
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 	write_relmap_file(&shared_map, false, false, false,
 					  InvalidOid, GLOBALTABLESPACE_OID, "global");
 	write_relmap_file(&local_map, false, false, false,
 					  MyDatabaseId, MyDatabaseTableSpace, DatabasePath);
+	LWLockRelease(RelationMappingLock);
 }
 
 /*
@@ -784,7 +787,7 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 	char		mapfilename[MAXPGPATH];
 	pg_crc32c	crc;
 	int			fd;
-	int			r;
+	ssize_t		r;
 
 	Assert(elevel >= ERROR);
 
@@ -828,7 +831,7 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 		else
 			ereport(elevel,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read file \"%s\": read %d of %zu",
+					 errmsg("could not read file \"%s\": read %zd of %zu",
 							mapfilename, r, sizeof(RelMapFile))));
 	}
 	pgstat_report_wait_end();
@@ -852,7 +855,7 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 
 	/* verify the CRC */
 	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, (char *) map, offsetof(RelMapFile, crc));
+	COMP_CRC32C(crc, map, offsetof(RelMapFile, crc));
 	FIN_CRC32C(crc);
 
 	if (!EQ_CRC32C(crc, map->crc))
@@ -892,6 +895,15 @@ write_relmap_file(RelMapFile *newmap, bool write_wal, bool send_sinval,
 	char		maptempfilename[MAXPGPATH];
 
 	/*
+	 * Even without concurrent use of this map, CheckPointRelationMap() relies
+	 * on this locking.  Without it, a restore of a base backup taken after
+	 * this function's XLogInsert() and before its durable_rename() would not
+	 * have the changes.  wal_level=minimal doesn't need the lock, but this
+	 * isn't performance-critical enough for such a micro-optimization.
+	 */
+	Assert(LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE));
+
+	/*
 	 * Fill in the overhead fields and update CRC.
 	 */
 	newmap->magic = RELMAPPER_FILEMAGIC;
@@ -899,7 +911,7 @@ write_relmap_file(RelMapFile *newmap, bool write_wal, bool send_sinval,
 		elog(ERROR, "attempt to write bogus relation mapping");
 
 	INIT_CRC32C(newmap->crc);
-	COMP_CRC32C(newmap->crc, (char *) newmap, offsetof(RelMapFile, crc));
+	COMP_CRC32C(newmap->crc, newmap, offsetof(RelMapFile, crc));
 	FIN_CRC32C(newmap->crc);
 
 	/*
@@ -958,8 +970,8 @@ write_relmap_file(RelMapFile *newmap, bool write_wal, bool send_sinval,
 		xlrec.nbytes = sizeof(RelMapFile);
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) (&xlrec), MinSizeOfRelmapUpdate);
-		XLogRegisterData((char *) newmap, sizeof(RelMapFile));
+		XLogRegisterData(&xlrec, MinSizeOfRelmapUpdate);
+		XLogRegisterData(newmap, sizeof(RelMapFile));
 
 		lsn = XLogInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE);
 

@@ -43,8 +43,15 @@ ecpg_realloc(void *ptr, long size, int lineno)
 	return new;
 }
 
+/*
+ * Wrapper for strdup(), with NULL in input treated as a correct case.
+ *
+ * "alloc_failed" can be optionally specified by the caller to check for
+ * allocation failures.  The caller is responsible for its initialization,
+ * as ecpg_strdup() may be called repeatedly across multiple allocations.
+ */
 char *
-ecpg_strdup(const char *string, int lineno)
+ecpg_strdup(const char *string, int lineno, bool *alloc_failed)
 {
 	char	   *new;
 
@@ -54,6 +61,8 @@ ecpg_strdup(const char *string, int lineno)
 	new = strdup(string);
 	if (!new)
 	{
+		if (alloc_failed)
+			*alloc_failed = true;
 		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY, ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
 		return NULL;
 	}
@@ -100,7 +109,7 @@ set_auto_allocs(struct auto_mem *am)
 char *
 ecpg_auto_alloc(long size, int lineno)
 {
-	void	   *ptr = (void *) ecpg_alloc(size, lineno);
+	void	   *ptr = ecpg_alloc(size, lineno);
 
 	if (!ptr)
 		return NULL;

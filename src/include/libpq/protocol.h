@@ -4,7 +4,7 @@
  *		Definitions of the request/response codes for the wire protocol.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/libpq/protocol.h
@@ -63,6 +63,35 @@
 
 #define PqMsg_CopyDone				'c'
 #define PqMsg_CopyData				'd'
+
+
+/* Additional codes sent by parallel workers to leader processes. */
+
+#define PqParallelMsg_Progress		'P'
+
+/* Additional codes sent by repack workers to their steering process */
+
+#define PqRepackMsg_Terminate		'X'
+
+/* Replication codes sent by the primary (wrapped in CopyData messages). */
+
+#define PqReplMsg_Keepalive			'k'
+#define PqReplMsg_PrimaryStatusUpdate 's'
+#define PqReplMsg_WALData			'w'
+
+
+/* Replication codes sent by the standby (wrapped in CopyData messages). */
+
+#define PqReplMsg_HotStandbyFeedback 'h'
+#define PqReplMsg_PrimaryStatusRequest 'p'
+#define PqReplMsg_StandbyStatusUpdate 'r'
+
+
+/* Codes used for backups via COPY OUT (wrapped in CopyData messages). */
+
+#define PqBackupMsg_Manifest		'm'
+#define PqBackupMsg_NewArchive		'n'
+#define PqBackupMsg_ProgressReport	'p'
 
 
 /* These are the authentication request codes sent by the backend. */

@@ -15,7 +15,7 @@
  * gistSplitByKey() is the entry point to this file.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -51,7 +51,7 @@ gistunionsubkeyvec(GISTSTATE *giststate, IndexTuple *itvec,
 	int			i,
 				cleanedLen = 0;
 
-	cleanedItVec = (IndexTuple *) palloc(sizeof(IndexTuple) * gsvp->len);
+	cleanedItVec = palloc_array(IndexTuple, gsvp->len);
 
 	for (i = 0; i < gsvp->len; i++)
 	{
@@ -501,7 +501,7 @@ gistUserPicksplit(Relation r, GistEntryVector *entryvec, int attno, GistSplitVec
 		 * Locate don't-care tuples, if any.  If there are none, the split is
 		 * optimal, so just fall out and return false.
 		 */
-		v->spl_dontcare = (bool *) palloc0(sizeof(bool) * (entryvec->n + 1));
+		v->spl_dontcare = palloc0_array(bool, entryvec->n + 1);
 
 		NumDontCare = findDontCares(r, giststate, entryvec->vector, v, attno);
 
@@ -587,8 +587,8 @@ gistSplitHalf(GIST_SPLITVEC *v, int len)
 	int			i;
 
 	v->spl_nright = v->spl_nleft = 0;
-	v->spl_left = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
-	v->spl_right = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+	v->spl_left = palloc_array(OffsetNumber, len);
+	v->spl_right = palloc_array(OffsetNumber, len);
 	for (i = 1; i <= len; i++)
 		if (i < len / 2)
 			v->spl_right[v->spl_nright++] = i;
@@ -632,7 +632,7 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 	/* note that entryvec->vector[0] goes unused in this code */
 	entryvec = palloc(GEVHDRSZ + (len + 1) * sizeof(GISTENTRY));
 	entryvec->n = len + 1;
-	offNullTuples = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+	offNullTuples = palloc_array(OffsetNumber, len);
 
 	for (i = 1; i <= len; i++)
 	{
@@ -674,7 +674,7 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 		v->splitVector.spl_nright = nOffNullTuples;
 		v->spl_risnull[attno] = true;
 
-		v->splitVector.spl_left = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+		v->splitVector.spl_left = palloc_array(OffsetNumber, len);
 		v->splitVector.spl_nleft = 0;
 		for (i = 1; i <= len; i++)
 			if (j < v->splitVector.spl_nright && offNullTuples[j] == i)
@@ -716,8 +716,8 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 				 * Form an array of just the don't-care tuples to pass to a
 				 * recursive invocation of this function for the next column.
 				 */
-				IndexTuple *newitup = (IndexTuple *) palloc(len * sizeof(IndexTuple));
-				OffsetNumber *map = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+				IndexTuple *newitup = palloc_array(IndexTuple, len);
+				OffsetNumber *map = palloc_array(OffsetNumber, len);
 				int			newlen = 0;
 				GIST_SPLITVEC backupSplit;
 
@@ -738,9 +738,9 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 				 * call will overwrite that with its own result.
 				 */
 				backupSplit = v->splitVector;
-				backupSplit.spl_left = (OffsetNumber *) palloc(sizeof(OffsetNumber) * len);
+				backupSplit.spl_left = palloc_array(OffsetNumber, len);
 				memcpy(backupSplit.spl_left, v->splitVector.spl_left, sizeof(OffsetNumber) * v->splitVector.spl_nleft);
-				backupSplit.spl_right = (OffsetNumber *) palloc(sizeof(OffsetNumber) * len);
+				backupSplit.spl_right = palloc_array(OffsetNumber, len);
 				memcpy(backupSplit.spl_right, v->splitVector.spl_right, sizeof(OffsetNumber) * v->splitVector.spl_nright);
 
 				/* Recursively decide how to split the don't-care tuples */

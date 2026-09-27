@@ -75,6 +75,19 @@ SELECT '1&2&4&5&6'::query_int;
 SELECT '1&(2&(4&(5|6)))'::query_int;
 SELECT '1&(2&(4&(5|!6)))'::query_int;
 
+-- Test for overflow of the int16 "left" field in findoprnd().
+-- This query uses a balanced binary tree to avoid using too much stack.
+DO $$
+DECLARE
+  e text := '1';
+BEGIN
+  FOR i IN 1..15 LOOP
+    e := '(' || e || '&' || e || ')';
+  END LOOP;
+  PERFORM ('0|' || e)::query_int;
+END;
+$$;
+
 -- test non-error-throwing input
 
 SELECT str as "query_int",
@@ -107,6 +120,7 @@ SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 SELECT count(*) from test__int WHERE a @@ '20 | !21';
 SELECT count(*) from test__int WHERE a @@ '!20 & !21';
+SELECT count(*) from test__int WHERE a @@ '!2733 & (2738 | 254)';
 
 SET enable_seqscan = off;  -- not all of these would use index by default
 
@@ -124,6 +138,7 @@ SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 SELECT count(*) from test__int WHERE a @@ '20 | !21';
 SELECT count(*) from test__int WHERE a @@ '!20 & !21';
+SELECT count(*) from test__int WHERE a @@ '!2733 & (2738 | 254)';
 
 INSERT INTO test__int SELECT array(SELECT x FROM generate_series(1, 1001) x); -- should fail
 
@@ -144,6 +159,7 @@ SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 SELECT count(*) from test__int WHERE a @@ '20 | !21';
 SELECT count(*) from test__int WHERE a @@ '!20 & !21';
+SELECT count(*) from test__int WHERE a @@ '!2733 & (2738 | 254)';
 
 DROP INDEX text_idx;
 CREATE INDEX text_idx on test__int using gist (a gist__intbig_ops(siglen = 0));
@@ -162,6 +178,7 @@ SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 SELECT count(*) from test__int WHERE a @@ '20 | !21';
 SELECT count(*) from test__int WHERE a @@ '!20 & !21';
+SELECT count(*) from test__int WHERE a @@ '!2733 & (2738 | 254)';
 
 DROP INDEX text_idx;
 CREATE INDEX text_idx on test__int using gist ( a gist__intbig_ops );
@@ -178,6 +195,7 @@ SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 SELECT count(*) from test__int WHERE a @@ '20 | !21';
 SELECT count(*) from test__int WHERE a @@ '!20 & !21';
+SELECT count(*) from test__int WHERE a @@ '!2733 & (2738 | 254)';
 
 DROP INDEX text_idx;
 CREATE INDEX text_idx on test__int using gin ( a gin__int_ops );
@@ -194,6 +212,7 @@ SELECT count(*) from test__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from test__int WHERE a @@ '(20&23)|(50&68)';
 SELECT count(*) from test__int WHERE a @@ '20 | !21';
 SELECT count(*) from test__int WHERE a @@ '!20 & !21';
+SELECT count(*) from test__int WHERE a @@ '!2733 & (2738 | 254)';
 
 DROP INDEX text_idx;
 
@@ -209,9 +228,10 @@ DROP INDEX text_idx;
 -- core that would reach the same codepaths.
 CREATE TABLE more__int AS SELECT
    -- Leave alone NULLs, empty arrays and the one row that we use to test
-   -- equality
+   -- equality; also skip INT_MAX
    CASE WHEN a IS NULL OR a = '{}' OR a = '{73,23,20}' THEN a ELSE
-     (select array_agg(u) || array_agg(u + 1000) || array_agg(u + 2000) from (select unnest(a) u) x)
+     (select array_agg(u) || array_agg(u + 1000) || array_agg(u + 2000)
+      from unnest(a) u where u < 2000000000)
    END AS a, a as b
    FROM test__int;
 CREATE INDEX ON more__int using gist (a gist__int_ops(numranges = 252));
@@ -228,6 +248,7 @@ SELECT count(*) from more__int WHERE a @> '{20,23}' or a @> '{50,68}';
 SELECT count(*) from more__int WHERE a @@ '(20&23)|(50&68)';
 SELECT count(*) from more__int WHERE a @@ '20 | !21';
 SELECT count(*) from more__int WHERE a @@ '!20 & !21';
+SELECT count(*) from test__int WHERE a @@ '!2733 & (2738 | 254)';
 
 
 RESET enable_seqscan;

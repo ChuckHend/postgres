@@ -5,7 +5,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_receivewal.c
@@ -30,6 +30,7 @@
 #include "access/xlog_internal.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
+#include "common/pg_parse_lsn.h"
 #include "fe_utils/option_utils.h"
 #include "getopt_long.h"
 #include "libpq-fe.h"
@@ -59,7 +60,7 @@ static XLogRecPtr endpos = InvalidXLogRecPtr;
 static void usage(void);
 static DIR *get_destination_dir(char *dest_folder);
 static void close_destination_dir(DIR *dest_dir, char *dest_folder);
-static XLogRecPtr FindStreamingStart(uint32 *tli);
+static XLogRecPtr FindStreamingStart(uint32 *tli_p);
 static void StreamLog(void);
 static bool stop_streaming(XLogRecPtr xlogpos, uint32 timeline,
 						   bool segment_finished);
@@ -188,14 +189,14 @@ stop_streaming(XLogRecPtr xlogpos, uint32 timeline, bool segment_finished)
 
 	/* we assume that we get called once at the end of each segment */
 	if (verbose && segment_finished)
-		pg_log_info("finished segment at %X/%X (timeline %u)",
+		pg_log_info("finished segment at %X/%08X (timeline %u)",
 					LSN_FORMAT_ARGS(xlogpos),
 					timeline);
 
-	if (!XLogRecPtrIsInvalid(endpos) && endpos < xlogpos)
+	if (XLogRecPtrIsValid(endpos) && endpos < xlogpos)
 	{
 		if (verbose)
-			pg_log_info("stopped log streaming at %X/%X (timeline %u)",
+			pg_log_info("stopped log streaming at %X/%08X (timeline %u)",
 						LSN_FORMAT_ARGS(xlogpos),
 						timeline);
 		time_to_stop = true;
@@ -211,7 +212,7 @@ stop_streaming(XLogRecPtr xlogpos, uint32 timeline, bool segment_finished)
 	 * timeline, but it's close enough for reporting purposes.
 	 */
 	if (verbose && prevtimeline != 0 && prevtimeline != timeline)
-		pg_log_info("switched to timeline %u at %X/%X",
+		pg_log_info("switched to timeline %u at %X/%08X",
 					timeline,
 					LSN_FORMAT_ARGS(prevpos));
 
@@ -265,7 +266,7 @@ close_destination_dir(DIR *dest_dir, char *dest_folder)
  * If there are no WAL files in the directory, returns InvalidXLogRecPtr.
  */
 static XLogRecPtr
-FindStreamingStart(uint32 *tli)
+FindStreamingStart(uint32 *tli_p)
 {
 	DIR		   *dir;
 	struct dirent *dirent;
@@ -331,7 +332,7 @@ FindStreamingStart(uint32 *tli)
 			char		buf[4];
 			int			bytes_out;
 			char		fullpath[MAXPGPATH * 2];
-			int			r;
+			ssize_t		r;
 
 			snprintf(fullpath, sizeof(fullpath), "%s/%s", basedir, dirent->d_name);
 
@@ -342,14 +343,14 @@ FindStreamingStart(uint32 *tli)
 			if (lseek(fd, (off_t) (-4), SEEK_END) < 0)
 				pg_fatal("could not seek in compressed file \"%s\": %m",
 						 fullpath);
-			r = read(fd, (char *) buf, sizeof(buf));
+			r = read(fd, buf, sizeof(buf));
 			if (r != sizeof(buf))
 			{
 				if (r < 0)
 					pg_fatal("could not read compressed file \"%s\": %m",
 							 fullpath);
 				else
-					pg_fatal("could not read compressed file \"%s\": read %d of %zu",
+					pg_fatal("could not read compressed file \"%s\": read %zd of %zu",
 							 fullpath, r, sizeof(buf));
 			}
 
@@ -486,7 +487,7 @@ FindStreamingStart(uint32 *tli)
 
 		XLogSegNoOffsetToRecPtr(high_segno, 0, WalSegSz, high_ptr);
 
-		*tli = high_tli;
+		*tli_p = high_tli;
 		return high_ptr;
 	}
 	else
@@ -535,7 +536,7 @@ StreamLog(void)
 	 * Figure out where to start streaming.  First scan the local directory.
 	 */
 	stream.startpos = FindStreamingStart(&stream.timeline);
-	if (stream.startpos == InvalidXLogRecPtr)
+	if (!XLogRecPtrIsValid(stream.startpos))
 	{
 		/*
 		 * Try to get the starting point from the slot if any.  This is
@@ -556,14 +557,14 @@ StreamLog(void)
 		 * If it the starting point is still not known, use the current WAL
 		 * flush value as last resort.
 		 */
-		if (stream.startpos == InvalidXLogRecPtr)
+		if (!XLogRecPtrIsValid(stream.startpos))
 		{
 			stream.startpos = serverpos;
 			stream.timeline = servertli;
 		}
 	}
 
-	Assert(stream.startpos != InvalidXLogRecPtr &&
+	Assert(XLogRecPtrIsValid(stream.startpos) &&
 		   stream.timeline != 0);
 
 	/*
@@ -575,7 +576,7 @@ StreamLog(void)
 	 * Start the replication
 	 */
 	if (verbose)
-		pg_log_info("starting log streaming at %X/%X (timeline %u)",
+		pg_log_info("starting log streaming at %X/%08X (timeline %u)",
 					LSN_FORMAT_ARGS(stream.startpos),
 					stream.timeline);
 
@@ -651,8 +652,6 @@ main(int argc, char **argv)
 	int			c;
 	int			option_index;
 	char	   *db_name;
-	uint32		hi,
-				lo;
 	pg_compress_specification compression_spec;
 	char	   *compression_detail = NULL;
 	char	   *compression_algorithm_str = "none";
@@ -689,9 +688,8 @@ main(int argc, char **argv)
 				basedir = pg_strdup(optarg);
 				break;
 			case 'E':
-				if (sscanf(optarg, "%X/%X", &hi, &lo) != 2)
+				if (!pg_parse_lsn(optarg, &endpos))
 					pg_fatal("could not parse end position \"%s\"", optarg);
-				endpos = ((uint64) hi) << 32 | lo;
 				break;
 			case 'h':
 				dbhost = pg_strdup(optarg);
@@ -770,7 +768,7 @@ main(int argc, char **argv)
 
 	if (replication_slot == NULL && (do_drop_slot || do_create_slot))
 	{
-		/* translator: second %s is an option name */
+		/* translator: %s is an option name */
 		pg_log_error("%s needs a slot to be specified using --slot",
 					 do_drop_slot ? "--drop-slot" : "--create-slot");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -889,7 +887,7 @@ main(int argc, char **argv)
 			pg_log_info("creating replication slot \"%s\"", replication_slot);
 
 		if (!CreateReplicationSlot(conn, replication_slot, NULL, false, true, false,
-								   slot_exists_ok, false))
+								   slot_exists_ok, false, false))
 			exit(1);
 		exit(0);
 	}

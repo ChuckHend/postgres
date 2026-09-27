@@ -3,7 +3,7 @@
  * statscmds.c
  *	  Commands for creating and altering extended statistics objects
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,9 +14,8 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
-#include "access/relscan.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -29,14 +28,14 @@
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "statistics/statistics.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/lsyscache.h"
-#include "utils/fmgroids.h"
 #include "utils/inval.h"
-#include "utils/memutils.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -60,9 +59,15 @@ compare_int16(const void *a, const void *b)
 
 /*
  *		CREATE STATISTICS
+ *
+ * relids is a list of OIDs of relations specified in the FROM clause, on which
+ * the statistics object is defined. We identify the target by the passed-in
+ * OID rather than re-resolving stmt->relations by name, so that we operate
+ * on exactly the relation the caller looked up. Only a single relation is
+ * supported for now.
  */
 ObjectAddress
-CreateStatistics(CreateStatsStmt *stmt)
+CreateStatistics(List *relids, CreateStatsStmt *stmt, bool check_rights)
 {
 	int16		attnums[STATS_MAX_DIMENSIONS];
 	int			nattnums = 0;
@@ -71,7 +76,7 @@ CreateStatistics(CreateStatsStmt *stmt)
 	NameData	stxname;
 	Oid			statoid;
 	Oid			namespaceId;
-	Oid			stxowner = GetUserId();
+	Oid			stxowner = OidIsValid(stmt->owner) ? stmt->owner : GetUserId();
 	HeapTuple	htup;
 	Datum		values[Natts_pg_statistic_ext];
 	bool		nulls[Natts_pg_statistic_ext];
@@ -80,7 +85,7 @@ CreateStatistics(CreateStatsStmt *stmt)
 	Datum		exprsDatum;
 	Relation	statrel;
 	Relation	rel = NULL;
-	Oid			relid;
+	Oid			relid = InvalidOid;
 	ObjectAddress parentobject,
 				myself;
 	Datum		types[4];		/* one for each possible type of statistic */
@@ -98,24 +103,17 @@ CreateStatistics(CreateStatsStmt *stmt)
 	Assert(IsA(stmt, CreateStatsStmt));
 
 	/*
-	 * Examine the FROM clause.  Currently, we only allow it to be a single
-	 * simple table, but later we'll probably allow multiple tables and JOIN
-	 * syntax.  The grammar is already prepared for that, so we have to check
-	 * here that what we got is what we can support.
+	 * Currently, we only allow the FROM clause to be a single simple table,
+	 * but later we'll probably allow multiple tables and JOIN syntax.  The
+	 * grammar and the loop below are already prepared for that, but examining
+	 * the FROM clause is the caller's job, so all we do here is assert that
+	 * the caller rejected what we can't support.
 	 */
-	if (list_length(stmt->relations) != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("only a single relation is allowed in CREATE STATISTICS")));
+	Assert(list_length(relids) == 1);
 
-	foreach(cell, stmt->relations)
+	foreach(cell, relids)
 	{
-		Node	   *rln = (Node *) lfirst(cell);
-
-		if (!IsA(rln, RangeVar))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("only a single relation is allowed in CREATE STATISTICS")));
+		relid = lfirst_oid(cell);
 
 		/*
 		 * CREATE STATISTICS will influence future execution plans but does
@@ -124,7 +122,7 @@ CreateStatistics(CreateStatsStmt *stmt)
 		 * conflicting with ANALYZE and other DDL that sets statistical
 		 * information, but not with normal queries.
 		 */
-		rel = relation_openrv((RangeVar *) rln, ShareUpdateExclusiveLock);
+		rel = relation_open(relid, ShareUpdateExclusiveLock);
 
 		/* Restrict to allowed relation types */
 		if (rel->rd_rel->relkind != RELKIND_RELATION &&
@@ -137,10 +135,28 @@ CreateStatistics(CreateStatsStmt *stmt)
 							RelationGetRelationName(rel)),
 					 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 
-		/* You must own the relation to create stats on it */
-		if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), stxowner))
+		/*
+		 * You must own the relation to create stats on it. Skip check if
+		 * caller doesn't want it.
+		 */
+		if (check_rights &&
+			!object_ownercheck(RelationRelationId, RelationGetRelid(rel), stxowner))
 			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
 						   RelationGetRelationName(rel));
+
+		/*
+		 * Conflict log tables are system-managed tables used internally for
+		 * logical replication conflict logging. Unlike user tables, they are
+		 * not expected to have complex query usage, so to keep things simple,
+		 * user-defined extended statistics are not required or supported at
+		 * present.
+		 */
+		if (IsConflictLogTableClass(rel->rd_rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot create statistics on conflict log table \"%s\"",
+							RelationGetRelationName(rel)),
+					 errdetail("Conflict log tables are system-managed tables for logical replication conflicts.")));
 
 		/* Creating statistics on system catalogs is not allowed */
 		if (!allowSystemTableMods && IsSystemRelation(rel))
@@ -151,7 +167,6 @@ CreateStatistics(CreateStatsStmt *stmt)
 	}
 
 	Assert(rel);
-	relid = RelationGetRelid(rel);
 
 	/*
 	 * If the node has a name, split it up and determine creation namespace.
@@ -171,6 +186,21 @@ CreateStatistics(CreateStatsStmt *stmt)
 											  namespaceId);
 	}
 	namestrcpy(&stxname, namestr);
+
+	/*
+	 * Check we have creation rights in target namespace.  Skip check if
+	 * caller doesn't want it.
+	 */
+	if (check_rights)
+	{
+		AclResult	aclresult;
+
+		aclresult = object_aclcheck(NamespaceRelationId, namespaceId,
+									GetUserId(), ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_SCHEMA,
+						   get_namespace_name(namespaceId));
+	}
 
 	/*
 	 * Deal with the possibility that the statistics object already exists.
@@ -213,7 +243,8 @@ CreateStatistics(CreateStatsStmt *stmt)
 	 * Convert the expression list to a simple array of attnums, but also keep
 	 * a list of more complex expressions.  While at it, enforce some
 	 * constraints - we don't allow extended statistics on system attributes,
-	 * and we require the data type to have a less-than operator.
+	 * and we require the data type to have a less-than operator, if we're
+	 * building multivariate statistics.
 	 *
 	 * There are many ways to "mask" a simple attribute reference as an
 	 * expression, for example "(a+0)" etc. We can't possibly detect all of
@@ -249,16 +280,40 @@ CreateStatistics(CreateStatsStmt *stmt)
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("statistics creation on system columns is not supported")));
 
-			/* Disallow data types without a less-than operator */
-			type = lookup_type_cache(attForm->atttypid, TYPECACHE_LT_OPR);
-			if (type->lt_opr == InvalidOid)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("column \"%s\" cannot be used in statistics because its type %s has no default btree operator class",
-								attname, format_type_be(attForm->atttypid))));
+			/*
+			 * Disallow data types without a less-than operator in
+			 * multivariate statistics.
+			 */
+			if (numcols > 1)
+			{
+				type = lookup_type_cache(attForm->atttypid, TYPECACHE_LT_OPR);
+				if (type->lt_opr == InvalidOid)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot create multivariate statistics on column \"%s\"",
+									attname),
+							 errdetail("The type %s has no default btree operator class.",
+									   format_type_be(attForm->atttypid))));
+			}
 
-			attnums[nattnums] = attForm->attnum;
-			nattnums++;
+			/* Treat virtual generated columns as expressions */
+			if (attForm->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			{
+				Node	   *expr;
+
+				expr = (Node *) makeVar(1,
+										attForm->attnum,
+										attForm->atttypid,
+										attForm->atttypmod,
+										attForm->attcollation,
+										0);
+				stxexprs = lappend(stxexprs, expr);
+			}
+			else
+			{
+				attnums[nattnums] = attForm->attnum;
+				nattnums++;
+			}
 			ReleaseSysCache(atttuple);
 		}
 		else if (IsA(selem->expr, Var)) /* column reference in parens */
@@ -272,35 +327,51 @@ CreateStatistics(CreateStatsStmt *stmt)
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("statistics creation on system columns is not supported")));
 
-			/* Disallow data types without a less-than operator */
-			type = lookup_type_cache(var->vartype, TYPECACHE_LT_OPR);
-			if (type->lt_opr == InvalidOid)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("column \"%s\" cannot be used in statistics because its type %s has no default btree operator class",
-								get_attname(relid, var->varattno, false), format_type_be(var->vartype))));
+			/*
+			 * Disallow data types without a less-than operator in
+			 * multivariate statistics.
+			 */
+			if (numcols > 1)
+			{
+				type = lookup_type_cache(var->vartype, TYPECACHE_LT_OPR);
+				if (type->lt_opr == InvalidOid)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot create multivariate statistics on column \"%s\"",
+									get_attname(relid, var->varattno, false)),
+							 errdetail("The type %s has no default btree operator class.",
+									   format_type_be(var->vartype))));
+			}
 
-			attnums[nattnums] = var->varattno;
-			nattnums++;
+			/* Treat virtual generated columns as expressions */
+			if (get_attgenerated(relid, var->varattno) == ATTRIBUTE_GENERATED_VIRTUAL)
+			{
+				stxexprs = lappend(stxexprs, (Node *) var);
+			}
+			else
+			{
+				attnums[nattnums] = var->varattno;
+				nattnums++;
+			}
 		}
 		else					/* expression */
 		{
 			Node	   *expr = selem->expr;
 			Oid			atttype;
 			TypeCacheEntry *type;
-			Bitmapset  *attnums = NULL;
+			Bitmapset  *expr_attrs = NULL;
 			int			k;
 
 			Assert(expr != NULL);
 
-			/* Disallow expressions referencing system attributes. */
-			pull_varattnos(expr, 1, &attnums);
+			pull_varattnos(expr, 1, &expr_attrs);
 
 			k = -1;
-			while ((k = bms_next_member(attnums, k)) >= 0)
+			while ((k = bms_next_member(expr_attrs, k)) >= 0)
 			{
 				AttrNumber	attnum = k + FirstLowInvalidHeapAttributeNumber;
 
+				/* Disallow expressions referencing system attributes. */
 				if (attnum <= 0)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -308,21 +379,19 @@ CreateStatistics(CreateStatsStmt *stmt)
 			}
 
 			/*
-			 * Disallow data types without a less-than operator.
-			 *
-			 * We ignore this for statistics on a single expression, in which
-			 * case we'll build the regular statistics only (and that code can
-			 * deal with such data types).
+			 * Disallow data types without a less-than operator in
+			 * multivariate statistics.
 			 */
-			if (list_length(stmt->exprs) > 1)
+			if (numcols > 1)
 			{
 				atttype = exprType(expr);
 				type = lookup_type_cache(atttype, TYPECACHE_LT_OPR);
 				if (type->lt_opr == InvalidOid)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("expression cannot be used in multivariate statistics because its type %s has no default btree operator class",
-									format_type_be(atttype))));
+							 errmsg("cannot create multivariate statistics on this expression"),
+							 errdetail("The type %s has no default btree operator class.",
+									   format_type_be(atttype))));
 			}
 
 			stxexprs = lappend(stxexprs, expr);
@@ -330,22 +399,25 @@ CreateStatistics(CreateStatsStmt *stmt)
 	}
 
 	/*
-	 * Parse the statistics kinds.
-	 *
-	 * First check that if this is the case with a single expression, there
-	 * are no statistics kinds specified (we don't allow that for the simple
-	 * CREATE STATISTICS form).
+	 * Check that at least two columns were specified in the statement, or
+	 * that we're building statistics on a single expression (or virtual
+	 * generated column).
 	 */
-	if ((list_length(stmt->exprs) == 1) && (list_length(stxexprs) == 1))
-	{
-		/* statistics kinds not specified */
-		if (stmt->stat_types != NIL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("when building statistics on a single expression, statistics kinds may not be specified")));
-	}
+	if (numcols < 2 && list_length(stxexprs) != 1)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				errmsg("cannot create extended statistics on a single non-virtual column"),
+				errdetail("Univariate statistics are already built for each individual non-virtual table column."));
 
-	/* OK, let's check that we recognize the statistics kinds. */
+	/*
+	 * Parse the statistics kinds (not allowed when building univariate
+	 * statistics).
+	 */
+	if (numcols == 1 && stmt->stat_types != NIL)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot specify statistics kinds when building univariate statistics"));
+
 	build_ndistinct = false;
 	build_dependencies = false;
 	build_mcv = false;
@@ -392,15 +464,6 @@ CreateStatistics(CreateStatsStmt *stmt)
 	 * consider per-clause estimates (e.g. functional dependencies).
 	 */
 	build_expressions = (stxexprs != NIL);
-
-	/*
-	 * Check that at least two columns were specified in the statement, or
-	 * that we're building statistics on a single expression.
-	 */
-	if ((numcols < 2) && (list_length(stxexprs) != 1))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("extended statistics require at least 2 columns")));
 
 	/*
 	 * Sort the attnums, which makes detecting duplicates somewhat easier, and
@@ -498,9 +561,9 @@ CreateStatistics(CreateStatsStmt *stmt)
 	values[Anum_pg_statistic_ext_stxrelid - 1] = ObjectIdGetDatum(relid);
 	values[Anum_pg_statistic_ext_stxname - 1] = NameGetDatum(&stxname);
 	values[Anum_pg_statistic_ext_stxnamespace - 1] = ObjectIdGetDatum(namespaceId);
-	values[Anum_pg_statistic_ext_stxstattarget - 1] = Int16GetDatum(-1);
 	values[Anum_pg_statistic_ext_stxowner - 1] = ObjectIdGetDatum(stxowner);
 	values[Anum_pg_statistic_ext_stxkeys - 1] = PointerGetDatum(stxkeys);
+	nulls[Anum_pg_statistic_ext_stxstattarget - 1] = true;
 	values[Anum_pg_statistic_ext_stxkind - 1] = PointerGetDatum(stxkind);
 
 	values[Anum_pg_statistic_ext_stxexprs - 1] = exprsDatum;
@@ -564,11 +627,16 @@ CreateStatistics(CreateStatsStmt *stmt)
 	 * just like we do for index expressions.
 	 */
 	if (stxexprs)
+	{
+		if (check_rights)
+			CheckUsageOnTypesInSingleRelExpr((Node *) stxexprs, relid, GetUserId());
+
 		recordDependencyOnSingleRelExpr(&myself,
 										(Node *) stxexprs,
 										relid,
 										DEPENDENCY_NORMAL,
 										DEPENDENCY_AUTO, false);
+	}
 
 	/*
 	 * Also add dependencies on namespace and owner.  These are required
@@ -609,23 +677,36 @@ AlterStatistics(AlterStatsStmt *stmt)
 	bool		repl_null[Natts_pg_statistic_ext];
 	bool		repl_repl[Natts_pg_statistic_ext];
 	ObjectAddress address;
-	int			newtarget = stmt->stxstattarget;
+	int			newtarget = 0;
+	bool		newtarget_default;
 
-	/* Limit statistics target to a sane range */
-	if (newtarget < -1)
+	/* -1 was used in previous versions for the default setting */
+	if (stmt->stxstattarget && intVal(stmt->stxstattarget) != -1)
 	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("statistics target %d is too low",
-						newtarget)));
+		newtarget = intVal(stmt->stxstattarget);
+		newtarget_default = false;
 	}
-	else if (newtarget > MAX_STATISTICS_TARGET)
+	else
+		newtarget_default = true;
+
+	if (!newtarget_default)
 	{
-		newtarget = MAX_STATISTICS_TARGET;
-		ereport(WARNING,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("lowering statistics target to %d",
-						newtarget)));
+		/* Limit statistics target to a sane range */
+		if (newtarget < 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("statistics target %d is too low",
+							newtarget)));
+		}
+		else if (newtarget > MAX_STATISTICS_TARGET)
+		{
+			newtarget = MAX_STATISTICS_TARGET;
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("lowering statistics target to %d",
+							newtarget)));
+		}
 	}
 
 	/* lookup OID of the statistics object */
@@ -676,7 +757,10 @@ AlterStatistics(AlterStatsStmt *stmt)
 
 	/* replace the stxstattarget column */
 	repl_repl[Anum_pg_statistic_ext_stxstattarget - 1] = true;
-	repl_val[Anum_pg_statistic_ext_stxstattarget - 1] = Int16GetDatum(newtarget);
+	if (!newtarget_default)
+		repl_val[Anum_pg_statistic_ext_stxstattarget - 1] = Int16GetDatum(newtarget);
+	else
+		repl_null[Anum_pg_statistic_ext_stxstattarget - 1] = true;
 
 	newtup = heap_modify_tuple(oldtup, RelationGetDescr(rel),
 							   repl_val, repl_null, repl_repl);
@@ -734,17 +818,10 @@ void
 RemoveStatisticsById(Oid statsOid)
 {
 	Relation	relation;
+	Relation	rel;
 	HeapTuple	tup;
 	Form_pg_statistic_ext statext;
 	Oid			relid;
-
-	/*
-	 * First delete the pg_statistic_ext_data tuples holding the actual
-	 * statistical data. There might be data with/without inheritance, so
-	 * attempt deleting both.
-	 */
-	RemoveStatisticsDataById(statsOid, true);
-	RemoveStatisticsDataById(statsOid, false);
 
 	/*
 	 * Delete the pg_statistic_ext tuple.  Also send out a cache inval on the
@@ -760,11 +837,25 @@ RemoveStatisticsById(Oid statsOid)
 	statext = (Form_pg_statistic_ext) GETSTRUCT(tup);
 	relid = statext->stxrelid;
 
+	/*
+	 * Delete the pg_statistic_ext_data tuples holding the actual statistical
+	 * data. There might be data with/without inheritance, so attempt deleting
+	 * both. We lock the user table first, to prevent other processes (e.g.
+	 * DROP STATISTICS) from removing the row concurrently.
+	 */
+	rel = table_open(relid, ShareUpdateExclusiveLock);
+
+	RemoveStatisticsDataById(statsOid, true);
+	RemoveStatisticsDataById(statsOid, false);
+
 	CacheInvalidateRelcacheByRelid(relid);
 
 	CatalogTupleDelete(relation, &tup->t_self);
 
 	ReleaseSysCache(tup);
+
+	/* Keep lock until the end of the transaction. */
+	table_close(rel, NoLock);
 
 	table_close(relation, RowExclusiveLock);
 }

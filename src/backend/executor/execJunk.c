@@ -3,7 +3,7 @@
  * execJunk.c
  *	  Junk attribute support stuff....
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -93,7 +93,7 @@ ExecInitJunkFilter(List *targetList, TupleTableSlot *slot)
 		AttrNumber	cleanResno;
 		ListCell   *t;
 
-		cleanMap = (AttrNumber *) palloc(cleanLength * sizeof(AttrNumber));
+		cleanMap = palloc_array(AttrNumber, cleanLength);
 		cleanResno = 0;
 		foreach(t, targetList)
 		{
@@ -165,11 +165,11 @@ ExecInitJunkFilterConversion(List *targetList,
 	cleanLength = cleanTupType->natts;
 	if (cleanLength > 0)
 	{
-		cleanMap = (AttrNumber *) palloc0(cleanLength * sizeof(AttrNumber));
+		cleanMap = palloc0_array(AttrNumber, cleanLength);
 		t = list_head(targetList);
 		for (i = 0; i < cleanLength; i++)
 		{
-			if (TupleDescAttr(cleanTupType, i)->attisdropped)
+			if (TupleDescCompactAttr(cleanTupType, i)->attisdropped)
 				continue;		/* map entry is already zero */
 			for (;;)
 			{

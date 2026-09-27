@@ -1,11 +1,11 @@
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test that connections to a hot standby are correctly canceled when a
 # recovery conflict is detected Also, test that statistics in
 # pg_stat_database_conflicts are populated correctly
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -325,9 +325,10 @@ sub check_conflict_log
 sub check_conflict_stat
 {
 	my $conflict_type = shift;
-	my $count = $node_standby->safe_psql($test_db,
-		qq[SELECT confl_$conflict_type FROM pg_stat_database_conflicts WHERE datname='$test_db';]
-	);
 
-	is($count, 1, "$sect: stats show conflict on standby");
+	ok( $node_standby->poll_query_until(
+			$test_db,
+			qq[SELECT confl_$conflict_type FROM pg_stat_database_conflicts WHERE datname='$test_db';],
+			'1'),
+		"$sect: stats show conflict on standby");
 }

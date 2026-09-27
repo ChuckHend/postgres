@@ -1,5 +1,5 @@
 
-# Copyright (c) 2023, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 
 =pod
 
@@ -30,7 +30,7 @@ compare the results of cross-version upgrade tests.
 package PostgreSQL::Test::AdjustUpgrade;
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use Exporter 'import';
 use PostgreSQL::Version;
@@ -86,13 +86,19 @@ sub adjust_database_contents
 
 	# remove dbs of modules known to cause pg_upgrade to fail
 	# anything not builtin and incompatible should clean up its own db
-	foreach my $bad_module ('test_ddl_deparse', 'tsearch2')
+	foreach my $bad_module ('adminpack', 'test_ddl_deparse', 'tsearch2')
 	{
 		if ($dbnames{"contrib_regression_$bad_module"})
 		{
 			_add_st($result, 'postgres',
 				"drop database contrib_regression_$bad_module");
 			delete($dbnames{"contrib_regression_$bad_module"});
+		}
+		if ($dbnames{"regression_$bad_module"})
+		{
+			_add_st($result, 'postgres',
+				"drop database regression_$bad_module");
+			delete($dbnames{"regression_$bad_module"});
 		}
 	}
 
@@ -104,6 +110,67 @@ sub adjust_database_contents
 			'contrib_regression_test_extensions',
 			'drop extension if exists test_ext_cine',
 			'drop extension if exists test_ext7');
+	}
+
+	# refint was removed in v20
+	if ($old_version < 20)
+	{
+		if ($dbnames{"contrib_regression_autoinc"})
+		{
+			_add_st($result, 'contrib_regression_autoinc',
+				'drop extension if exists refint cascade');
+		}
+		if ($dbnames{"regression_spi"})
+		{
+			_add_st($result, 'regression_spi',
+				'drop extension if exists refint cascade');
+		}
+	}
+
+	# btree_gist inet/cidr indexes cannot be upgraded to v19
+	if ($old_version < 19)
+	{
+		if ($dbnames{"contrib_regression_btree_gist"})
+		{
+			_add_st(
+				$result,
+				'contrib_regression_btree_gist',
+				"drop index if exists public.inettmp_a_a1_idx");
+			_add_st(
+				$result,
+				'contrib_regression_btree_gist',
+				"drop index if exists public.inetidx");
+			_add_st(
+				$result,
+				'contrib_regression_btree_gist',
+				"drop index public.cidridx");
+		}
+		if ($dbnames{"regression_btree_gist"})
+		{
+			_add_st($result, 'regression_btree_gist',
+				"drop index if exists public.inettmp_a_a1_idx");
+			_add_st($result, 'regression_btree_gist',
+				"drop index if exists public.inetidx");
+			_add_st($result, 'regression_btree_gist',
+				"drop index public.cidridx");
+		}
+	}
+
+	# we removed these test-support functions in v18
+	if ($old_version < 18)
+	{
+		_add_st($result, 'regression', 'drop function ttdummy()');
+		_add_st($result, 'regression', 'drop function set_ttdummy(integer)');
+		_add_st($result, 'regression', 'drop function autoinc()');
+		_add_st($result, 'regression', 'drop function check_foreign_key()');
+		_add_st($result, 'regression', 'drop function check_primary_key()');
+	}
+
+	# we removed this test-support function in v17
+	if ($old_version >= 15 && $old_version < 17)
+	{
+		_add_st($result, 'regression',
+			'drop function get_columns_length(oid[])');
 	}
 
 	# stuff not supported from release 16
@@ -132,17 +199,20 @@ sub adjust_database_contents
 			'drop operator if exists #@%# (bigint,NONE)');
 
 		# get rid of dblink's dependencies on regress.so
-		my $regrdb =
-		  $old_version le '9.4'
-		  ? 'contrib_regression'
-		  : 'contrib_regression_dblink';
-
-		if ($dbnames{$regrdb})
+		if ($dbnames{'contrib_regression_dblink'})
 		{
 			_add_st(
-				$result, $regrdb,
+				$result, 'contrib_regression_dblink',
 				'drop function if exists public.putenv(text)',
 				'drop function if exists public.wait_pid(integer)');
+		}
+
+		# delete seg row that pre-14 was printed incorrectly but would now
+		# be printed correctly
+		if ($dbnames{contrib_regression_seg})
+		{
+			_add_st($result, 'contrib_regression_seg',
+				"delete from test_seg where s = '4.6 .. ~7.0'");
 		}
 	}
 
@@ -175,7 +245,7 @@ sub adjust_database_contents
 		}
 
 		# this table had OIDs too, but we'll just drop it
-		if ($old_version >= 10 && $dbnames{'contrib_regression_postgres_fdw'})
+		if ($dbnames{'contrib_regression_postgres_fdw'})
 		{
 			_add_st(
 				$result,
@@ -201,31 +271,27 @@ sub adjust_database_contents
 			'drop function if exists public.funny_dup17()');
 	}
 
-	# version-0 C functions are no longer supported
-	if ($old_version < 10)
+	# Version 19 changed the output format of pg_lsn.  To avoid output
+	# differences, set all pg_lsn columns to NULL if the old version is
+	# older than 19.
+	if ($old_version < 19)
 	{
 		_add_st($result, 'regression',
-			'drop function oldstyle_length(integer, text)');
-	}
+			"update brintest set lsncol = NULL");
 
-	if ($old_version lt '9.5')
-	{
-		# cope with changes of underlying functions
-		_add_st(
-			$result,
-			'regression',
-			'drop operator @#@ (NONE, bigint)',
-			'CREATE OPERATOR @#@ ('
-			  . 'PROCEDURE = factorial, RIGHTARG = bigint )',
-			'drop aggregate public.array_cat_accum(anyarray)',
-			'CREATE AGGREGATE array_larger_accum (anyarray) ' . ' ( '
-			  . '   sfunc = array_larger, '
-			  . '   stype = anyarray, '
-			  . '   initcond = $${}$$ ' . '  ) ');
+		if ($old_version >= 12)
+		{
+			_add_st($result, 'regression',
+				"update tab_core_types set pg_lsn = NULL");
+		}
 
-		# "=>" is no longer valid as an operator name
-		_add_st($result, 'regression',
-			'drop operator if exists public.=> (bigint, NONE)');
+		if ($old_version >= 14)
+		{
+			_add_st($result, 'regression',
+				"update brintest_multi set lsncol = NULL");
+			_add_st($result, 'regression',
+				"update brintest_bloom set lsncol = NULL");
+		}
 	}
 
 	return $result;
@@ -281,10 +347,26 @@ sub adjust_old_dumpfile
 	# Version comments will certainly not match.
 	$dump =~ s/^-- Dumped from database version.*\n//mg;
 
+	# Same with version argument to pg_restore_relation_stats(),
+	# pg_restore_attribute_stats() or pg_restore_extended_stats().
+	$dump =~ s {\n(\s+'version',) '\d+'::integer,$}
+		{$1 '000000'::integer,}mg;
+
 	if ($old_version < 16)
 	{
 		# Fix up some view queries that no longer require table-qualification.
 		$dump = _mash_view_qualifiers($dump);
+	}
+
+	if ($old_version >= 14 && $old_version < 17)
+	{
+		# Fix up some privilege-set discrepancies.
+		$dump =~
+		  s {^REVOKE SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE}
+			{REVOKE ALL ON TABLE}mg;
+		$dump =~
+		  s {^(GRANT SELECT,INSERT,REFERENCES,TRIGGER,TRUNCATE),UPDATE ON TABLE}
+			{$1,MAINTAIN,UPDATE ON TABLE}mg;
 	}
 
 	if ($old_version < 14)
@@ -307,95 +389,6 @@ sub adjust_old_dumpfile
 			(^CREATE\sTRIGGER\s.*?)
 			\sEXECUTE\sPROCEDURE
 			/$1 EXECUTE FUNCTION/mgx;
-	}
-
-	if ($old_version lt '9.6')
-	{
-		# adjust some places where we don't print so many parens anymore
-
-		my $prefix =
-		  "'New York'\tnew & york | big & apple | nyc\t'new' & 'york'\t";
-		my $orig = "( 'new' & 'york' | 'big' & 'appl' ) | 'nyc'";
-		my $repl = "'new' & 'york' | 'big' & 'appl' | 'nyc'";
-		$dump =~ s/(?<=^\Q$prefix\E)\Q$orig\E/$repl/mg;
-
-		$prefix =
-		  "'Sanct Peter'\tPeterburg | peter | 'Sanct Peterburg'\t'sanct' & 'peter'\t";
-		$orig = "( 'peterburg' | 'peter' ) | 'sanct' & 'peterburg'";
-		$repl = "'peterburg' | 'peter' | 'sanct' & 'peterburg'";
-		$dump =~ s/(?<=^\Q$prefix\E)\Q$orig\E/$repl/mg;
-	}
-
-	if ($old_version lt '9.5')
-	{
-		# adjust some places where we don't print so many parens anymore
-
-		my $prefix = "CONSTRAINT (?:sequence|copy)_con CHECK [(][(]";
-		my $orig = "((x > 3) AND (y <> 'check failed'::text))";
-		my $repl = "(x > 3) AND (y <> 'check failed'::text)";
-		$dump =~ s/($prefix)\Q$orig\E/$1$repl/mg;
-
-		$prefix = "CONSTRAINT insert_con CHECK [(][(]";
-		$orig = "((x >= 3) AND (y <> 'check failed'::text))";
-		$repl = "(x >= 3) AND (y <> 'check failed'::text)";
-		$dump =~ s/($prefix)\Q$orig\E/$1$repl/mg;
-
-		$orig = "DEFAULT ((-1) * currval('public.insert_seq'::regclass))";
-		$repl =
-		  "DEFAULT ('-1'::integer * currval('public.insert_seq'::regclass))";
-		$dump =~ s/\Q$orig\E/$repl/mg;
-
-		my $expr =
-		  "(rsl.sl_color = rsh.slcolor) AND (rsl.sl_len_cm >= rsh.slminlen_cm)";
-		$dump =~ s/WHERE \(\(\Q$expr\E\)/WHERE ($expr/g;
-
-		$expr =
-		  "(rule_and_refint_t3.id3a = new.id3a) AND (rule_and_refint_t3.id3b = new.id3b)";
-		$dump =~ s/WHERE \(\(\Q$expr\E\)/WHERE ($expr/g;
-
-		$expr =
-		  "(rule_and_refint_t3_1.id3a = new.id3a) AND (rule_and_refint_t3_1.id3b = new.id3b)";
-		$dump =~ s/WHERE \(\(\Q$expr\E\)/WHERE ($expr/g;
-	}
-
-	if ($old_version lt '9.3')
-	{
-		# CREATE VIEW/RULE statements were not pretty-printed before 9.3.
-		# To cope, reduce all whitespace sequences within them to one space.
-		# This must be done on both old and new dumps.
-		$dump = _mash_view_whitespace($dump);
-
-		# _mash_view_whitespace doesn't handle multi-command rules;
-		# rather than trying to fix that, just hack the exceptions manually.
-
-		my $prefix =
-		  "CREATE RULE rtest_sys_del AS ON DELETE TO public.rtest_system DO (DELETE FROM public.rtest_interface WHERE (rtest_interface.sysname = old.sysname);";
-		my $line2 = " DELETE FROM public.rtest_admin";
-		my $line3 = " WHERE (rtest_admin.sysname = old.sysname);";
-		$dump =~
-		  s/(?<=\Q$prefix\E)\Q$line2$line3\E \);/\n$line2\n $line3\n);/mg;
-
-		$prefix =
-		  "CREATE RULE rtest_sys_upd AS ON UPDATE TO public.rtest_system DO (UPDATE public.rtest_interface SET sysname = new.sysname WHERE (rtest_interface.sysname = old.sysname);";
-		$line2 = " UPDATE public.rtest_admin SET sysname = new.sysname";
-		$line3 = " WHERE (rtest_admin.sysname = old.sysname);";
-		$dump =~
-		  s/(?<=\Q$prefix\E)\Q$line2$line3\E \);/\n$line2\n $line3\n);/mg;
-
-		# and there's one place where pre-9.3 uses a different table alias
-		$dump =~ s {^(CREATE\sRULE\srule_and_refint_t3_ins\sAS\s
-			 ON\sINSERT\sTO\spublic\.rule_and_refint_t3\s
-			 WHERE\s\(EXISTS\s\(SELECT\s1\sFROM\spublic\.rule_and_refint_t3)\s
-			 (WHERE\s\(\(rule_and_refint_t3)
-			 (\.id3a\s=\snew\.id3a\)\sAND\s\(rule_and_refint_t3)
-			 (\.id3b\s=\snew\.id3b\)\sAND\s\(rule_and_refint_t3)}
-		{$1 rule_and_refint_t3_1 $2_1$3_1$4_1}mx;
-
-		# Also fix old use of NATURAL JOIN syntax
-		$dump =~ s {NATURAL JOIN public\.credit_card r}
-			{JOIN public.credit_card r USING (cid)}mg;
-		$dump =~ s {NATURAL JOIN public\.credit_usage r}
-			{JOIN public.credit_usage r USING (cid)}mg;
 	}
 
 	# Suppress blank lines, as some places in pg_dump emit more or fewer.
@@ -487,6 +480,7 @@ my @_unused_view_qualifiers = (
 	{ obj => 'VIEW public.limit_thousand_v_2', qual => 'onek' },
 	{ obj => 'VIEW public.limit_thousand_v_3', qual => 'onek' },
 	{ obj => 'VIEW public.limit_thousand_v_4', qual => 'onek' },
+	{ obj => 'VIEW public.limit_thousand_v_5', qual => 'onek' },
 	# Since 14
 	{ obj => 'MATERIALIZED VIEW public.compressmv', qual => 'cmdata1' });
 
@@ -510,7 +504,6 @@ sub _mash_view_qualifiers
 		{
 			my @thischunks = split /;/, $chunk, 2;
 			my $stmt = shift(@thischunks);
-			my $ostmt = $stmt;
 
 			# now $stmt is just the body of the CREATE [MATERIALIZED] VIEW
 			$stmt =~ s/$qualifier\.//g;
@@ -529,37 +522,6 @@ sub _mash_view_qualifiers
 	  s {^(CREATE VIEW public\.shoelace_obsolete .*?)(sl_color\)\)\)\);)}
 	{$1shoelace.$2}ms;
 
-	return $dump;
-}
-
-
-# Internal subroutine to mangle whitespace within view/rule commands.
-# Any consecutive sequence of whitespace is reduced to one space.
-sub _mash_view_whitespace
-{
-	my ($dump) = @_;
-
-	foreach my $leader ('CREATE VIEW', 'CREATE RULE')
-	{
-		my @splitchunks = split $leader, $dump;
-
-		$dump = shift(@splitchunks);
-		foreach my $chunk (@splitchunks)
-		{
-			my @thischunks = split /;/, $chunk, 2;
-			my $stmt = shift(@thischunks);
-
-			# now $stmt is just the body of the CREATE VIEW/RULE
-			$stmt =~ s/\s+/ /sg;
-			# we also need to smash these forms for sub-selects and rules
-			$stmt =~ s/\( SELECT/(SELECT/g;
-			$stmt =~ s/\( INSERT/(INSERT/g;
-			$stmt =~ s/\( UPDATE/(UPDATE/g;
-			$stmt =~ s/\( DELETE/(DELETE/g;
-
-			$dump .= $leader . $stmt . ';' . $thischunks[0];
-		}
-	}
 	return $dump;
 }
 
@@ -603,6 +565,22 @@ sub adjust_new_dumpfile
 	# Version comments will certainly not match.
 	$dump =~ s/^-- Dumped from database version.*\n//mg;
 
+	# Same with version argument to pg_restore_relation_stats(),
+	# pg_restore_attribute_stats() or pg_restore_extended_stats().
+	$dump =~ s {\n(\s+'version',) '\d+'::integer,$}
+		{$1 '000000'::integer,}mg;
+
+	if ($old_version < 18)
+	{
+		$dump =~ s {,\n(\s+'relallfrozen',) '-?\d+'::integer$}{}mg;
+	}
+
+	# pre-v16 dumps do not know about XMLSERIALIZE(NO INDENT).
+	if ($old_version < 16)
+	{
+		$dump =~ s/XMLSERIALIZE\((.*)? NO INDENT\)/XMLSERIALIZE\($1\)/mg;
+	}
+
 	if ($old_version < 14)
 	{
 		# Suppress noise-word uses of IN in CREATE/ALTER PROCEDURE.
@@ -632,24 +610,6 @@ sub adjust_new_dumpfile
 	if ($old_version < 12)
 	{
 		$dump =~ s/^SET default_table_access_method = heap;\n//mg;
-	}
-
-	# dumps from pre-9.6 dblink may include redundant ACL settings
-	if ($old_version lt '9.6')
-	{
-		my $comment =
-		  "-- Name: FUNCTION dblink_connect_u\(.*?\); Type: ACL; Schema: public; Owner: .*";
-		my $sql =
-		  "REVOKE ALL ON FUNCTION public\.dblink_connect_u\(.*?\) FROM PUBLIC;";
-		$dump =~ s/^--\n$comment\n--\n+$sql\n+//mg;
-	}
-
-	if ($old_version lt '9.3')
-	{
-		# CREATE VIEW/RULE statements were not pretty-printed before 9.3.
-		# To cope, reduce all whitespace sequences within them to one space.
-		# This must be done on both old and new dumps.
-		$dump = _mash_view_whitespace($dump);
 	}
 
 	# Suppress blank lines, as some places in pg_dump emit more or fewer.

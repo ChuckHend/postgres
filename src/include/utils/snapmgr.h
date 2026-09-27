@@ -3,7 +3,7 @@
  * snapmgr.h
  *	  POSTGRES snapshot manager
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/snapmgr.h
@@ -27,10 +27,12 @@ extern PGDLLIMPORT TransactionId RecentXmin;
 /* Variables representing various special snapshot semantics */
 extern PGDLLIMPORT SnapshotData SnapshotSelfData;
 extern PGDLLIMPORT SnapshotData SnapshotAnyData;
-extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
+extern PGDLLIMPORT SnapshotData SnapshotToastData;
 
 #define SnapshotSelf		(&SnapshotSelfData)
 #define SnapshotAny			(&SnapshotAnyData)
+
+/* Use get_toast_snapshot() for the TOAST snapshot */
 
 /*
  * We don't provide a static SnapshotDirty variable because it would be
@@ -50,23 +52,31 @@ extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
 	 (snapshotdata).vistest = (vistestp))
 
 /*
- * Similarly, some initialization is required for SnapshotToast.  We need
- * to set lsn and whenTaken correctly to support snapshot_too_old.
+ * Is the snapshot implemented as an MVCC snapshot (i.e. it uses
+ * SNAPSHOT_MVCC)? If so, there will be at most one visible tuple in a chain
+ * of updated tuples, and each visible tuple will be seen exactly once.
  */
-#define InitToastSnapshot(snapshotdata, l, w)  \
-	((snapshotdata).snapshot_type = SNAPSHOT_TOAST, \
-	 (snapshotdata).lsn = (l),					\
-	 (snapshotdata).whenTaken = (w))
-
-/* This macro encodes the knowledge of which snapshots are MVCC-safe */
 #define IsMVCCSnapshot(snapshot)  \
-	((snapshot)->snapshot_type == SNAPSHOT_MVCC || \
-	 (snapshot)->snapshot_type == SNAPSHOT_HISTORIC_MVCC)
+	((snapshot)->snapshot_type == SNAPSHOT_MVCC)
+
+/*
+ * Special kind of MVCC snapshot, used during logical decoding. The visibility
+ * is checked from the perspective of an already committed transaction that is
+ * being decoded.
+ */
+#define IsHistoricMVCCSnapshot(snapshot)  \
+	((snapshot)->snapshot_type == SNAPSHOT_HISTORIC_MVCC)
+
+/*
+ * Is the snapshot either an MVCC snapshot or has equivalent visibility
+ * semantics (see IsMVCCSnapshot())?
+ */
+#define IsMVCCLikeSnapshot(snapshot)  \
+	(IsMVCCSnapshot(snapshot) || IsHistoricMVCCSnapshot(snapshot))
 
 extern Snapshot GetTransactionSnapshot(void);
 extern Snapshot GetLatestSnapshot(void);
 extern void SnapshotSetCommandId(CommandId curcid);
-extern Snapshot GetOldestSnapshot(void);
 
 extern Snapshot GetCatalogSnapshot(Oid relid);
 extern Snapshot GetNonHistoricCatalogSnapshot(Oid relid);
@@ -105,12 +115,17 @@ extern char *ExportSnapshot(Snapshot snapshot);
  */
 typedef struct GlobalVisState GlobalVisState;
 extern GlobalVisState *GlobalVisTestFor(Relation rel);
-extern bool GlobalVisTestIsRemovableXid(GlobalVisState *state, TransactionId xid);
-extern bool GlobalVisTestIsRemovableFullXid(GlobalVisState *state, FullTransactionId fxid);
-extern FullTransactionId GlobalVisTestNonRemovableFullHorizon(GlobalVisState *state);
-extern TransactionId GlobalVisTestNonRemovableHorizon(GlobalVisState *state);
+extern bool GlobalVisTestIsRemovableXid(GlobalVisState *state,
+										TransactionId xid,
+										bool allow_update);
+extern bool GlobalVisTestIsRemovableFullXid(GlobalVisState *state,
+											FullTransactionId fxid,
+											bool allow_update);
 extern bool GlobalVisCheckRemovableXid(Relation rel, TransactionId xid);
 extern bool GlobalVisCheckRemovableFullXid(Relation rel, FullTransactionId fxid);
+extern bool GlobalVisTestXidConsideredRunning(GlobalVisState *state,
+											  TransactionId xid,
+											  bool allow_update);
 
 /*
  * Utility functions for implementing visibility routines in table AMs.
@@ -127,6 +142,7 @@ extern bool HistoricSnapshotActive(void);
 extern Size EstimateSnapshotSpace(Snapshot snapshot);
 extern void SerializeSnapshot(Snapshot snapshot, char *start_address);
 extern Snapshot RestoreSnapshot(char *start_address);
-extern void RestoreTransactionSnapshot(Snapshot snapshot, void *source_pgproc);
+struct PGPROC;
+extern void RestoreTransactionSnapshot(Snapshot snapshot, struct PGPROC *source_pgproc);
 
 #endif							/* SNAPMGR_H */

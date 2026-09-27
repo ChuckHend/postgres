@@ -3,7 +3,7 @@
  * fastpath.c
  *	  routines to handle function requests from the frontend
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -11,7 +11,9 @@
  *	  src/backend/tcop/fastpath.c
  *
  * NOTES
- *	  This cruft is the server side of PQfn.
+ *	  This cruft is the server side of PQfn.  libpq's PQfn() was retired in
+ *	  v20 and now always errors, but the server code is retained for the
+ *	  benefit of older clients and the frontend LO interface.
  *
  *-------------------------------------------------------------------------
  */
@@ -22,11 +24,10 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
-#include "libpq/libpq.h"
 #include "libpq/pqformat.h"
+#include "libpq/protocol.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "port/pg_bswap.h"
 #include "tcop/fastpath.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
@@ -85,7 +86,7 @@ SendFunctionResult(Datum retval, bool isnull, Oid rettype, int16 format)
 
 			getTypeOutputInfo(rettype, &typoutput, &typisvarlena);
 			outputstr = OidOutputFunctionCall(typoutput, retval);
-			pq_sendcountedtext(&buf, outputstr, strlen(outputstr), false);
+			pq_sendcountedtext(&buf, outputstr, strlen(outputstr));
 			pfree(outputstr);
 		}
 		else if (format == 1)
@@ -340,7 +341,7 @@ parse_fcall_arguments(StringInfo msgBuf, struct fp_info *fip,
 	numAFormats = pq_getmsgint(msgBuf, 2);
 	if (numAFormats > 0)
 	{
-		aformats = (int16 *) palloc(numAFormats * sizeof(int16));
+		aformats = palloc_array(int16, numAFormats);
 		for (i = 0; i < numAFormats; i++)
 			aformats[i] = pq_getmsgint(msgBuf, 2);
 	}

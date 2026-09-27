@@ -5,7 +5,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/receivelog.c
@@ -19,9 +19,10 @@
 #include <unistd.h>
 
 #include "access/xlog_internal.h"
-#include "common/file_utils.h"
 #include "common/logging.h"
+#include "common/pg_parse_lsn.h"
 #include "libpq-fe.h"
+#include "libpq/protocol.h"
 #include "receivelog.h"
 #include "streamutil.h"
 
@@ -39,8 +40,8 @@ static int	CopyStreamReceive(PGconn *conn, long timeout, pgsocket stop_socket,
 							  char **buffer);
 static bool ProcessKeepaliveMsg(PGconn *conn, StreamCtl *stream, char *copybuf,
 								int len, XLogRecPtr blockpos, TimestampTz *last_status);
-static bool ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
-							   XLogRecPtr *blockpos);
+static bool ProcessWALDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
+							  XLogRecPtr *blockpos);
 static PGresult *HandleEndOfCopyStream(PGconn *conn, StreamCtl *stream, char *copybuf,
 									   XLogRecPtr blockpos, XLogRecPtr *stoppos);
 static bool CheckCopyStreamStop(PGconn *conn, StreamCtl *stream, XLogRecPtr blockpos);
@@ -192,7 +193,7 @@ static bool
 close_walfile(StreamCtl *stream, XLogRecPtr pos)
 {
 	char	   *fn;
-	off_t		currpos;
+	pgoff_t		currpos;
 	int			r;
 	char		walfile_name[MAXPGPATH];
 
@@ -272,9 +273,9 @@ existsTimeLineHistoryFile(StreamCtl *stream)
 }
 
 static bool
-writeTimeLineHistoryFile(StreamCtl *stream, char *filename, char *content)
+writeTimeLineHistoryFile(StreamCtl *stream, const char *filename, const char *content)
 {
-	int			size = strlen(content);
+	size_t		size = strlen(content);
 	char		histfname[MAXFNAMELEN];
 	Walfile    *f;
 
@@ -299,7 +300,7 @@ writeTimeLineHistoryFile(StreamCtl *stream, char *filename, char *content)
 		return false;
 	}
 
-	if ((int) stream->walmethod->ops->write(f, content, size) != size)
+	if (stream->walmethod->ops->write(f, content, size) != size)
 	{
 		pg_log_error("could not write timeline history file \"%s\": %s",
 					 histfname, GetLastWalMethodError(stream->walmethod));
@@ -339,7 +340,7 @@ sendFeedback(PGconn *conn, XLogRecPtr blockpos, TimestampTz now, bool replyReque
 	char		replybuf[1 + 8 + 8 + 8 + 8 + 1];
 	int			len = 0;
 
-	replybuf[len] = 'r';
+	replybuf[len] = PqReplMsg_StandbyStatusUpdate;
 	len += 1;
 	fe_sendint64(blockpos, &replybuf[len]); /* write */
 	len += 8;
@@ -452,8 +453,7 @@ CheckServerVersionForStreaming(PGconn *conn)
 bool
 ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 {
-	char		query[128];
-	char		slotcmd[128];
+	PQExpBuffer query;
 	PGresult   *res;
 	XLogRecPtr	stoppos;
 
@@ -478,7 +478,6 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 	if (stream->replication_slot != NULL)
 	{
 		reportFlushPosition = true;
-		sprintf(slotcmd, "SLOT \"%s\" ", stream->replication_slot);
 	}
 	else
 	{
@@ -486,7 +485,6 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 			reportFlushPosition = true;
 		else
 			reportFlushPosition = false;
-		slotcmd[0] = 0;
 	}
 
 	if (stream->sysidentifier != NULL)
@@ -535,8 +533,10 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 		 */
 		if (!existsTimeLineHistoryFile(stream))
 		{
-			snprintf(query, sizeof(query), "TIMELINE_HISTORY %u", stream->timeline);
-			res = PQexec(conn, query);
+			query = createPQExpBuffer();
+			appendPQExpBuffer(query, "TIMELINE_HISTORY %u", stream->timeline);
+			res = PQexec(conn, query->data);
+			destroyPQExpBuffer(query);
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
 			{
 				/* FIXME: we might send it ok, but get an error */
@@ -572,11 +572,18 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 			return true;
 
 		/* Initiate the replication stream at specified location */
-		snprintf(query, sizeof(query), "START_REPLICATION %s%X/%X TIMELINE %u",
-				 slotcmd,
-				 LSN_FORMAT_ARGS(stream->startpos),
-				 stream->timeline);
-		res = PQexec(conn, query);
+		query = createPQExpBuffer();
+		appendPQExpBufferStr(query, "START_REPLICATION");
+		if (stream->replication_slot != NULL)
+		{
+			appendPQExpBufferStr(query, " SLOT ");
+			AppendQuotedIdentifier(query, stream->replication_slot);
+		}
+		appendPQExpBuffer(query, " %X/%08X TIMELINE %u",
+						  LSN_FORMAT_ARGS(stream->startpos),
+						  stream->timeline);
+		res = PQexec(conn, query->data);
+		destroyPQExpBuffer(query);
 		if (PQresultStatus(res) != PGRES_COPY_BOTH)
 		{
 			pg_log_error("could not send replication command \"%s\": %s",
@@ -629,7 +636,7 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 			}
 			if (stream->startpos > stoppos)
 			{
-				pg_log_error("server stopped streaming timeline %u at %X/%X, but reported next timeline %u to begin at %X/%X",
+				pg_log_error("server stopped streaming timeline %u at %X/%08X, but reported next timeline %u to begin at %X/%08X",
 							 stream->timeline, LSN_FORMAT_ARGS(stoppos),
 							 newtimeline, LSN_FORMAT_ARGS(stream->startpos));
 				goto error;
@@ -698,9 +705,6 @@ error:
 static bool
 ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos, uint32 *timeline)
 {
-	uint32		startpos_xlogid,
-				startpos_xrecoff;
-
 	/*----------
 	 * The result set consists of one row and two columns, e.g:
 	 *
@@ -721,14 +725,12 @@ ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos, uint32 *timeline)
 	}
 
 	*timeline = atoi(PQgetvalue(res, 0, 0));
-	if (sscanf(PQgetvalue(res, 0, 1), "%X/%X", &startpos_xlogid,
-			   &startpos_xrecoff) != 2)
+	if (!pg_parse_lsn(PQgetvalue(res, 0, 1), startpos))
 	{
 		pg_log_error("could not parse next timeline's starting point \"%s\"",
 					 PQgetvalue(res, 0, 1));
 		return false;
 	}
-	*startpos = ((uint64) startpos_xlogid << 32) | startpos_xrecoff;
 
 	return true;
 }
@@ -804,6 +806,10 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 		sleeptime = CalculateCopyStreamSleeptime(now, stream->standby_message_timeout,
 												 last_status);
 
+		/* Done with any prior message */
+		PQfreemem(copybuf);
+		copybuf = NULL;
+
 		r = CopyStreamReceive(conn, sleeptime, stream->stop_socket, &copybuf);
 		while (r != 0)
 		{
@@ -815,20 +821,20 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 
 				if (res == NULL)
 					goto error;
-				else
-					return res;
+				PQfreemem(copybuf);
+				return res;
 			}
 
 			/* Check the message type. */
-			if (copybuf[0] == 'k')
+			if (copybuf[0] == PqReplMsg_Keepalive)
 			{
 				if (!ProcessKeepaliveMsg(conn, stream, copybuf, r, blockpos,
 										 &last_status))
 					goto error;
 			}
-			else if (copybuf[0] == 'w')
+			else if (copybuf[0] == PqReplMsg_WALData)
 			{
-				if (!ProcessXLogDataMsg(conn, stream, copybuf, r, &blockpos))
+				if (!ProcessWALDataMsg(conn, stream, copybuf, r, &blockpos))
 					goto error;
 
 				/*
@@ -844,6 +850,10 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 							 copybuf[0]);
 				goto error;
 			}
+
+			/* Done with that message */
+			PQfreemem(copybuf);
+			copybuf = NULL;
 
 			/*
 			 * Process the received data, and any subsequent data we can read
@@ -921,8 +931,8 @@ CopyStreamPoll(PGconn *conn, long timeout_ms, pgsocket stop_socket)
  * maximum of 'timeout' ms.
  *
  * If data was received, returns the length of the data. *buffer is set to
- * point to a buffer holding the received message. The buffer is only valid
- * until the next CopyStreamReceive call.
+ * point to a buffer holding the received message. The caller must eventually
+ * free the buffer with PQfreemem().
  *
  * Returns 0 if no data was available within timeout, or if wait was
  * interrupted by signal or stop_socket input.
@@ -935,8 +945,8 @@ CopyStreamReceive(PGconn *conn, long timeout, pgsocket stop_socket,
 	char	   *copybuf = NULL;
 	int			rawlen;
 
-	PQfreemem(*buffer);
-	*buffer = NULL;
+	/* Caller should have cleared any prior buffer */
+	Assert(*buffer == NULL);
 
 	/* Try to receive a CopyData message */
 	rawlen = PQgetCopyData(conn, &copybuf, 1);
@@ -994,7 +1004,7 @@ ProcessKeepaliveMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	 * Parse the keepalive message, enclosed in the CopyData message. We just
 	 * check if the server requested a reply, and ignore the rest.
 	 */
-	pos = 1;					/* skip msgtype 'k' */
+	pos = 1;					/* skip msgtype PqReplMsg_Keepalive */
 	pos += 8;					/* skip walEnd */
 	pos += 8;					/* skip sendTime */
 
@@ -1034,11 +1044,11 @@ ProcessKeepaliveMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 }
 
 /*
- * Process XLogData message.
+ * Process WALData message.
  */
 static bool
-ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
-				   XLogRecPtr *blockpos)
+ProcessWALDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
+				  XLogRecPtr *blockpos)
 {
 	int			xlogoff;
 	int			bytes_left;
@@ -1047,17 +1057,17 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 
 	/*
 	 * Once we've decided we don't want to receive any more, just ignore any
-	 * subsequent XLogData messages.
+	 * subsequent WALData messages.
 	 */
 	if (!(still_sending))
 		return true;
 
 	/*
-	 * Read the header of the XLogData message, enclosed in the CopyData
+	 * Read the header of the WALData message, enclosed in the CopyData
 	 * message. We only need the WAL location field (dataStart), the rest of
 	 * the header is ignored.
 	 */
-	hdr_len = 1;				/* msgtype 'w' */
+	hdr_len = 1;				/* msgtype PqReplMsg_WALData */
 	hdr_len += 8;				/* dataStart */
 	hdr_len += 8;				/* walEnd */
 	hdr_len += 8;				/* sendTime */
@@ -1155,7 +1165,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 					return false;
 				}
 				still_sending = false;
-				return true;	/* ignore the rest of this XLogData packet */
+				return true;	/* ignore the rest of this WALData packet */
 			}
 		}
 	}
@@ -1199,7 +1209,6 @@ HandleEndOfCopyStream(PGconn *conn, StreamCtl *stream, char *copybuf,
 		}
 		still_sending = false;
 	}
-	PQfreemem(copybuf);
 	*stoppos = blockpos;
 	return res;
 }

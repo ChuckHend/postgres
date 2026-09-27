@@ -6,38 +6,24 @@
 
 #include "postgres.h"
 
-#include "access/htup_details.h"
-#include "access/xact.h"
-#include "catalog/pg_type.h"
+#include "commands/event_trigger.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "plpy_elog.h"
 #include "plpy_exec.h"
 #include "plpy_main.h"
-#include "plpy_procedure.h"
 #include "plpy_subxactobject.h"
-#include "plpython.h"
-#include "utils/builtins.h"
-#include "utils/lsyscache.h"
-#include "utils/rel.h"
-#include "utils/typcache.h"
+#include "plpy_util.h"
+#include "utils/fmgrprotos.h"
 
-/* saved state for a set-returning function */
-typedef struct PLySRFState
-{
-	PyObject   *iter;			/* Python iterator producing results */
-	PLySavedArgs *savedargs;	/* function argument values */
-	MemoryContextCallback callback; /* for releasing refcounts when done */
-} PLySRFState;
-
+static void ShutdownPLyFunction(Datum arg);
 static PyObject *PLy_function_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc);
 static PLySavedArgs *PLy_function_save_args(PLyProcedure *proc);
 static void PLy_function_restore_args(PLyProcedure *proc, PLySavedArgs *savedargs);
 static void PLy_function_drop_args(PLySavedArgs *savedargs);
 static void PLy_global_args_push(PLyProcedure *proc);
 static void PLy_global_args_pop(PLyProcedure *proc);
-static void plpython_srf_cleanup_callback(void *arg);
 static void plpython_return_error_callback(void *arg);
 
 static PyObject *PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc,
@@ -52,13 +38,14 @@ static void PLy_abort_open_subtransactions(int save_subxact_level);
 
 /* function subhandler */
 Datum
-PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
+PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedureCache *pcache)
 {
+	PLyProcedure *proc = pcache->proc;
 	bool		is_setof = proc->is_setof;
+	ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
 	Datum		rv;
 	PyObject   *volatile plargs = NULL;
 	PyObject   *volatile plrv = NULL;
-	FuncCallContext *volatile funcctx = NULL;
 	PLySRFState *volatile srfstate = NULL;
 	ErrorContextCallback plerrcontext;
 
@@ -73,25 +60,40 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 	{
 		if (is_setof)
 		{
-			/* First Call setup */
-			if (SRF_IS_FIRSTCALL())
+			/*
+			 * PL/Python returns sets in ValuePerCall mode, so the handler is
+			 * invoked once per result row.  Across those calls we keep the
+			 * iterator and saved arguments in the per-call-site cache
+			 * (pcache->srfstate); a NULL srfstate means this is the first
+			 * call of a new iteration, so we must set up that state now.
+			 */
+			if (pcache->srfstate == NULL)
 			{
-				funcctx = SRF_FIRSTCALL_INIT();
-				srfstate = (PLySRFState *)
-					MemoryContextAllocZero(funcctx->multi_call_memory_ctx,
-										   sizeof(PLySRFState));
-				/* Immediately register cleanup callback */
-				srfstate->callback.func = plpython_srf_cleanup_callback;
-				srfstate->callback.arg = (void *) srfstate;
-				MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
-												   &srfstate->callback);
-				funcctx->user_fctx = (void *) srfstate;
+				if (!rsi || !IsA(rsi, ReturnSetInfo) ||
+					(rsi->allowedModes & SFRM_ValuePerCall) == 0)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("unsupported set function return mode"),
+							 errdetail("PL/Python set-returning functions only support returning one value per call.")));
+				}
+				rsi->returnMode = SFRM_ValuePerCall;
+
+				pcache->srfstate = (PLySRFState *)
+					MemoryContextAllocZero(pcache->fcontext, sizeof(PLySRFState));
+
+				/*
+				 * Register a shutdown callback so that the iterator state is
+				 * released if execution is abandoned before the iterator is
+				 * exhausted.  We'll unregister it again on normal completion.
+				 */
+				RegisterExprContextCallback(rsi->econtext,
+											ShutdownPLyFunction,
+											PointerGetDatum(pcache));
+				pcache->shutdown_reg = true;
 			}
-			/* Every call setup */
-			funcctx = SRF_PERCALL_SETUP();
-			Assert(funcctx != NULL);
-			srfstate = (PLySRFState *) funcctx->user_fctx;
-			Assert(srfstate != NULL);
+
+			srfstate = pcache->srfstate;
 		}
 
 		if (srfstate == NULL || srfstate->iter == NULL)
@@ -128,20 +130,7 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 		{
 			if (srfstate->iter == NULL)
 			{
-				/* first time -- do checks and setup */
-				ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
-
-				if (!rsi || !IsA(rsi, ReturnSetInfo) ||
-					(rsi->allowedModes & SFRM_ValuePerCall) == 0)
-				{
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("unsupported set function return mode"),
-							 errdetail("PL/Python set-returning functions only support returning one value per call.")));
-				}
-				rsi->returnMode = SFRM_ValuePerCall;
-
-				/* Make iterator out of returned object */
+				/* First time -- make iterator out of returned object */
 				srfstate->iter = PyObject_GetIter(plrv);
 
 				Py_DECREF(plrv);
@@ -231,7 +220,23 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 		}
 		else
 		{
-			/* Normal conversion of result */
+			/*
+			 * Normal conversion of result.  However, if the result is of type
+			 * RECORD, we have to set up for that each time through, since it
+			 * might be different from last time.
+			 */
+			if (proc->result.typoid == RECORDOID)
+			{
+				TupleDesc	desc;
+
+				if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("function returning record called in context "
+									"that cannot accept type record")));
+				PLy_output_setup_record(&proc->result, desc, proc);
+			}
+
 			rv = PLy_output_convert(&proc->result, plrv,
 									&fcinfo->isnull);
 		}
@@ -245,21 +250,15 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 		Py_XDECREF(plrv);
 
 		/*
-		 * If there was an error within a SRF, the iterator might not have
-		 * been exhausted yet.  Clear it so the next invocation of the
-		 * function will start the iteration again.  (This code is probably
-		 * unnecessary now; plpython_srf_cleanup_callback should take care of
-		 * cleanup.  But it doesn't hurt anything to do it here.)
+		 * If we are erroring out of a SRF, clean up its state immediately.
+		 * ShutdownPLyFunction will not be called on abort, and the
+		 * memory-context callback only fires when the FmgrInfo's context is
+		 * torn down.  Releasing the Python references promptly avoids leaking
+		 * them if teardown is delayed, and clearing pcache->srfstate ensures
+		 * that if we reuse the pcache we won't mistake this for an iteration
+		 * still in progress.
 		 */
-		if (srfstate)
-		{
-			Py_XDECREF(srfstate->iter);
-			srfstate->iter = NULL;
-			/* And drop any saved args; we won't need them */
-			if (srfstate->savedargs)
-				PLy_function_drop_args(srfstate->savedargs);
-			srfstate->savedargs = NULL;
-		}
+		PLy_function_cleanup_srfstate(pcache);
 
 		PG_RE_THROW();
 	}
@@ -275,23 +274,108 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 
 	if (srfstate)
 	{
-		/* We're in a SRF, exit appropriately */
+		/* We're in a SRF, signal done-or-not via rsi->isDone */
 		if (srfstate->iter == NULL)
 		{
-			/* Iterator exhausted, so we're done */
-			SRF_RETURN_DONE(funcctx);
+			/*
+			 * Iterator exhausted.  Unregister the shutdown callback since
+			 * we're done normally, then clean up srfstate.  (srfstate->iter
+			 * is already NULL here, so the cleanup just frees the struct.)
+			 */
+			if (pcache->shutdown_reg)
+			{
+				UnregisterExprContextCallback(rsi->econtext,
+											  ShutdownPLyFunction,
+											  PointerGetDatum(pcache));
+				pcache->shutdown_reg = false;
+			}
+			PLy_function_cleanup_srfstate(pcache);
+
+			rsi->isDone = ExprEndResult;
+			fcinfo->isnull = true;
+			return (Datum) 0;
 		}
-		else if (fcinfo->isnull)
-			SRF_RETURN_NEXT_NULL(funcctx);
 		else
-			SRF_RETURN_NEXT(funcctx, rv);
+		{
+			rsi->isDone = ExprMultipleResult;
+			return rv;
+		}
 	}
 
 	/* Plain function, just return the Datum value (possibly null) */
 	return rv;
 }
 
-/* trigger subhandler
+/*
+ * ExprContext shutdown callback, invoked when the expression context that
+ * ran a SRF is rescanned or freed at end of query.  This handles in-query
+ * cancellation, e.g. a LIMIT that stops fetching before the iterator is
+ * exhausted, or a rescan of the owning plan node.
+ *
+ * NB: this is not called during an error abort (see comments for
+ * PLy_function_cleanup_srfstate).
+ */
+static void
+ShutdownPLyFunction(Datum arg)
+{
+	PLyProcedureCache *pcache = (PLyProcedureCache *) DatumGetPointer(arg);
+
+	/* execUtils.c will deregister the callback after we return */
+	pcache->shutdown_reg = false;
+
+	PLy_function_cleanup_srfstate(pcache);
+}
+
+/*
+ * Release the Python references held by an in-progress set-returning
+ * function, and free the SRF state.  This is a no-op if there is no active
+ * SRF state, so it's safe to call more than once.
+ *
+ * The Python iterator and the saved argument values own reference counts on
+ * Python objects, which are not released by transaction abort the way SQL
+ * resources are.  We must therefore make sure this runs in every exit path.
+ * There are four ways for a set-returning function to terminate:
+ * 1. Normal completion of the iterator.  Then this is called from
+ *    PLy_exec_function's normal exit path.
+ * 2. Error thrown from within execution of the SRF.  Then this is called
+ *    from PLy_exec_function's PG_CATCH stanza.
+ * 3. Early termination of the calling query, for example due to LIMIT,
+ *    or to a rescan of the calling plan node.  Then this is called via the
+ *    ExprContext shutdown callback ShutdownPLyFunction.
+ * 4. Error thrown from elsewhere in the query.  Then this is called during
+ *    (sub)transaction abort via the memory-context reset callback
+ *    RemovePLyProcedureCache.
+ * (Some code paths hit more than one of these calls, which is why this
+ * must tolerate the cleanup having been done already.)
+ *
+ * This argument presumes that the FmgrInfo the SRF is called from is in a
+ * memory context that will be cleaned up by query abort.  Postgres does use
+ * some longer-lived FmgrInfos, for instance those in relcache and typcache
+ * entries.  But we never call SRFs via those.
+ */
+void
+PLy_function_cleanup_srfstate(PLyProcedureCache *pcache)
+{
+	PLySRFState *srfstate = pcache->srfstate;
+
+	if (srfstate != NULL)
+	{
+		/* Release refcount on the iter, if we still have one */
+		Py_XDECREF(srfstate->iter);
+		srfstate->iter = NULL;
+
+		/* And drop any saved args; we won't need them */
+		if (srfstate->savedargs)
+			PLy_function_drop_args(srfstate->savedargs);
+		srfstate->savedargs = NULL;
+
+		pfree(srfstate);
+		pcache->srfstate = NULL;
+	}
+}
+
+/*
+ * trigger subhandler
  *
  * the python function is expected to return Py_None if the tuple is
  * acceptable and unmodified.  Otherwise it should return a PyUnicode
@@ -334,6 +418,13 @@ PLy_exec_trigger(FunctionCallInfo fcinfo, PLyProcedure *proc)
 							 proc);
 	PLy_output_setup_tuple(&proc->result, rel_descr, proc);
 	PLy_input_setup_tuple(&proc->result_in, rel_descr, proc);
+
+	/*
+	 * If the trigger is called recursively, we must push outer-level
+	 * arguments into the stack.  This must be immediately before the PG_TRY
+	 * to ensure that the corresponding pop happens.
+	 */
+	PLy_global_args_push(proc);
 
 	PG_TRY();
 	{
@@ -397,12 +488,54 @@ PLy_exec_trigger(FunctionCallInfo fcinfo, PLyProcedure *proc)
 	}
 	PG_FINALLY();
 	{
+		PLy_global_args_pop(proc);
 		Py_XDECREF(plargs);
 		Py_XDECREF(plrv);
 	}
 	PG_END_TRY();
 
 	return rv;
+}
+
+/*
+ * event trigger subhandler
+ */
+void
+PLy_exec_event_trigger(FunctionCallInfo fcinfo, PLyProcedure *proc)
+{
+	EventTriggerData *tdata;
+	PyObject   *volatile pltdata = NULL;
+
+	Assert(CALLED_AS_EVENT_TRIGGER(fcinfo));
+	tdata = (EventTriggerData *) fcinfo->context;
+
+	PG_TRY();
+	{
+		PyObject   *pltevent,
+				   *plttag;
+
+		pltdata = PyDict_New();
+		if (!pltdata)
+			PLy_elog(ERROR, NULL);
+
+		pltevent = PLyUnicode_FromString(tdata->event);
+		PyDict_SetItemString(pltdata, "event", pltevent);
+		Py_DECREF(pltevent);
+
+		plttag = PLyUnicode_FromString(GetCommandTagName(tdata->tag));
+		PyDict_SetItemString(pltdata, "tag", plttag);
+		Py_DECREF(plttag);
+
+		PLy_procedure_call(proc, "TD", pltdata);
+
+		if (SPI_finish() != SPI_OK_FINISH)
+			elog(ERROR, "SPI_finish() failed");
+	}
+	PG_FINALLY();
+	{
+		Py_XDECREF(pltdata);
+	}
+	PG_END_TRY();
 }
 
 /* helper functions for Python code execution */
@@ -448,21 +581,6 @@ PLy_function_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc)
 				PLy_elog(ERROR, "PyDict_SetItemString() failed, while setting up arguments");
 			arg = NULL;
 		}
-
-		/* Set up output conversion for functions returning RECORD */
-		if (proc->result.typoid == RECORDOID)
-		{
-			TupleDesc	desc;
-
-			if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("function returning record called in context "
-								"that cannot accept type record")));
-
-			/* cache the output conversion functions */
-			PLy_output_setup_record(&proc->result, desc, proc);
-		}
 	}
 	PG_CATCH();
 	{
@@ -500,6 +618,13 @@ PLy_function_save_args(PLyProcedure *proc)
 	/* Fetch the "args" list */
 	result->args = PyDict_GetItemString(proc->globals, "args");
 	Py_XINCREF(result->args);
+
+	/* If it's a trigger, also save "TD" */
+	if (proc->is_trigger == PLPY_TRIGGER)
+	{
+		result->td = PyDict_GetItemString(proc->globals, "TD");
+		Py_XINCREF(result->td);
+	}
 
 	/* Fetch all the named arguments */
 	if (proc->argnames)
@@ -550,6 +675,13 @@ PLy_function_restore_args(PLyProcedure *proc, PLySavedArgs *savedargs)
 		Py_DECREF(savedargs->args);
 	}
 
+	/* Restore the "TD" object, too */
+	if (savedargs->td)
+	{
+		PyDict_SetItemString(proc->globals, "TD", savedargs->td);
+		Py_DECREF(savedargs->td);
+	}
+
 	/* And free the PLySavedArgs struct */
 	pfree(savedargs);
 }
@@ -568,8 +700,9 @@ PLy_function_drop_args(PLySavedArgs *savedargs)
 		Py_XDECREF(savedargs->namedargs[i]);
 	}
 
-	/* Drop ref to the "args" object, too */
+	/* Drop refs to the "args" and "TD" objects, too */
 	Py_XDECREF(savedargs->args);
+	Py_XDECREF(savedargs->td);
 
 	/* And free the PLySavedArgs struct */
 	pfree(savedargs);
@@ -578,9 +711,9 @@ PLy_function_drop_args(PLySavedArgs *savedargs)
 /*
  * Save away any existing arguments for the given procedure, so that we can
  * install new values for a recursive call.  This should be invoked before
- * doing PLy_function_build_args().
+ * doing PLy_function_build_args() or PLy_trigger_build_args().
  *
- * NB: caller must ensure that PLy_global_args_pop gets invoked once, and
+ * NB: callers must ensure that PLy_global_args_pop gets invoked once, and
  * only once, per successful completion of PLy_global_args_push.  Otherwise
  * we'll end up out-of-sync between the actual call stack and the contents
  * of proc->argstack.
@@ -648,25 +781,6 @@ PLy_global_args_pop(PLyProcedure *proc)
 	}
 }
 
-/*
- * Memory context deletion callback for cleaning up a PLySRFState.
- * We need this in case execution of the SRF is terminated early,
- * due to error or the caller simply not running it to completion.
- */
-static void
-plpython_srf_cleanup_callback(void *arg)
-{
-	PLySRFState *srfstate = (PLySRFState *) arg;
-
-	/* Release refcount on the iter, if we still have one */
-	Py_XDECREF(srfstate->iter);
-	srfstate->iter = NULL;
-	/* And drop any saved args; we won't need them */
-	if (srfstate->savedargs)
-		PLy_function_drop_args(srfstate->savedargs);
-	srfstate->savedargs = NULL;
-}
-
 static void
 plpython_return_error_callback(void *arg)
 {
@@ -689,7 +803,7 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 			   *pltrelid,
 			   *plttablename,
 			   *plttableschema,
-			   *pltargs = NULL,
+			   *pltargs,
 			   *pytnew,
 			   *pytold,
 			   *pltdata;
@@ -712,6 +826,11 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 			Py_DECREF(pltdata);
 			return NULL;
 		}
+	}
+	else
+	{
+		Py_INCREF(Py_None);
+		pltargs = Py_None;
 	}
 
 	PG_TRY();
@@ -856,7 +975,7 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 			PyObject   *pltarg;
 
 			/* pltargs should have been allocated before the PG_TRY block. */
-			Assert(pltargs);
+			Assert(pltargs && pltargs != Py_None);
 
 			for (i = 0; i < tdata->tg_trigger->tgnargs; i++)
 			{
@@ -870,8 +989,7 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 		}
 		else
 		{
-			Py_INCREF(Py_None);
-			pltargs = Py_None;
+			Assert(pltargs == Py_None);
 		}
 		PyDict_SetItemString(pltdata, "args", pltargs);
 		Py_DECREF(pltargs);
@@ -933,9 +1051,9 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 
 		tupdesc = RelationGetDescr(tdata->tg_relation);
 
-		modvalues = (Datum *) palloc0(tupdesc->natts * sizeof(Datum));
-		modnulls = (bool *) palloc0(tupdesc->natts * sizeof(bool));
-		modrepls = (bool *) palloc0(tupdesc->natts * sizeof(bool));
+		modvalues = palloc0_array(Datum, tupdesc->natts);
+		modnulls = palloc0_array(bool, tupdesc->natts);
+		modrepls = palloc0_array(bool, tupdesc->natts);
 
 		for (i = 0; i < nkeys; i++)
 		{
@@ -978,7 +1096,7 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 			Py_INCREF(plval);
 
 			/* We assume proc->result is set up to convert tuples properly */
-			att = &proc->result.u.tuple.atts[attn - 1];
+			att = &proc->result.tuple.atts[attn - 1];
 
 			modvalues[attn - 1] = PLy_output_convert(att,
 													 plval,
@@ -1040,13 +1158,7 @@ PLy_procedure_call(PLyProcedure *proc, const char *kargs, PyObject *vargs)
 
 	PG_TRY();
 	{
-#if PY_VERSION_HEX >= 0x03020000
-		rv = PyEval_EvalCode(proc->code,
-							 proc->globals, proc->globals);
-#else
-		rv = PyEval_EvalCode((PyCodeObject *) proc->code,
-							 proc->globals, proc->globals);
-#endif
+		rv = PyEval_EvalCode(proc->code, proc->globals, proc->globals);
 
 		/*
 		 * Since plpy will only let you close subtransactions that you

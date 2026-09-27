@@ -4,7 +4,7 @@
  *	  fetch tuples from a GIN scan.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -122,10 +122,10 @@ collectMatchBitmap(GinBtreeData *btree, GinBtreeStack *stack,
 				   GinScanEntry scanEntry, Snapshot snapshot)
 {
 	OffsetNumber attnum;
-	Form_pg_attribute attr;
+	CompactAttribute *attr;
 
 	/* Initialize empty bitmap result */
-	scanEntry->matchBitmap = tbm_create(work_mem * 1024L, NULL);
+	scanEntry->matchBitmap = tbm_create(work_mem * (Size) 1024, NULL);
 
 	/* Null query cannot partial-match anything */
 	if (scanEntry->isPartialMatch &&
@@ -134,7 +134,7 @@ collectMatchBitmap(GinBtreeData *btree, GinBtreeStack *stack,
 
 	/* Locate tupdesc entry for key column (for attbyval/attlen data) */
 	attnum = scanEntry->attnum;
-	attr = TupleDescAttr(btree->ginstate->origTupdesc, attnum - 1);
+	attr = TupleDescCompactAttr(btree->ginstate->origTupdesc, attnum - 1);
 
 	/*
 	 * Predicate lock entry leaf page, following pages will be locked by
@@ -332,7 +332,8 @@ restartScanEntry:
 	entry->list = NULL;
 	entry->nlist = 0;
 	entry->matchBitmap = NULL;
-	entry->matchResult = NULL;
+	entry->matchNtuples = -1;
+	entry->matchResult.blockno = InvalidBlockNumber;
 	entry->reduceResult = false;
 	entry->predictNumberResult = 0;
 
@@ -373,7 +374,7 @@ restartScanEntry:
 			if (entry->matchBitmap)
 			{
 				if (entry->matchIterator)
-					tbm_end_iterate(entry->matchIterator);
+					tbm_end_private_iterate(entry->matchIterator);
 				entry->matchIterator = NULL;
 				tbm_free(entry->matchBitmap);
 				entry->matchBitmap = NULL;
@@ -385,7 +386,8 @@ restartScanEntry:
 
 		if (entry->matchBitmap && !tbm_is_empty(entry->matchBitmap))
 		{
-			entry->matchIterator = tbm_begin_iterate(entry->matchBitmap);
+			entry->matchIterator =
+				tbm_begin_private_iterate(entry->matchBitmap);
 			entry->isFinished = false;
 		}
 	}
@@ -487,7 +489,7 @@ restartScanEntry:
 static int
 entryIndexByFrequencyCmp(const void *a1, const void *a2, void *arg)
 {
-	const GinScanKey key = (const GinScanKey) arg;
+	const GinScanKeyData *key = arg;
 	int			i1 = *(const int *) a1;
 	int			i2 = *(const int *) a2;
 	uint32		n1 = key->scanEntry[i1]->predictNumberResult;
@@ -505,8 +507,6 @@ static void
 startScanKey(GinState *ginstate, GinScanOpaque so, GinScanKey key)
 {
 	MemoryContext oldCtx = CurrentMemoryContext;
-	int			i;
-	int			j;
 	int		   *entryIndexes;
 
 	ItemPointerSetMin(&key->curItem);
@@ -542,30 +542,35 @@ startScanKey(GinState *ginstate, GinScanOpaque so, GinScanKey key)
 
 		key->nrequired = 0;
 		key->nadditional = key->nentries;
-		key->additionalEntries = palloc(key->nadditional * sizeof(GinScanEntry));
-		for (i = 0; i < key->nadditional; i++)
+		key->additionalEntries = palloc_array(GinScanEntry, key->nadditional);
+		for (int i = 0; i < key->nadditional; i++)
 			key->additionalEntries[i] = key->scanEntry[i];
 	}
 	else if (key->nentries > 1)
 	{
+		uint32		i;
+		int			j;
+
 		MemoryContextSwitchTo(so->tempCtx);
 
-		entryIndexes = (int *) palloc(sizeof(int) * key->nentries);
+		entryIndexes = palloc_array(int, key->nentries);
 		for (i = 0; i < key->nentries; i++)
 			entryIndexes[i] = i;
 		qsort_arg(entryIndexes, key->nentries, sizeof(int),
 				  entryIndexByFrequencyCmp, key);
 
+		for (i = 1; i < key->nentries; i++)
+			key->entryRes[entryIndexes[i]] = GIN_MAYBE;
 		for (i = 0; i < key->nentries - 1; i++)
 		{
 			/* Pass all entries <= i as FALSE, and the rest as MAYBE */
-			for (j = 0; j <= i; j++)
-				key->entryRes[entryIndexes[j]] = GIN_FALSE;
-			for (j = i + 1; j < key->nentries; j++)
-				key->entryRes[entryIndexes[j]] = GIN_MAYBE;
+			key->entryRes[entryIndexes[i]] = GIN_FALSE;
 
 			if (key->triConsistentFn(key) == GIN_FALSE)
 				break;
+
+			/* Make this loop interruptible in case there are many keys */
+			CHECK_FOR_INTERRUPTS();
 		}
 		/* i is now the last required entry. */
 
@@ -573,14 +578,14 @@ startScanKey(GinState *ginstate, GinScanOpaque so, GinScanKey key)
 
 		key->nrequired = i + 1;
 		key->nadditional = key->nentries - key->nrequired;
-		key->requiredEntries = palloc(key->nrequired * sizeof(GinScanEntry));
-		key->additionalEntries = palloc(key->nadditional * sizeof(GinScanEntry));
+		key->requiredEntries = palloc_array(GinScanEntry, key->nrequired);
+		key->additionalEntries = palloc_array(GinScanEntry, key->nadditional);
 
 		j = 0;
-		for (i = 0; i < key->nrequired; i++)
-			key->requiredEntries[i] = key->scanEntry[entryIndexes[j++]];
-		for (i = 0; i < key->nadditional; i++)
-			key->additionalEntries[i] = key->scanEntry[entryIndexes[j++]];
+		for (int k = 0; k < key->nrequired; k++)
+			key->requiredEntries[k] = key->scanEntry[entryIndexes[j++]];
+		for (int k = 0; k < key->nadditional; k++)
+			key->additionalEntries[k] = key->scanEntry[entryIndexes[j++]];
 
 		/* clean up after consistentFn calls (also frees entryIndexes) */
 		MemoryContextReset(so->tempCtx);
@@ -591,7 +596,7 @@ startScanKey(GinState *ginstate, GinScanOpaque so, GinScanKey key)
 
 		key->nrequired = 1;
 		key->nadditional = 0;
-		key->requiredEntries = palloc(1 * sizeof(GinScanEntry));
+		key->requiredEntries = palloc_array(GinScanEntry, 1);
 		key->requiredEntries[0] = key->scanEntry[0];
 	}
 	MemoryContextSwitchTo(oldCtx);
@@ -823,29 +828,35 @@ entryGetItem(GinState *ginstate, GinScanEntry entry,
 		{
 			/*
 			 * If we've exhausted all items on this block, move to next block
-			 * in the bitmap.
+			 * in the bitmap. tbm_private_iterate() sets matchResult.blockno
+			 * to InvalidBlockNumber when the bitmap is exhausted.
 			 */
-			while (entry->matchResult == NULL ||
-				   (entry->matchResult->ntuples >= 0 &&
-					entry->offset >= entry->matchResult->ntuples) ||
-				   entry->matchResult->blockno < advancePastBlk ||
+			while ((!BlockNumberIsValid(entry->matchResult.blockno)) ||
+				   (!entry->matchResult.lossy &&
+					entry->offset >= entry->matchNtuples) ||
+				   entry->matchResult.blockno < advancePastBlk ||
 				   (ItemPointerIsLossyPage(&advancePast) &&
-					entry->matchResult->blockno == advancePastBlk))
+					entry->matchResult.blockno == advancePastBlk))
 			{
-				entry->matchResult = tbm_iterate(entry->matchIterator);
-
-				if (entry->matchResult == NULL)
+				if (!tbm_private_iterate(entry->matchIterator, &entry->matchResult))
 				{
+					Assert(!BlockNumberIsValid(entry->matchResult.blockno));
 					ItemPointerSetInvalid(&entry->curItem);
-					tbm_end_iterate(entry->matchIterator);
+					tbm_end_private_iterate(entry->matchIterator);
 					entry->matchIterator = NULL;
 					entry->isFinished = true;
 					break;
 				}
 
+				/* Exact pages need their tuple offsets extracted. */
+				if (!entry->matchResult.lossy)
+					entry->matchNtuples = tbm_extract_page_tuple(&entry->matchResult,
+																 entry->matchOffsets,
+																 TBM_MAX_TUPLES_PER_PAGE);
+
 				/*
 				 * Reset counter to the beginning of entry->matchResult. Note:
-				 * entry->offset is still greater than matchResult->ntuples if
+				 * entry->offset is still greater than matchResult.ntuples if
 				 * matchResult is lossy.  So, on next call we will get next
 				 * result from TIDBitmap.
 				 */
@@ -858,10 +869,10 @@ entryGetItem(GinState *ginstate, GinScanEntry entry,
 			 * We're now on the first page after advancePast which has any
 			 * items on it. If it's a lossy result, return that.
 			 */
-			if (entry->matchResult->ntuples < 0)
+			if (entry->matchResult.lossy)
 			{
 				ItemPointerSetLossyPage(&entry->curItem,
-										entry->matchResult->blockno);
+										entry->matchResult.blockno);
 
 				/*
 				 * We might as well fall out of the loop; we could not
@@ -872,30 +883,35 @@ entryGetItem(GinState *ginstate, GinScanEntry entry,
 			}
 
 			/*
-			 * Not a lossy page. Skip over any offsets <= advancePast, and
-			 * return that.
+			 * Not a lossy page. If tuple offsets were extracted,
+			 * entry->matchNtuples must be > -1
 			 */
-			if (entry->matchResult->blockno == advancePastBlk)
+			Assert(entry->matchNtuples > -1);
+
+			/* Skip over any offsets <= advancePast, and return that. */
+			if (entry->matchResult.blockno == advancePastBlk)
 			{
+				Assert(entry->matchNtuples > 0);
+
 				/*
 				 * First, do a quick check against the last offset on the
 				 * page. If that's > advancePast, so are all the other
 				 * offsets, so just go back to the top to get the next page.
 				 */
-				if (entry->matchResult->offsets[entry->matchResult->ntuples - 1] <= advancePastOff)
+				if (entry->matchOffsets[entry->matchNtuples - 1] <= advancePastOff)
 				{
-					entry->offset = entry->matchResult->ntuples;
+					entry->offset = entry->matchNtuples;
 					continue;
 				}
 
 				/* Otherwise scan to find the first item > advancePast */
-				while (entry->matchResult->offsets[entry->offset] <= advancePastOff)
+				while (entry->matchOffsets[entry->offset] <= advancePastOff)
 					entry->offset++;
 			}
 
 			ItemPointerSet(&entry->curItem,
-						   entry->matchResult->blockno,
-						   entry->matchResult->offsets[entry->offset]);
+						   entry->matchResult.blockno,
+						   entry->matchOffsets[entry->offset]);
 			entry->offset++;
 
 			/* Done unless we need to reduce the result */
@@ -992,7 +1008,6 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
 {
 	ItemPointerData minItem;
 	ItemPointerData curPageLossy;
-	uint32		i;
 	bool		haveLossyEntry;
 	GinScanEntry entry;
 	GinTernaryValue res;
@@ -1019,7 +1034,7 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
 	 */
 	ItemPointerSetMax(&minItem);
 	allFinished = true;
-	for (i = 0; i < key->nrequired; i++)
+	for (int i = 0; i < key->nrequired; i++)
 	{
 		entry = key->requiredEntries[i];
 
@@ -1101,7 +1116,7 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
 	 * decide with partial information, that could be a big loss. So, load all
 	 * the additional entries, before calling the consistent function.
 	 */
-	for (i = 0; i < key->nadditional; i++)
+	for (int i = 0; i < key->nadditional; i++)
 	{
 		entry = key->additionalEntries[i];
 
@@ -1161,7 +1176,7 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
 	ItemPointerSetLossyPage(&curPageLossy,
 							GinItemPointerGetBlockNumber(&key->curItem));
 	haveLossyEntry = false;
-	for (i = 0; i < key->nentries; i++)
+	for (uint32 i = 0; i < key->nentries; i++)
 	{
 		entry = key->scanEntry[i];
 		if (entry->isFinished == false &&
@@ -1209,7 +1224,7 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
 	 *
 	 * Prepare entryRes array to be passed to consistentFn.
 	 */
-	for (i = 0; i < key->nentries; i++)
+	for (uint32 i = 0; i < key->nentries; i++)
 	{
 		entry = key->scanEntry[i];
 		if (entry->isFinished)
@@ -1312,6 +1327,8 @@ scanGetItem(IndexScanDesc scan, ItemPointerData advancePast,
 	 */
 	do
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		ItemPointerSetMin(item);
 		match = true;
 		for (i = 0; i < so->nkeys && match; i++)
@@ -1608,13 +1625,11 @@ collectMatchesForHeapRow(IndexScanDesc scan, pendingPosition *pos)
 	OffsetNumber attrnum;
 	Page		page;
 	IndexTuple	itup;
-	int			i,
-				j;
 
 	/*
 	 * Reset all entryRes and hasMatchKey flags
 	 */
-	for (i = 0; i < so->nkeys; i++)
+	for (uint32 i = 0; i < so->nkeys; i++)
 	{
 		GinScanKey	key = so->keys + i;
 
@@ -1638,11 +1653,11 @@ collectMatchesForHeapRow(IndexScanDesc scan, pendingPosition *pos)
 
 		page = BufferGetPage(pos->pendingBuffer);
 
-		for (i = 0; i < so->nkeys; i++)
+		for (uint32 i = 0; i < so->nkeys; i++)
 		{
 			GinScanKey	key = so->keys + i;
 
-			for (j = 0; j < key->nentries; j++)
+			for (uint32 j = 0; j < key->nentries; j++)
 			{
 				GinScanEntry entry = key->scanEntry[j];
 				OffsetNumber StopLow = pos->firstOffset,
@@ -1804,7 +1819,7 @@ collectMatchesForHeapRow(IndexScanDesc scan, pendingPosition *pos)
 	 * GIN_CAT_EMPTY_QUERY scanEntry always matches.  So return "true" if all
 	 * non-excludeOnly scan keys have at least one match.
 	 */
-	for (i = 0; i < so->nkeys; i++)
+	for (uint32 i = 0; i < so->nkeys; i++)
 	{
 		if (pos->hasMatchKey[i] == false && !so->keys[i].excludeOnly)
 			return false;
@@ -1823,7 +1838,6 @@ scanPendingInsert(IndexScanDesc scan, TIDBitmap *tbm, int64 *ntids)
 	MemoryContext oldCtx;
 	bool		recheck,
 				match;
-	int			i;
 	pendingPosition pos;
 	Buffer		metabuffer = ReadBuffer(scan->indexRelation, GIN_METAPAGE_BLKNO);
 	Page		page;
@@ -1856,7 +1870,7 @@ scanPendingInsert(IndexScanDesc scan, TIDBitmap *tbm, int64 *ntids)
 	LockBuffer(pos.pendingBuffer, GIN_SHARE);
 	pos.firstOffset = FirstOffsetNumber;
 	UnlockReleaseBuffer(metabuffer);
-	pos.hasMatchKey = palloc(sizeof(bool) * so->nkeys);
+	pos.hasMatchKey = palloc_array(bool, so->nkeys);
 
 	/*
 	 * loop for each heap row. scanGetCandidate returns full row or row's
@@ -1882,7 +1896,7 @@ scanPendingInsert(IndexScanDesc scan, TIDBitmap *tbm, int64 *ntids)
 		recheck = false;
 		match = true;
 
-		for (i = 0; i < so->nkeys; i++)
+		for (uint32 i = 0; i < so->nkeys; i++)
 		{
 			GinScanKey	key = so->keys + i;
 
@@ -1951,8 +1965,6 @@ gingetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 	for (;;)
 	{
-		CHECK_FOR_INTERRUPTS();
-
 		if (!scanGetItem(scan, iptr, &iptr, &recheck))
 			break;
 

@@ -3,7 +3,7 @@
  * partdesc.c
  *		Support routines for manipulating partition descriptors
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,8 +21,6 @@
 #include "catalog/pg_inherits.h"
 #include "partitioning/partbounds.h"
 #include "partitioning/partdesc.h"
-#include "storage/bufmgr.h"
-#include "storage/sinval.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
@@ -31,6 +29,7 @@
 #include "utils/memutils.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 typedef struct PartitionDirectoryData
@@ -38,7 +37,7 @@ typedef struct PartitionDirectoryData
 	MemoryContext pdir_mcxt;
 	HTAB	   *pdir_hash;
 	bool		omit_detached;
-}			PartitionDirectoryData;
+} PartitionDirectoryData;
 
 typedef struct PartitionDirectoryEntry
 {
@@ -146,16 +145,19 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 	ListCell   *cell;
 	int			i,
 				nparts;
-	PartitionKey key = RelationGetPartitionKey(rel);
+	bool		retried = false;
+	PartitionKey partkey = RelationGetPartitionKey(rel);
 	MemoryContext new_pdcxt;
 	MemoryContext oldcxt;
 	int		   *mapping;
 
+retry:
+
 	/*
 	 * Get partition oids from pg_inherits.  This uses a single snapshot to
 	 * fetch the list of children, so while more children may be getting added
-	 * concurrently, whatever this function returns will be accurate as of
-	 * some well-defined point in time.
+	 * or removed concurrently, whatever this function returns will be
+	 * accurate as of some well-defined point in time.
 	 */
 	detached_exist = false;
 	detached_xmin = InvalidTransactionId;
@@ -169,9 +171,9 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 	/* Allocate working arrays for OIDs, leaf flags, and boundspecs. */
 	if (nparts > 0)
 	{
-		oids = (Oid *) palloc(nparts * sizeof(Oid));
-		is_leaf = (bool *) palloc(nparts * sizeof(bool));
-		boundspecs = palloc(nparts * sizeof(PartitionBoundSpec *));
+		oids = palloc_array(Oid, nparts);
+		is_leaf = palloc_array(bool, nparts);
+		boundspecs = palloc_array(PartitionBoundSpec *, nparts);
 	}
 
 	/* Collect bound spec nodes for each partition. */
@@ -198,41 +200,79 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 		}
 
 		/*
-		 * The system cache may be out of date; if so, we may find no pg_class
-		 * tuple or an old one where relpartbound is NULL.  In that case, try
-		 * the table directly.  We can't just AcceptInvalidationMessages() and
-		 * retry the system cache lookup because it's possible that a
-		 * concurrent ATTACH PARTITION operation has removed itself from the
-		 * ProcArray but not yet added invalidation messages to the shared
-		 * queue; InvalidateSystemCaches() would work, but seems excessive.
+		 * Two problems are possible here.  First, a concurrent ATTACH
+		 * PARTITION might be in the process of adding a new partition, but
+		 * the syscache doesn't have it, or its copy of it does not yet have
+		 * its relpartbound set.  We cannot just AcceptInvalidationMessages(),
+		 * because the other process might have already removed itself from
+		 * the ProcArray but not yet added its invalidation messages to the
+		 * shared queue.  We solve this problem by reading pg_class directly
+		 * for the desired tuple.
 		 *
-		 * Note that this algorithm assumes that PartitionBoundSpec we manage
-		 * to fetch is the right one -- so this is only good enough for
-		 * concurrent ATTACH PARTITION, not concurrent DETACH PARTITION or
-		 * some hypothetical operation that changes the partition bounds.
+		 * If the partition recently detached is also dropped, we get no tuple
+		 * from the scan.  In that case, we also retry, and next time through
+		 * here, we don't see that partition anymore.
+		 *
+		 * The other problem is that DETACH CONCURRENTLY is in the process of
+		 * removing a partition, which happens in two steps: first it marks it
+		 * as "detach pending", commits, then unsets relpartbound.  If
+		 * find_inheritance_children_extended included that partition but we
+		 * below we see that DETACH CONCURRENTLY has reset relpartbound for
+		 * it, we'd see an inconsistent view.  (The inconsistency is seen
+		 * because table_open below reads invalidation messages.)  We protect
+		 * against this by retrying find_inheritance_children_extended().
 		 */
 		if (boundspec == NULL)
 		{
 			Relation	pg_class;
 			SysScanDesc scan;
-			ScanKeyData key[1];
-			Datum		datum;
-			bool		isnull;
+			ScanKeyData skey[1];
 
 			pg_class = table_open(RelationRelationId, AccessShareLock);
-			ScanKeyInit(&key[0],
+			ScanKeyInit(&skey[0],
 						Anum_pg_class_oid,
 						BTEqualStrategyNumber, F_OIDEQ,
 						ObjectIdGetDatum(inhrelid));
 			scan = systable_beginscan(pg_class, ClassOidIndexId, true,
-									  NULL, 1, key);
+									  NULL, 1, skey);
+
+			/*
+			 * We could get one tuple from the scan (the normal case), or zero
+			 * tuples if the table has been dropped meanwhile.
+			 */
 			tuple = systable_getnext(scan);
-			datum = heap_getattr(tuple, Anum_pg_class_relpartbound,
-								 RelationGetDescr(pg_class), &isnull);
-			if (!isnull)
-				boundspec = stringToNode(TextDatumGetCString(datum));
+			if (HeapTupleIsValid(tuple))
+			{
+				Datum		datum;
+				bool		isnull;
+
+				datum = heap_getattr(tuple, Anum_pg_class_relpartbound,
+									 RelationGetDescr(pg_class), &isnull);
+				if (!isnull)
+					boundspec = stringToNode(TextDatumGetCString(datum));
+			}
 			systable_endscan(scan);
 			table_close(pg_class, AccessShareLock);
+
+			/*
+			 * If we still don't get a relpartbound value (either because
+			 * boundspec is null or because there was no tuple), then it must
+			 * be because of DETACH CONCURRENTLY.  Restart from the top, as
+			 * explained above.  We only do this once, for two reasons: first,
+			 * only one DETACH CONCURRENTLY session could affect us at a time,
+			 * since each of them would have to wait for the snapshot under
+			 * which this is running; and second, to avoid possible infinite
+			 * loops in case of catalog corruption.
+			 *
+			 * Note that the current memory context is short-lived enough, so
+			 * we needn't worry about memory leaks here.
+			 */
+			if (!boundspec && !retried)
+			{
+				AcceptInvalidationMessages();
+				retried = true;
+				goto retry;
+			}
 		}
 
 		/* Sanity checks. */
@@ -268,7 +308,7 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 	 * This could fail, but we haven't done any damage if so.
 	 */
 	if (nparts > 0)
-		boundinfo = partition_bounds_create(boundspecs, nparts, key, &mapping);
+		boundinfo = partition_bounds_create(boundspecs, nparts, partkey, &mapping);
 
 	/*
 	 * Now build the actual relcache partition descriptor, copying all the
@@ -289,15 +329,14 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 	if (nparts > 0)
 	{
 		oldcxt = MemoryContextSwitchTo(new_pdcxt);
-		partdesc->boundinfo = partition_bounds_copy(boundinfo, key);
+		partdesc->boundinfo = partition_bounds_copy(boundinfo, partkey);
 
 		/* Initialize caching fields for speeding up ExecFindPartition */
 		partdesc->last_found_datum_index = -1;
-		partdesc->last_found_part_index = -1;
 		partdesc->last_found_count = 0;
 
-		partdesc->oids = (Oid *) palloc(nparts * sizeof(Oid));
-		partdesc->is_leaf = (bool *) palloc(nparts * sizeof(bool));
+		partdesc->oids = palloc_array(Oid, nparts);
+		partdesc->is_leaf = palloc_array(bool, nparts);
 
 		/*
 		 * Assign OIDs from the original array into mapped indexes of the
@@ -386,7 +425,7 @@ CreatePartitionDirectory(MemoryContext mcxt, bool omit_detached)
 	PartitionDirectory pdir;
 	HASHCTL		ctl;
 
-	pdir = palloc(sizeof(PartitionDirectoryData));
+	pdir = palloc_object(PartitionDirectoryData);
 	pdir->pdir_mcxt = mcxt;
 
 	ctl.keysize = sizeof(Oid);

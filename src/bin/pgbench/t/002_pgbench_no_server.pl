@@ -1,12 +1,12 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 #
 # pgbench tests which do not need a server
 #
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -50,7 +50,7 @@ sub pgbench_scripts
 			# cleanup from prior runs
 			unlink $filename;
 			append_to_file($filename, $$files{$fn});
-			push @cmd, '-f', $filename;
+			push @cmd, '--file' => $filename;
 		}
 	}
 	command_checks_all(\@cmd, $stat, $out, $err, $name);
@@ -66,7 +66,7 @@ my @options = (
 	# name, options, stderr checks
 	[
 		'bad option',
-		'-h home -p 5432 -U calvin -d --bad-option',
+		'-h home -p 5432 -U calvin ---debug --bad-option',
 		[qr{--help.*more information}]
 	],
 	[
@@ -92,7 +92,7 @@ my @options = (
 	[ 'too many scripts', '-S ' x 129, [qr{at most 128 SQL scripts}] ],
 	[
 		'bad #clients', '-c three',
-		[qr{invalid value "three" for option -c/--clients}]
+		[qr{invalid value "three" for option -c/--client}]
 	],
 	[
 		'bad #threads', '-j eleven',
@@ -233,21 +233,9 @@ for my $o (@options)
 		'pgbench option error: ' . $name);
 }
 
-# Help
-pgbench(
-	'--help', 0,
-	[
-		qr{benchmarking tool for PostgreSQL},
-		qr{Usage},
-		qr{Initialization options:},
-		qr{Common options:},
-		qr{Report bugs to}
-	],
-	[qr{^$}],
-	'pgbench help');
-
-# Version
-pgbench('-V', 0, [qr{^pgbench .PostgreSQL. }], [qr{^$}], 'pgbench version');
+program_help_ok('pgbench');
+program_version_ok('pgbench');
+program_options_handling_ok('pgbench');
 
 # list of builtins
 pgbench(

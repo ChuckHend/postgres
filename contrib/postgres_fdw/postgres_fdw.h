@@ -3,7 +3,7 @@
  * postgres_fdw.h
  *		  Foreign-data wrapper for remote PostgreSQL servers
  *
- * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/postgres_fdw.h
@@ -15,7 +15,7 @@
 
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
-#include "libpq-fe.h"
+#include "libpq/libpq-be-fe.h"
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "utils/relcache.h"
@@ -62,6 +62,7 @@ typedef struct PgFdwRelationInfo
 	/* Estimated size and cost for a scan, join, or grouping/aggregation. */
 	double		rows;
 	int			width;
+	int			disabled_nodes;
 	Cost		startup_cost;
 	Cost		total_cost;
 
@@ -105,6 +106,16 @@ typedef struct PgFdwRelationInfo
 	/* joinclauses contains only JOIN/ON conditions for an outer join */
 	List	   *joinclauses;	/* List of RestrictInfo */
 
+	/*
+	 * If a FUNCTION RTE was absorbed into this join, these point at the stub
+	 * PgFdwRelationInfo for the function side (paired with the
+	 * outerrel/innerrel), so the cost estimator and deparser can find it
+	 * without consulting the function rel's fdw_private.  At most one of
+	 * outer_func_fpinfo/inner_func_fpinfo is set.
+	 */
+	struct PgFdwRelationInfo *outer_func_fpinfo;
+	struct PgFdwRelationInfo *inner_func_fpinfo;
+
 	/* Upper relation information */
 	UpperRelationKind stage;
 
@@ -118,6 +129,10 @@ typedef struct PgFdwRelationInfo
 										 * subquery? */
 	Relids		lower_subquery_rels;	/* all relids appearing in lower
 										 * subqueries */
+	Relids		hidden_subquery_rels;	/* relids, which can't be referred to
+										 * from upper relations, used
+										 * internally for equivalence member
+										 * search */
 
 	/*
 	 * Index of the relation.  It is used to create an alias to a subquery
@@ -143,7 +158,7 @@ typedef enum PgFdwSamplingMethod
 	ANALYZE_SAMPLE_AUTO,		/* choose by server version */
 	ANALYZE_SAMPLE_RANDOM,		/* remote random() */
 	ANALYZE_SAMPLE_SYSTEM,		/* TABLESAMPLE system */
-	ANALYZE_SAMPLE_BERNOULLI	/* TABLESAMPLE bernoulli */
+	ANALYZE_SAMPLE_BERNOULLI,	/* TABLESAMPLE bernoulli */
 } PgFdwSamplingMethod;
 
 /* in postgres_fdw.c */
@@ -158,11 +173,13 @@ extern void ReleaseConnection(PGconn *conn);
 extern unsigned int GetCursorNumber(PGconn *conn);
 extern unsigned int GetPrepStmtNumber(PGconn *conn);
 extern void do_sql_command(PGconn *conn, const char *sql);
-extern PGresult *pgfdw_get_result(PGconn *conn, const char *query);
+extern PGresult *pgfdw_get_result(PGconn *conn);
 extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query,
 								  PgFdwConnState *state);
-extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
-							   bool clear, const char *sql);
+pg_noreturn extern void pgfdw_report_error(PGresult *res, PGconn *conn,
+										   const char *sql);
+extern void pgfdw_report(int elevel, PGresult *res, PGconn *conn,
+						 const char *sql);
 
 /* in option.c */
 extern int	ExtractConnectionOptions(List *defelems,
@@ -176,11 +193,13 @@ extern char *pgfdw_application_name;
 /* in deparse.c */
 extern void classifyConditions(PlannerInfo *root,
 							   RelOptInfo *baserel,
+							   PgFdwRelationInfo *fpinfo,
 							   List *input_conds,
 							   List **remote_conds,
 							   List **local_conds);
 extern bool is_foreign_expr(PlannerInfo *root,
 							RelOptInfo *baserel,
+							PgFdwRelationInfo *fpinfo,
 							Expr *expr);
 extern bool is_foreign_param(PlannerInfo *root,
 							 RelOptInfo *baserel,

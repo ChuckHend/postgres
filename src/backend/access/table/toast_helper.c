@@ -4,7 +4,7 @@
  *	  Helper functions for table AMs implementing compressed or
  *    out-of-line storage of varlena attributes.
  *
- * Copyright (c) 2000-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/access/table/toast_helper.c
@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
-#include "access/table.h"
 #include "access/toast_helper.h"
 #include "access/toast_internals.h"
 #include "catalog/pg_type_d.h"
@@ -50,8 +49,8 @@ toast_tuple_init(ToastTupleContext *ttc)
 	for (i = 0; i < numAttrs; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
-		struct varlena *old_value;
-		struct varlena *new_value;
+		varlena    *old_value;
+		varlena    *new_value;
 
 		ttc->ttc_attr[i].tai_colflags = 0;
 		ttc->ttc_attr[i].tai_oldexternal = NULL;
@@ -63,20 +62,24 @@ toast_tuple_init(ToastTupleContext *ttc)
 			 * For UPDATE get the old and new values of this attribute
 			 */
 			old_value =
-				(struct varlena *) DatumGetPointer(ttc->ttc_oldvalues[i]);
+				(varlena *) DatumGetPointer(ttc->ttc_oldvalues[i]);
 			new_value =
-				(struct varlena *) DatumGetPointer(ttc->ttc_values[i]);
+				(varlena *) DatumGetPointer(ttc->ttc_values[i]);
 
 			/*
 			 * If the old value is stored on disk, check if it has changed so
 			 * we have to delete it later.
+			 *
+			 * Note that TOAST pointers could have different vartags, for oid
+			 * or oid8, and these can have different sizes.
 			 */
 			if (att->attlen == -1 && !ttc->ttc_oldisnull[i] &&
 				VARATT_IS_EXTERNAL_ONDISK(old_value))
 			{
 				if (ttc->ttc_isnull[i] ||
 					!VARATT_IS_EXTERNAL_ONDISK(new_value) ||
-					memcmp((char *) old_value, (char *) new_value,
+					VARTAG_EXTERNAL(old_value) != VARTAG_EXTERNAL(new_value) ||
+					memcmp(old_value, new_value,
 						   VARSIZE_EXTERNAL(old_value)) != 0)
 				{
 					/*
@@ -103,7 +106,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 			/*
 			 * For INSERT simply get the new value
 			 */
-			new_value = (struct varlena *) DatumGetPointer(ttc->ttc_values[i]);
+			new_value = (varlena *) DatumGetPointer(ttc->ttc_values[i]);
 		}
 
 		/*
@@ -172,8 +175,9 @@ toast_tuple_init(ToastTupleContext *ttc)
  * The column must have attstorage EXTERNAL or EXTENDED if check_main is
  * false, and must have attstorage MAIN if check_main is true.
  *
- * The column must have a minimum size of MAXALIGN(TOAST_POINTER_SIZE);
- * if not, no benefit is to be expected by compressing it.
+ * The column must be larger than the TOAST pointer that would replace it;
+ * if not, no benefit is to be expected by compressing it.  Note that this
+ * choice depends on the TOAST value type, oid or oid8.
  *
  * The return value is the index of the biggest suitable column, or
  * -1 if there is none.
@@ -185,9 +189,20 @@ toast_tuple_find_biggest_attribute(ToastTupleContext *ttc,
 	TupleDesc	tupleDesc = ttc->ttc_rel->rd_att;
 	int			numAttrs = tupleDesc->natts;
 	int			biggest_attno = -1;
-	int32		biggest_size = MAXALIGN(TOAST_POINTER_SIZE);
+	int32		biggest_size;
 	int32		skip_colflags = TOASTCOL_IGNORE;
 	int			i;
+
+	/*
+	 * Size of the TOAST pointer this relation would use.  A relation without
+	 * a TOAST table cannot have any of its attributes moved out-of-line, but
+	 * it can still have some of them compressed.  Fall back to the oid size
+	 * in that case.
+	 */
+	if (RelationGetToastChunkIdType(ttc->ttc_rel) == OID8OID)
+		biggest_size = MAXALIGN(TOAST_OID8_POINTER_SIZE);
+	else
+		biggest_size = MAXALIGN(TOAST_OID_POINTER_SIZE);
 
 	if (for_compression)
 		skip_colflags |= TOASTCOL_INCOMPRESSIBLE;
@@ -254,7 +269,7 @@ toast_tuple_try_compression(ToastTupleContext *ttc, int attribute)
  * Move an attribute to external storage.
  */
 void
-toast_tuple_externalize(ToastTupleContext *ttc, int attribute, int options)
+toast_tuple_externalize(ToastTupleContext *ttc, int attribute, uint32 options)
 {
 	Datum	   *value = &ttc->ttc_values[attribute];
 	Datum		old_value = *value;
@@ -316,7 +331,7 @@ toast_tuple_cleanup(ToastTupleContext *ttc)
  * relation.
  */
 void
-toast_delete_external(Relation rel, Datum *values, bool *isnull,
+toast_delete_external(Relation rel, const Datum *values, const bool *isnull,
 					  bool is_speculative)
 {
 	TupleDesc	tupleDesc = rel->rd_att;
@@ -325,13 +340,13 @@ toast_delete_external(Relation rel, Datum *values, bool *isnull,
 
 	for (i = 0; i < numAttrs; i++)
 	{
-		if (TupleDescAttr(tupleDesc, i)->attlen == -1)
+		if (TupleDescCompactAttr(tupleDesc, i)->attlen == -1)
 		{
 			Datum		value = values[i];
 
 			if (isnull[i])
 				continue;
-			else if (VARATT_IS_EXTERNAL_ONDISK(value))
+			else if (VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)))
 				toast_delete_datum(rel, value, is_speculative);
 		}
 	}

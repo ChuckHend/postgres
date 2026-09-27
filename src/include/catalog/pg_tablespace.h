@@ -4,7 +4,7 @@
  *	  definition of the "tablespace" system catalog (pg_tablespace)
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_tablespace.h
@@ -19,13 +19,15 @@
 #define PG_TABLESPACE_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_tablespace_d.h"
+#include "catalog/pg_tablespace_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_tablespace definition.  cpp turns this into
  *		typedef struct FormData_pg_tablespace
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_tablespace,1213,TableSpaceRelationId) BKI_SHARED_RELATION
 {
 	Oid			oid;			/* oid */
@@ -35,10 +37,12 @@ CATALOG(pg_tablespace,1213,TableSpaceRelationId) BKI_SHARED_RELATION
 	Oid			spcowner BKI_DEFAULT(POSTGRES) BKI_LOOKUP(pg_authid);
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
-	aclitem		spcacl[1];		/* access permissions */
-	text		spcoptions[1];	/* per-tablespace options */
+	aclitem		spcacl[];		/* access permissions */
+	text		spcoptions[];	/* per-tablespace options */
 #endif
 } FormData_pg_tablespace;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_tablespace corresponds to a pointer to a tuple with
@@ -51,5 +55,9 @@ DECLARE_TOAST_WITH_MACRO(pg_tablespace, 4185, 4186, PgTablespaceToastTable, PgTa
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_tablespace_oid_index, 2697, TablespaceOidIndexId, pg_tablespace, btree(oid oid_ops));
 DECLARE_UNIQUE_INDEX(pg_tablespace_spcname_index, 2698, TablespaceNameIndexId, pg_tablespace, btree(spcname name_ops));
+
+MAKE_SYSCACHE(TABLESPACEOID, pg_tablespace_oid_index, 4);
+
+extern char *get_tablespace_location(Oid tablespaceOid);
 
 #endif							/* PG_TABLESPACE_H */

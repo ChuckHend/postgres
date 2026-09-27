@@ -1,9 +1,9 @@
-# Copyright (c) 2023, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 
 # Test worker_spi module.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -63,11 +63,14 @@ $node->safe_psql('postgres', q(CREATE ROLE myrole SUPERUSER LOGIN;));
 $node->safe_psql('mydb', 'CREATE EXTENSION worker_spi;');
 
 # Now load the module as a shared library.
+# Update max_worker_processes to make room for enough bgworkers, including
+# parallel workers these may spawn.
 $node->append_conf(
 	'postgresql.conf', q{
 shared_preload_libraries = 'worker_spi'
 worker_spi.database = 'mydb'
 worker_spi.total_workers = 3
+max_worker_processes = 32
 });
 $node->restart;
 
@@ -103,5 +106,62 @@ ok( $node->poll_query_until(
 postgres|myrole|WorkerSpiMain]),
 	'dynamic bgworkers all launched'
 ) or die "Timed out while waiting for dynamic bgworkers to be launched";
+
+# Check BGWORKER_BYPASS_ALLOWCONN.
+$node->safe_psql('postgres',
+	q(CREATE DATABASE noconndb ALLOW_CONNECTIONS false;));
+my $noconndb_id = $node->safe_psql('mydb',
+	"SELECT oid FROM pg_database where datname = 'noconndb';");
+my $log_offset = -s $node->logfile;
+
+# worker_spi_launch() may be able to detect that the worker has been
+# stopped, so do not rely on safe_psql().
+$node->psql('postgres',
+	qq[SELECT worker_spi_launch(12, $noconndb_id, $myrole_id);]);
+$node->wait_for_log(
+	qr/database "noconndb" is not currently accepting connections/,
+	$log_offset);
+
+# bgworker bypasses the connection check, and can be launched.
+my $worker4_pid = $node->safe_psql('postgres',
+	qq[SELECT worker_spi_launch(12, $noconndb_id, $myrole_id, '{"ALLOWCONN"}');]
+);
+ok( $node->poll_query_until(
+		'postgres',
+		qq[SELECT datname, usename, wait_event FROM pg_stat_activity
+            WHERE backend_type = 'worker_spi dynamic' AND
+            pid IN ($worker4_pid) ORDER BY datname;],
+		qq[noconndb|myrole|WorkerSpiMain]),
+	'dynamic bgworker with BYPASS_ALLOWCONN started');
+
+# Check BGWORKER_BYPASS_ROLELOGINCHECK.
+# First create a role without login access.
+$node->safe_psql(
+	'postgres', qq[
+  CREATE ROLE nologrole WITH NOLOGIN;
+  GRANT CREATE ON DATABASE mydb TO nologrole;
+]);
+my $nologrole_id = $node->safe_psql('mydb',
+	"SELECT oid FROM pg_roles where rolname = 'nologrole';");
+$log_offset = -s $node->logfile;
+
+# bgworker cannot be launched with login restriction.
+$node->psql('postgres',
+	qq[SELECT worker_spi_launch(13, $mydb_id, $nologrole_id);]);
+$node->wait_for_log(qr/role "nologrole" is not permitted to log in/,
+	$log_offset);
+
+# bgworker bypasses the login restriction, and can be launched.
+$log_offset = -s $node->logfile;
+my $worker5_pid = $node->safe_psql('mydb',
+	qq[SELECT worker_spi_launch(13, $mydb_id, $nologrole_id, '{"ROLELOGINCHECK"}');]
+);
+ok( $node->poll_query_until(
+		'mydb',
+		qq[SELECT datname, usename, wait_event FROM pg_stat_activity
+            WHERE backend_type = 'worker_spi dynamic' AND
+            pid = $worker5_pid;],
+		'mydb|nologrole|WorkerSpiMain'),
+	'dynamic bgworker with BYPASS_ROLELOGINCHECK launched');
 
 done_testing();

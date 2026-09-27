@@ -3,7 +3,7 @@
  * numutils.c
  *	  utility functions for I/O of built-in numeric types.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,13 +14,12 @@
  */
 #include "postgres.h"
 
-#include <math.h>
 #include <limits.h>
 #include <ctype.h>
 
 #include "common/int.h"
-#include "utils/builtins.h"
 #include "port/pg_bitutils.h"
+#include "utils/builtins.h"
 
 /*
  * A table of all two-digit numbers. This is used to speed up decimal digit
@@ -113,7 +112,7 @@ static const int8 hexlookup[128] = {
  * pg_strtoint16() will throw ereport() upon bad input format or overflow;
  * while pg_strtoint16_safe() instead returns such complaints in *escontext,
  * if it's an ErrorSaveContext.
-*
+ *
  * NB: Accumulate input as an unsigned number, to deal with two's complement
  * representation of the most negative number, which can't be represented as a
  * signed positive number.
@@ -132,6 +131,7 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 	uint16		tmp = 0;
 	bool		neg = false;
 	unsigned char digit;
+	int16		result;
 
 	/*
 	 * The majority of cases are likely to be base-10 digits without any
@@ -191,10 +191,9 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (unlikely(tmp > (uint16) (-(PG_INT16_MIN + 1)) + 1))
+		if (unlikely(pg_neg_u16_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int16) tmp);
+		return result;
 	}
 
 	if (unlikely(tmp > PG_INT16_MAX))
@@ -334,10 +333,9 @@ slow:
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (tmp > (uint16) (-(PG_INT16_MIN + 1)) + 1)
+		if (unlikely(pg_neg_u16_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int16) tmp);
+		return result;
 	}
 
 	if (tmp > PG_INT16_MAX)
@@ -394,6 +392,7 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 	uint32		tmp = 0;
 	bool		neg = false;
 	unsigned char digit;
+	int32		result;
 
 	/*
 	 * The majority of cases are likely to be base-10 digits without any
@@ -453,10 +452,9 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (unlikely(tmp > (uint32) (-(PG_INT32_MIN + 1)) + 1))
+		if (unlikely(pg_neg_u32_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int32) tmp);
+		return result;
 	}
 
 	if (unlikely(tmp > PG_INT32_MAX))
@@ -596,10 +594,9 @@ slow:
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (tmp > (uint32) (-(PG_INT32_MIN + 1)) + 1)
+		if (unlikely(pg_neg_u32_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int32) tmp);
+		return result;
 	}
 
 	if (tmp > PG_INT32_MAX)
@@ -656,6 +653,7 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 	uint64		tmp = 0;
 	bool		neg = false;
 	unsigned char digit;
+	int64		result;
 
 	/*
 	 * The majority of cases are likely to be base-10 digits without any
@@ -715,10 +713,9 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (unlikely(tmp > (uint64) (-(PG_INT64_MIN + 1)) + 1))
+		if (unlikely(pg_neg_u64_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int64) tmp);
+		return result;
 	}
 
 	if (unlikely(tmp > PG_INT64_MAX))
@@ -858,10 +855,9 @@ slow:
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (tmp > (uint64) (-(PG_INT64_MIN + 1)) + 1)
+		if (unlikely(pg_neg_u64_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int64) tmp);
+		return result;
 	}
 
 	if (tmp > PG_INT64_MAX)

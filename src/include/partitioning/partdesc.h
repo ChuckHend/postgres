@@ -2,7 +2,7 @@
  *
  * partdesc.h
  *
- * Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * src/include/partitioning/partdesc.h
  *
@@ -40,16 +40,10 @@ typedef struct PartitionDescData
 	/* Caching fields to cache lookups in get_partition_for_tuple() */
 
 	/*
-	 * Index into the PartitionBoundInfo's datum array for the last found
+	 * Index into the PartitionBoundInfo's datums array for the last found
 	 * partition or -1 if none.
 	 */
 	int			last_found_datum_index;
-
-	/*
-	 * Partition index of the last found partition or -1 if none has been
-	 * found yet.
-	 */
-	int			last_found_part_index;
 
 	/*
 	 * For LIST partitioning, this is the number of times in a row that the
@@ -72,4 +66,4 @@ extern void DestroyPartitionDirectory(PartitionDirectory pdir);
 
 extern Oid	get_default_oid_from_partdesc(PartitionDesc partdesc);
 
-#endif							/* PARTCACHE_H */
+#endif							/* PARTDESC_H */

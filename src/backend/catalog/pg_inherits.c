@@ -8,7 +8,7 @@
  * Perhaps someday that code should be moved here, but it'd have to be
  * disentangled from other stuff such as pg_depend updates.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -28,7 +28,7 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
-#include "utils/memutils.h"
+#include "utils/hsearch.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -106,7 +106,7 @@ find_inheritance_children_extended(Oid parentrelId, bool omit_detached,
 	 * Scan pg_inherits and build a working array of subclass OIDs.
 	 */
 	maxoids = 32;
-	oidarr = (Oid *) palloc(maxoids * sizeof(Oid));
+	oidarr = palloc_array(Oid, maxoids);
 	numoids = 0;
 
 	relation = table_open(InheritsRelationId, AccessShareLock);
@@ -183,7 +183,7 @@ find_inheritance_children_extended(Oid parentrelId, bool omit_detached,
 		if (numoids >= maxoids)
 		{
 			maxoids *= 2;
-			oidarr = (Oid *) repalloc(oidarr, maxoids * sizeof(Oid));
+			oidarr = repalloc_array(oidarr, Oid, maxoids);
 		}
 		oidarr[numoids++] = inhrelid;
 	}

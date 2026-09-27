@@ -4,7 +4,7 @@
  *	  POSTGRES relation descriptor (a/k/a relcache entry) definitions.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/rel.h
@@ -57,7 +57,7 @@ typedef struct RelationData
 	RelFileLocator rd_locator;	/* relation physical identifier */
 	SMgrRelation rd_smgr;		/* cached file handle, or NULL */
 	int			rd_refcnt;		/* reference count */
-	BackendId	rd_backend;		/* owning backend id, if temporary relation */
+	ProcNumber	rd_backend;		/* owning backend's proc number, if temp rel */
 	bool		rd_islocaltemp; /* rel is a temp rel of this session */
 	bool		rd_isnailed;	/* rel is nailed in cache */
 	bool		rd_isvalid;		/* relcache entry is valid */
@@ -150,7 +150,8 @@ typedef struct RelationData
 
 	/* data managed by RelationGetIndexList: */
 	List	   *rd_indexlist;	/* list of OIDs of indexes on relation */
-	Oid			rd_pkindex;		/* OID of primary key, if any */
+	Oid			rd_pkindex;		/* OID of (deferrable?) primary key, if any */
+	bool		rd_ispkdeferrable;	/* is rd_pkindex a deferrable PK? */
 	Oid			rd_replidindex; /* OID of replica identity index, if any */
 
 	/* data managed by RelationGetStatExtList: */
@@ -202,7 +203,7 @@ typedef struct RelationData
 	 */
 	MemoryContext rd_indexcxt;	/* private memory cxt for this stuff */
 	/* use "struct" here to avoid needing to include amapi.h: */
-	struct IndexAmRoutine *rd_indam;	/* index AM's API struct */
+	const struct IndexAmRoutine *rd_indam;	/* index AM's API struct */
 	Oid		   *rd_opfamily;	/* OIDs of op families for each index col */
 	Oid		   *rd_opcintype;	/* OIDs of opclass declared input data types */
 	RegProcedure *rd_support;	/* OIDs of support procedures */
@@ -249,9 +250,18 @@ typedef struct RelationData
 	 */
 	Oid			rd_toastoid;	/* Real TOAST table's OID, or InvalidOid */
 
+	/*
+	 * Type OID of the "chunk_id" column of this relation's TOAST table, i.e.
+	 * OIDOID or OID8OID.
+	 *
+	 * This data is filled on demand by RelationGetToastChunkIdType(), not at
+	 * relcache build time, so as to save on syscache lookups.
+	 */
+	Oid			rd_toastchunkidtype;
+
 	bool		pgstat_enabled; /* should relation stats be counted */
 	/* use "struct" here to avoid needing to include pgstat.h: */
-	struct PgStat_TableStatus *pgstat_info; /* statistics collection area */
+	struct PgStat_RelationStatus *pgstat_info;	/* statistics collection area */
 } RelationData;
 
 
@@ -283,6 +293,9 @@ typedef struct ForeignKeyCacheInfo
 	/* number of columns in the foreign key */
 	int			nkeys;
 
+	/* Is enforced ? */
+	bool		conenforced;
+
 	/*
 	 * these arrays each have nkeys valid entries:
 	 */
@@ -306,8 +319,11 @@ typedef struct ForeignKeyCacheInfo
  /* autovacuum-related reloptions. */
 typedef struct AutoVacOpts
 {
-	bool		enabled;
+	pg_ternary	enabled;
+
+	int			autovacuum_parallel_workers;
 	int			vacuum_threshold;
+	int			vacuum_max_threshold;
 	int			vacuum_ins_threshold;
 	int			analyze_threshold;
 	int			vacuum_cost_limit;
@@ -317,7 +333,8 @@ typedef struct AutoVacOpts
 	int			multixact_freeze_min_age;
 	int			multixact_freeze_max_age;
 	int			multixact_freeze_table_age;
-	int			log_min_duration;
+	int			log_vacuum_min_duration;
+	int			log_analyze_min_duration;
 	float8		vacuum_cost_delay;
 	float8		vacuum_scale_factor;
 	float8		vacuum_ins_scale_factor;
@@ -329,19 +346,36 @@ typedef enum StdRdOptIndexCleanup
 {
 	STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO = 0,
 	STDRD_OPTION_VACUUM_INDEX_CLEANUP_OFF,
-	STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON
+	STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON,
+	STDRD_OPTION_VACUUM_INDEX_CLEANUP_NOT_SET,
 } StdRdOptIndexCleanup;
+
+/* StdRdOptions->toast_value_type values */
+typedef enum StdRdOptToastValueType
+{
+	STDRD_OPTION_TOAST_VALUE_TYPE_INVALID = 0,
+	STDRD_OPTION_TOAST_VALUE_TYPE_OID,
+	STDRD_OPTION_TOAST_VALUE_TYPE_OID8,
+} StdRdOptToastValueType;
 
 typedef struct StdRdOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			fillfactor;		/* page fill factor in percent (0..100) */
 	int			toast_tuple_target; /* target for tuple toasting */
+	StdRdOptToastValueType toast_value_type;	/* type assigned to chunk_id
+												 * at toast table creation */
 	AutoVacOpts autovacuum;		/* autovacuum-related options */
 	bool		user_catalog_table; /* use as an additional catalog relation */
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
-	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
+	pg_ternary	vacuum_truncate;	/* enables vacuum to truncate a relation */
+
+	/*
+	 * Fraction of pages in a relation that vacuum can eagerly scan and fail
+	 * to freeze. 0 if disabled, -1 if unspecified.
+	 */
+	double		vacuum_max_eager_freeze_failure_rate;
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -354,6 +388,14 @@ typedef struct StdRdOptions
 #define RelationGetToastTupleTarget(relation, defaulttarg) \
 	((relation)->rd_options ? \
 	 ((StdRdOptions *) (relation)->rd_options)->toast_tuple_target : (defaulttarg))
+
+/*
+ * RelationGetToastValueType
+ *		Returns the relation's toast_value_type.  Note multiple eval of argument!
+ */
+#define RelationGetToastValueType(relation, defaulttarg) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->toast_value_type : (defaulttarg))
 
 /*
  * RelationGetFillFactor
@@ -402,7 +444,7 @@ typedef enum ViewOptCheckOption
 {
 	VIEW_OPTION_CHECK_OPTION_NOT_SET,
 	VIEW_OPTION_CHECK_OPTION_LOCAL,
-	VIEW_OPTION_CHECK_OPTION_CASCADED
+	VIEW_OPTION_CHECK_OPTION_CASCADED,
 } ViewOptCheckOption;
 
 /*
@@ -474,9 +516,7 @@ typedef struct ViewOptions
  * RelationIsValid
  *		True iff relation descriptor is valid.
  */
-#define RelationIsValid(relation) PointerIsValid(relation)
-
-#define InvalidRelation ((Relation) NULL)
+#define RelationIsValid(relation) ((relation) != NULL)
 
 /*
  * RelationHasReferenceCountZero
@@ -561,18 +601,15 @@ typedef struct ViewOptions
  *
  * Very little code is authorized to touch rel->rd_smgr directly.  Instead
  * use this function to fetch its value.
- *
- * Note: since a relcache flush can cause the file handle to be closed again,
- * it's unwise to hold onto the pointer returned by this function for any
- * long period.  Recommended practice is to just re-execute RelationGetSmgr
- * each time you need to access the SMgrRelation.  It's quite cheap in
- * comparison to whatever an smgr function is going to do.
  */
 static inline SMgrRelation
 RelationGetSmgr(Relation rel)
 {
 	if (unlikely(rel->rd_smgr == NULL))
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
+	{
+		rel->rd_smgr = smgropen(rel->rd_locator, rel->rd_backend);
+		smgrpin(rel->rd_smgr);
+	}
 	return rel->rd_smgr;
 }
 
@@ -584,10 +621,11 @@ static inline void
 RelationCloseSmgr(Relation relation)
 {
 	if (relation->rd_smgr != NULL)
+	{
+		smgrunpin(relation->rd_smgr);
 		smgrclose(relation->rd_smgr);
-
-	/* smgrclose should unhook from owner pointer */
-	Assert(relation->rd_smgr == NULL);
+		relation->rd_smgr = NULL;
+	}
 }
 #endif							/* !FRONTEND */
 
@@ -653,6 +691,15 @@ RelationCloseSmgr(Relation relation)
 /*
  * RELATION_IS_OTHER_TEMP
  *		Test for a temporary relation that belongs to some other session.
+ *
+ * Reading another session's temp-table data through never works right:
+ * the owning session keeps the data in its private local buffer pool,
+ * which we cannot access.  Existing buffer-manager entry points
+ * (ReadBuffer_common(), StartReadBuffersImpl(), read_stream_begin_impl(),
+ * PrefetchBuffer() and ExtendBufferedRelCommon()) already enforce this; any
+ * new buffer-access entry points must do the same.  Command-level code
+ * (TRUNCATE, ALTER TABLE, VACUUM, CLUSTER, REINDEX, ...) additionally uses
+ * this macro for command-specific error messages.
  *
  * Beware of multiple eval of argument
  */

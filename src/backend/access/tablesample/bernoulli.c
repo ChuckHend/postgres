@@ -13,7 +13,7 @@
  * cutoff value computed from the selection probability by BeginSampleScan.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -30,7 +30,7 @@
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "optimizer/optimizer.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 
 
 /* Private state */
@@ -126,7 +126,7 @@ bernoulli_samplescangetsamplesize(PlannerInfo *root,
 static void
 bernoulli_initsamplescan(SampleScanState *node, int eflags)
 {
-	node->tsm_state = palloc0(sizeof(BernoulliSamplerData));
+	node->tsm_state = palloc0_object(BernoulliSamplerData);
 }
 
 /*
@@ -214,8 +214,8 @@ bernoulli_nextsampletuple(SampleScanState *node,
 
 		hashinput[1] = tupoffset;
 
-		hash = DatumGetUInt32(hash_any((const unsigned char *) hashinput,
-									   (int) sizeof(hashinput)));
+		hash = hash_bytes((const unsigned char *) hashinput,
+						  (int) sizeof(hashinput));
 		if (hash < sampler->cutoff)
 			break;
 	}

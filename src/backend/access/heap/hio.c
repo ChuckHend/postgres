@@ -3,7 +3,7 @@
  * hio.c
  *	  POSTGRES heap access method input/output code.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,7 +22,6 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
-#include "storage/smgr.h"
 
 
 /*
@@ -59,9 +58,7 @@ RelationPutHeapTuple(Relation relation,
 	/* Add the tuple to the page */
 	pageHeader = BufferGetPage(buffer);
 
-	offnum = PageAddItem(pageHeader, (Item) tuple->t_data,
-						 tuple->t_len, InvalidOffsetNumber, false, true);
-
+	offnum = PageAddItem(pageHeader, tuple->t_data, tuple->t_len, InvalidOffsetNumber, false, true);
 	if (offnum == InvalidOffsetNumber)
 		elog(PANIC, "failed to add tuple to page");
 
@@ -404,7 +401,7 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	{
 		BlockNumber first_fsm_block = first_block + not_in_fsm_pages;
 
-		FreeSpaceMapVacuumRange(relation, first_fsm_block, last_block);
+		FreeSpaceMapVacuumRange(relation, first_fsm_block, last_block + 1);
 	}
 
 	if (bistate)
@@ -501,7 +498,7 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
  */
 Buffer
 RelationGetBufferForTuple(Relation relation, Size len,
-						  Buffer otherBuffer, int options,
+						  Buffer otherBuffer, uint32 options,
 						  BulkInsertState bistate,
 						  Buffer *vmbuffer, Buffer *vmbuffer_other,
 						  int num_pages)
@@ -563,7 +560,7 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	 * on, as cached in the BulkInsertState or relcache entry.  If that
 	 * doesn't work, we ask the Free Space Map to locate a suitable page.
 	 * Since the FSM's info might be out of date, we have to be prepared to
-	 * loop around and retry multiple times. (To insure this isn't an infinite
+	 * loop around and retry multiple times. (To ensure this isn't an infinite
 	 * loop, we must update the FSM with the correct amount of free space on
 	 * each page that proves not to be suitable.)  If the FSM has no record of
 	 * a page with enough free space, we give up and extend the relation.
@@ -714,14 +711,15 @@ loop:
 		 * unlock the two buffers in, so this can be slightly simpler than the
 		 * code above.
 		 */
-		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		if (otherBuffer == InvalidBuffer)
-			ReleaseBuffer(buffer);
+			UnlockReleaseBuffer(buffer);
 		else if (otherBlock != targetBlock)
 		{
+			UnlockReleaseBuffer(buffer);
 			LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK);
-			ReleaseBuffer(buffer);
 		}
+		else
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 		/* Is there an ongoing bulk extension? */
 		if (bistate && bistate->next_free != InvalidBlockNumber)

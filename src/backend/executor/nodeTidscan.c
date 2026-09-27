@@ -3,7 +3,7 @@
  * nodeTidscan.c
  *	  Routines to support direct tid scans of relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,12 +25,11 @@
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeTidscan.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "storage/bufmgr.h"
 #include "utils/array.h"
 #include "utils/rel.h"
 
@@ -79,7 +78,7 @@ TidExprListCreate(TidScanState *tidstate)
 	foreach(l, node->tidquals)
 	{
 		Expr	   *expr = (Expr *) lfirst(l);
-		TidExpr    *tidexpr = (TidExpr *) palloc0(sizeof(TidExpr));
+		TidExpr    *tidexpr = palloc0_object(TidExpr);
 
 		if (is_opclause(expr))
 		{
@@ -158,8 +157,7 @@ TidListEval(TidScanState *tidstate)
 	 * ScalarArrayOpExprs, we may have to enlarge the array.
 	 */
 	numAllocTids = list_length(tidstate->tss_tidexprs);
-	tidList = (ItemPointerData *)
-		palloc(numAllocTids * sizeof(ItemPointerData));
+	tidList = palloc_array(ItemPointerData, numAllocTids);
 	numTids = 0;
 
 	foreach(l, tidstate->tss_tidexprs)
@@ -190,9 +188,7 @@ TidListEval(TidScanState *tidstate)
 			if (numTids >= numAllocTids)
 			{
 				numAllocTids *= 2;
-				tidList = (ItemPointerData *)
-					repalloc(tidList,
-							 numAllocTids * sizeof(ItemPointerData));
+				tidList = repalloc_array(tidList, ItemPointerData, numAllocTids);
 			}
 			tidList[numTids++] = *itemptr;
 		}
@@ -215,9 +211,7 @@ TidListEval(TidScanState *tidstate)
 			if (numTids + ndatums > numAllocTids)
 			{
 				numAllocTids = numTids + ndatums;
-				tidList = (ItemPointerData *)
-					repalloc(tidList,
-							 numAllocTids * sizeof(ItemPointerData));
+				tidList = repalloc_array(tidList, ItemPointerData, numAllocTids);
 			}
 			for (i = 0; i < ndatums; i++)
 			{
@@ -246,9 +240,7 @@ TidListEval(TidScanState *tidstate)
 				if (numTids >= numAllocTids)
 				{
 					numAllocTids *= 2;
-					tidList = (ItemPointerData *)
-						repalloc(tidList,
-								 numAllocTids * sizeof(ItemPointerData));
+					tidList = repalloc_array(tidList, ItemPointerData, numAllocTids);
 				}
 				tidList[numTids++] = cursor_tid;
 			}
@@ -403,12 +395,23 @@ TidNext(TidScanState *node)
 static bool
 TidRecheck(TidScanState *node, TupleTableSlot *slot)
 {
+	ItemPointer match;
+
+	/* WHERE CURRENT OF always intends to resolve to the latest tuple */
+	if (node->tss_isCurrentOf)
+		return true;
+
+	if (node->tss_TidList == NULL)
+		TidListEval(node);
+
 	/*
-	 * XXX shouldn't we check here to make sure tuple matches TID list? In
-	 * runtime-key case this is not certain, is it?  However, in the WHERE
-	 * CURRENT OF case it might not match anyway ...
+	 * Binary search the TidList to see if this ctid is mentioned and return
+	 * true if it is.
 	 */
-	return true;
+	match = (ItemPointer) bsearch(&slot->tts_tid, node->tss_TidList,
+								  node->tss_NumTids, sizeof(ItemPointerData),
+								  itemptr_comparator);
+	return match != NULL;
 }
 
 
@@ -526,7 +529,8 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 	 */
 	ExecInitScanTupleSlot(estate, &tidstate->ss,
 						  RelationGetDescr(currentRelation),
-						  table_slot_callbacks(currentRelation));
+						  table_slot_callbacks(currentRelation),
+						  TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS);
 
 	/*
 	 * Initialize result type and projection.

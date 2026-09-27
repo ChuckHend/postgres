@@ -5,7 +5,7 @@
  *	  However, we define it here so that the format is documented.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_control.h
@@ -22,7 +22,7 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1300
+#define PG_CONTROL_VERSION	2001
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -40,8 +40,10 @@ typedef struct CheckPoint
 	TimeLineID	PrevTimeLineID; /* previous TLI, if this record begins a new
 								 * timeline (equals ThisTimeLineID otherwise) */
 	bool		fullPageWrites; /* current full_page_writes */
+	int			wal_level;		/* current wal_level */
+	bool		logicalDecodingEnabled; /* current logical decoding status */
 	FullTransactionId nextXid;	/* next free transaction ID */
-	Oid			nextOid;		/* next free OID */
+	Oid8		nextOid;		/* next free OID */
 	MultiXactId nextMulti;		/* next free MultiXactId */
 	MultiXactOffset nextMultiOffset;	/* next free MultiXact offset */
 	TransactionId oldestXid;	/* cluster-wide minimum datfrozenxid */
@@ -61,6 +63,9 @@ typedef struct CheckPoint
 	 * set to InvalidTransactionId.
 	 */
 	TransactionId oldestActiveXid;
+
+	/* data checksums state at the time of the checkpoint  */
+	uint32		dataChecksumState;
 } CheckPoint;
 
 /* XLOG info values for XLOG rmgr */
@@ -76,8 +81,13 @@ typedef struct CheckPoint
 #define XLOG_END_OF_RECOVERY			0x90
 #define XLOG_FPI_FOR_HINT				0xA0
 #define XLOG_FPI						0xB0
-/* 0xC0 is used in Postgres 9.5-11 */
+#define XLOG_ASSIGN_LSN					0xC0
 #define XLOG_OVERWRITE_CONTRECORD		0xD0
+#define XLOG_CHECKPOINT_REDO			0xE0
+#define XLOG_LOGICAL_DECODING_STATUS_CHANGE	0xF0
+
+/* XLOG info values for XLOG2 rmgr */
+#define XLOG2_CHECKSUMS					0x00
 
 
 /*
@@ -92,7 +102,7 @@ typedef enum DBState
 	DB_SHUTDOWNING,
 	DB_IN_CRASH_RECOVERY,
 	DB_IN_ARCHIVE_RECOVERY,
-	DB_IN_PRODUCTION
+	DB_IN_PRODUCTION,
 } DBState;
 
 /*
@@ -205,6 +215,8 @@ typedef struct ControlFileData
 	uint32		blcksz;			/* data block size for this DB */
 	uint32		relseg_size;	/* blocks per segment of large relation */
 
+	uint32		slru_pages_per_segment; /* size of each SLRU segment */
+
 	uint32		xlog_blcksz;	/* block size within WAL files */
 	uint32		xlog_seg_size;	/* size of each WAL segment */
 
@@ -216,8 +228,47 @@ typedef struct ControlFileData
 
 	bool		float8ByVal;	/* float8, int8, etc pass-by-value? */
 
-	/* Are data pages protected by checksums? Zero if no checksum version */
+	/*
+	 * Data checksum state at cluster initialization. Since the state can be
+	 * changed during runtime, we need to store the initial value for system
+	 * functions which report initdb settings.
+	 */
+	uint32		data_checksum_version_init;
+	/* Current data checksums state */
 	uint32		data_checksum_version;
+
+	/*
+	 * WAL position through which data checksum transitions are covered.
+	 * Replay ignores XLOG2_CHECKSUMS records ending at or below this point:
+	 * their effect is already contained in data_checksum_version, or an
+	 * offline pg_checksums change made after they were first applied
+	 * supersedes them.  Ordinarily this is the end of the newest such record
+	 * this node has written or applied, but a tool may store any position
+	 * that covers the same set of records.  If the node has never written or
+	 * applied such a record this field shall be set to InvalidXLogRecPtr.
+	 *
+	 * The comparison has no timeline context, so the value is only valid
+	 * within the WAL history this node replays.  A tool that moves the node
+	 * to another history must clamp the watermark to the point where the
+	 * histories fork, as pg_rewind does, or reset it, as pg_resetwal does.
+	 */
+	XLogRecPtr	data_checksum_lsn;
+
+	/*
+	 * True when data_checksum_version was last set by pg_checksums in an
+	 * offline operation rather than by an online, WAL-logged transition. Such
+	 * a state is local to this node and not derived from WAL, so recovery
+	 * must not replace it with a state taken from a checkpoint record;
+	 * nothing in the WAL could restore the change once it is overwritten.
+	 * Cleared by the next WAL-logged transition.
+	 */
+	bool		data_checksum_is_local;
+
+	/*
+	 * True if the default signedness of char is "signed" on a platform where
+	 * the cluster is initialized.
+	 */
+	bool		default_char_signedness;
 
 	/*
 	 * Random nonce, used in authentication requests that need to proceed

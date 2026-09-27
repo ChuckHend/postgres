@@ -3,7 +3,7 @@
  * nodeGatherMerge.c
  *		Scan a plan in multiple workers, and do order-preserving merge.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,18 +14,15 @@
 
 #include "postgres.h"
 
-#include "access/relscan.h"
-#include "access/xact.h"
-#include "executor/execdebug.h"
+#include "access/htup_details.h"
+#include "executor/executor.h"
 #include "executor/execParallel.h"
 #include "executor/nodeGatherMerge.h"
-#include "executor/nodeSubplan.h"
 #include "executor/tqueue.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
+#include "utils/sortsupport.h"
 
 /*
  * When we read tuples from workers, it's a good idea to read several at once
@@ -149,8 +146,7 @@ ExecInitGatherMerge(GatherMerge *node, EState *estate, int eflags)
 		int			i;
 
 		gm_state->gm_nkeys = node->numCols;
-		gm_state->gm_sortkeys =
-			palloc0(sizeof(SortSupportData) * node->numCols);
+		gm_state->gm_sortkeys = palloc0_array(SortSupportData, node->numCols);
 
 		for (i = 0; i < node->numCols; i++)
 		{
@@ -228,14 +224,20 @@ ExecGatherMerge(PlanState *pstate)
 			/* We save # workers launched for the benefit of EXPLAIN */
 			node->nworkers_launched = pcxt->nworkers_launched;
 
+			/*
+			 * Count number of workers originally wanted and actually
+			 * launched.
+			 */
+			estate->es_parallel_workers_to_launch += pcxt->nworkers_to_launch;
+			estate->es_parallel_workers_launched += pcxt->nworkers_launched;
+
 			/* Set up tuple queue readers to read the results. */
 			if (pcxt->nworkers_launched > 0)
 			{
 				ExecParallelCreateReaders(node->pei);
 				/* Make a working array showing the active readers */
 				node->nreaders = pcxt->nworkers_launched;
-				node->reader = (TupleQueueReader **)
-					palloc(node->nreaders * sizeof(TupleQueueReader *));
+				node->reader = palloc_array(TupleQueueReader *, node->nreaders);
 				memcpy(node->reader, node->pei->reader,
 					   node->nreaders * sizeof(TupleQueueReader *));
 			}
@@ -405,18 +407,15 @@ gather_merge_setup(GatherMergeState *gm_state)
 	 * scan, we might have fewer than num_workers available workers, in which
 	 * case the extra array entries go unused.
 	 */
-	gm_state->gm_slots = (TupleTableSlot **)
-		palloc0((nreaders + 1) * sizeof(TupleTableSlot *));
+	gm_state->gm_slots = palloc0_array(TupleTableSlot *, nreaders + 1);
 
 	/* Allocate the tuple slot and tuple array for each worker */
-	gm_state->gm_tuple_buffers = (GMReaderTupleBuffer *)
-		palloc0(nreaders * sizeof(GMReaderTupleBuffer));
+	gm_state->gm_tuple_buffers = palloc0_array(GMReaderTupleBuffer, nreaders);
 
 	for (i = 0; i < nreaders; i++)
 	{
 		/* Allocate the tuple array with length MAX_TUPLE_STORE */
-		gm_state->gm_tuple_buffers[i].tuple =
-			(MinimalTuple *) palloc0(sizeof(MinimalTuple) * MAX_TUPLE_STORE);
+		gm_state->gm_tuple_buffers[i].tuple = palloc0_array(MinimalTuple, MAX_TUPLE_STORE);
 
 		/* Initialize tuple slot for worker */
 		gm_state->gm_slots[i + 1] =
@@ -733,7 +732,7 @@ gm_readnext_tuple(GatherMergeState *gm_state, int nreader, bool nowait,
 	 * Since we'll be buffering these across multiple calls, we need to make a
 	 * copy.
 	 */
-	return tup ? heap_copy_minimal_tuple(tup) : NULL;
+	return tup ? heap_copy_minimal_tuple(tup, 0) : NULL;
 }
 
 /*

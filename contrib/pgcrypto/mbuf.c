@@ -63,7 +63,7 @@ mbuf_free(MBuf *mbuf)
 {
 	if (mbuf->own_data)
 	{
-		px_memset(mbuf->data, 0, mbuf->buf_end - mbuf->data);
+		explicit_bzero(mbuf->data, mbuf->buf_end - mbuf->data);
 		pfree(mbuf->data);
 	}
 	pfree(mbuf);
@@ -115,7 +115,7 @@ mbuf_create(int len)
 	if (!len)
 		len = 8192;
 
-	mbuf = palloc(sizeof *mbuf);
+	mbuf = palloc_object(MBuf);
 	mbuf->data = palloc(len);
 	mbuf->buf_end = mbuf->data + len;
 	mbuf->data_end = mbuf->data;
@@ -132,8 +132,8 @@ mbuf_create_from_data(uint8 *data, int len)
 {
 	MBuf	   *mbuf;
 
-	mbuf = palloc(sizeof *mbuf);
-	mbuf->data = (uint8 *) data;
+	mbuf = palloc_object(MBuf);
+	mbuf->data = data;
 	mbuf->buf_end = mbuf->data + len;
 	mbuf->data_end = mbuf->data + len;
 	mbuf->read_pos = mbuf->data;
@@ -206,7 +206,7 @@ pullf_create(PullFilter **pf_p, const PullFilterOps *op, void *init_arg, PullFil
 		res = 0;
 	}
 
-	pf = palloc0(sizeof(*pf));
+	pf = palloc0_object(PullFilter);
 	pf->buflen = res;
 	pf->op = op;
 	pf->priv = priv;
@@ -233,11 +233,11 @@ pullf_free(PullFilter *pf)
 
 	if (pf->buf)
 	{
-		px_memset(pf->buf, 0, pf->buflen);
+		explicit_bzero(pf->buf, pf->buflen);
 		pfree(pf->buf);
 	}
 
-	px_memset(pf, 0, sizeof(*pf));
+	explicit_bzero(pf, sizeof(*pf));
 	pfree(pf);
 }
 
@@ -282,7 +282,7 @@ pullf_read_max(PullFilter *pf, int len, uint8 **data_p, uint8 *tmpbuf)
 		if (res < 0)
 		{
 			/* so the caller must clear only on success */
-			px_memset(tmpbuf, 0, total);
+			explicit_bzero(tmpbuf, total);
 			return res;
 		}
 		if (res == 0)
@@ -372,7 +372,7 @@ pushf_create(PushFilter **mp_p, const PushFilterOps *op, void *init_arg, PushFil
 		res = 0;
 	}
 
-	mp = palloc0(sizeof(*mp));
+	mp = palloc0_object(PushFilter);
 	mp->block_size = res;
 	mp->op = op;
 	mp->priv = priv;
@@ -399,11 +399,11 @@ pushf_free(PushFilter *mp)
 
 	if (mp->buf)
 	{
-		px_memset(mp->buf, 0, mp->block_size);
+		explicit_bzero(mp->buf, mp->block_size);
 		pfree(mp->buf);
 	}
 
-	px_memset(mp, 0, sizeof(*mp));
+	explicit_bzero(mp, sizeof(*mp));
 	pfree(mp);
 }
 

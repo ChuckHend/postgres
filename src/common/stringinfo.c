@@ -7,7 +7,7 @@
  * (null-terminated text) or arbitrary binary data.  All storage is allocated
  * with palloc() (falling back to malloc in frontend code).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	  src/common/stringinfo.c
@@ -24,13 +24,44 @@
 
 #include "postgres_fe.h"
 
-/* It's possible we could use a different value for this in frontend code */
-#define MaxAllocSize	((Size) 0x3fffffff) /* 1 gigabyte - 1 */
-
 #endif
 
 #include "lib/stringinfo.h"
 
+
+/*
+ * initStringInfoInternal
+ *
+ * Initialize a StringInfoData struct (with previously undefined contents)
+ * to describe an empty string.
+ * The initial memory allocation size is specified by 'initsize'.
+ * The valid range for 'initsize' is 1 to MaxAllocSize.
+ */
+static inline void
+initStringInfoInternal(StringInfo str, int initsize)
+{
+	Assert(initsize >= 1 && initsize <= MaxAllocSize);
+
+	str->data = (char *) palloc(initsize);
+	str->maxlen = initsize;
+	resetStringInfo(str);
+}
+
+/*
+ * makeStringInfoInternal(int initsize)
+ *
+ * Create an empty 'StringInfoData' & return a pointer to it.
+ * The initial memory allocation size is specified by 'initsize'.
+ * The valid range for 'initsize' is 1 to MaxAllocSize.
+ */
+static inline StringInfo
+makeStringInfoInternal(int initsize)
+{
+	StringInfo	res = palloc_object(StringInfoData);
+
+	initStringInfoInternal(res, initsize);
+	return res;
+}
 
 /*
  * makeStringInfo
@@ -40,13 +71,20 @@
 StringInfo
 makeStringInfo(void)
 {
-	StringInfo	res;
+	return makeStringInfoInternal(STRINGINFO_DEFAULT_SIZE);
+}
 
-	res = (StringInfo) palloc(sizeof(StringInfoData));
-
-	initStringInfo(res);
-
-	return res;
+/*
+ * makeStringInfoExt(int initsize)
+ *
+ * Create an empty 'StringInfoData' & return a pointer to it.
+ * The initial memory allocation size is specified by 'initsize'.
+ * The valid range for 'initsize' is 1 to MaxAllocSize.
+ */
+StringInfo
+makeStringInfoExt(int initsize)
+{
+	return makeStringInfoInternal(initsize);
 }
 
 /*
@@ -58,11 +96,21 @@ makeStringInfo(void)
 void
 initStringInfo(StringInfo str)
 {
-	int			size = 1024;	/* initial default buffer size */
+	initStringInfoInternal(str, STRINGINFO_DEFAULT_SIZE);
+}
 
-	str->data = (char *) palloc(size);
-	str->maxlen = size;
-	resetStringInfo(str);
+/*
+ * initStringInfoExt
+ *
+ * Initialize a StringInfoData struct (with previously undefined contents)
+ * to describe an empty string.
+ * The initial memory allocation size is specified by 'initsize'.
+ * The valid range for 'initsize' is 1 to MaxAllocSize.
+ */
+void
+initStringInfoExt(StringInfo str, int initsize)
+{
+	initStringInfoInternal(str, initsize);
 }
 
 /*
@@ -70,10 +118,16 @@ initStringInfo(StringInfo str)
  *
  * Reset the StringInfo: the data buffer remains valid, but its
  * previous content, if any, is cleared.
+ *
+ * Read-only StringInfos as initialized by initReadOnlyStringInfo cannot be
+ * reset.
  */
 void
 resetStringInfo(StringInfo str)
 {
+	/* don't allow resets of read-only StringInfos */
+	Assert(str->maxlen != 0);
+
 	str->data[0] = '\0';
 	str->len = 0;
 	str->cursor = 0;
@@ -88,7 +142,7 @@ resetStringInfo(StringInfo str)
  * strcat.
  */
 void
-appendStringInfo(StringInfo str, const char *fmt,...)
+appendStringInfo(StringInfo str, const char *fmt, ...)
 {
 	int			save_errno = errno;
 
@@ -98,16 +152,16 @@ appendStringInfo(StringInfo str, const char *fmt,...)
 		int			needed;
 
 		/* Try to format the data. */
-		errno = save_errno;
 		va_start(args, fmt);
 		needed = appendStringInfoVA(str, fmt, args);
 		va_end(args);
 
-		if (needed == 0)
+		if (likely(needed == 0))
 			break;				/* success */
 
 		/* Increase the buffer size and try again. */
 		enlargeStringInfo(str, needed);
+		errno = save_errno;
 	}
 }
 
@@ -129,13 +183,11 @@ appendStringInfo(StringInfo str, const char *fmt,...)
  * to redo va_start before you can rescan the argument list, and we can't do
  * that from here.
  */
-int
+inline int
 appendStringInfoVA(StringInfo str, const char *fmt, va_list args)
 {
 	int			avail;
-	size_t		nprinted;
-
-	Assert(str != NULL);
+	int			nprinted;
 
 	/*
 	 * If there's hardly any space, don't bother trying, just fail to make the
@@ -146,12 +198,24 @@ appendStringInfoVA(StringInfo str, const char *fmt, va_list args)
 	if (avail < 16)
 		return 32;
 
-	nprinted = pvsnprintf(str->data + str->len, (size_t) avail, fmt, args);
+	nprinted = vsnprintf(str->data + str->len, (size_t) avail, fmt, args);
 
-	if (nprinted < (size_t) avail)
+	/* We assume failure means the fmt is bogus, hence hard failure is OK */
+	if (unlikely(nprinted < 0))
+	{
+#ifndef FRONTEND
+		elog(ERROR, "vsnprintf failed: %m with format string \"%s\"", fmt);
+#else
+		fprintf(stderr, "vsnprintf failed: %m with format string \"%s\"\n",
+				fmt);
+		exit(EXIT_FAILURE);
+#endif
+	}
+
+	if (likely(nprinted < avail))
 	{
 		/* Success.  Note nprinted does not include trailing null. */
-		str->len += (int) nprinted;
+		str->len += nprinted;
 		return 0;
 	}
 
@@ -159,11 +223,14 @@ appendStringInfoVA(StringInfo str, const char *fmt, va_list args)
 	str->data[str->len] = '\0';
 
 	/*
-	 * Return pvsnprintf's estimate of the space needed.  (Although this is
-	 * given as a size_t, we know it will fit in int because it's not more
-	 * than MaxAllocSize.)
+	 * We assume a C99-compliant vsnprintf, so believe its estimate of the
+	 * required space.  (If it's wrong, the logic will still work, but we may
+	 * loop multiple times.)
+	 *
+	 * Unlike pvsnprintf(), we don't check for overrunning MaxAllocSize,
+	 * preferring to leave that to enlargeStringInfo().
 	 */
-	return (int) nprinted;
+	return nprinted;
 }
 
 /*
@@ -284,6 +351,9 @@ enlargeStringInfo(StringInfo str, int needed)
 {
 	int			newlen;
 
+	/* validate this is not a read-only StringInfo */
+	Assert(str->maxlen != 0);
+
 	/*
 	 * Guard against out-of-range "needed" values.  Without this, we can get
 	 * an overflow or infinite loop in the following.
@@ -302,13 +372,13 @@ enlargeStringInfo(StringInfo str, int needed)
 #ifndef FRONTEND
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("out of memory"),
+				 errmsg("string buffer exceeds maximum allowed length (%zu bytes)", MaxAllocSize),
 				 errdetail("Cannot enlarge string buffer containing %d bytes by %d more bytes.",
 						   str->len, needed)));
 #else
 		fprintf(stderr,
-				_("out of memory\n\nCannot enlarge string buffer containing %d bytes by %d more bytes.\n"),
-				str->len, needed);
+				_("string buffer exceeds maximum allowed length (%zu bytes)\n\nCannot enlarge string buffer containing %d bytes by %d more bytes.\n"),
+				MaxAllocSize, str->len, needed);
 		exit(EXIT_FAILURE);
 #endif
 	}
@@ -340,4 +410,20 @@ enlargeStringInfo(StringInfo str, int needed)
 	str->data = (char *) repalloc(str->data, newlen);
 
 	str->maxlen = newlen;
+}
+
+/*
+ * destroyStringInfo
+ *
+ * Frees a StringInfo and its buffer (opposite of makeStringInfo()).
+ * This must only be called on palloc'd StringInfos.
+ */
+void
+destroyStringInfo(StringInfo str)
+{
+	/* don't allow destroys of read-only StringInfos */
+	Assert(str->maxlen != 0);
+
+	pfree(str->data);
+	pfree(str);
 }

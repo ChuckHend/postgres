@@ -4,7 +4,7 @@
  *	  Utility and convenience functions for fmgr functions that return
  *	  sets and/or composite types, or deal with VARIADIC inputs.
  *
- * Copyright (c) 2002-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/fmgr/funcapi.c
@@ -73,7 +73,7 @@ static TypeFuncClass get_type_func_class(Oid typid, Oid *base_typeid);
  * RECORD datatype.
  */
 void
-InitMaterializedSRF(FunctionCallInfo fcinfo, bits32 flags)
+InitMaterializedSRF(FunctionCallInfo fcinfo, uint32 flags)
 {
 	bool		random_access;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
@@ -287,6 +287,13 @@ get_call_result_type(FunctionCallInfo fcinfo,
 /*
  * get_expr_result_type
  *		As above, but work from a calling expression node tree
+ *
+ * Beware of using this on the funcexpr of a RTE that has a coldeflist.
+ * The correct conclusion in such cases is always that the function returns
+ * RECORD with the columns defined by the coldeflist fields (funccolnames etc).
+ * If it does not, it's the executor's responsibility to catch the discrepancy
+ * at runtime; but code processing the query in advance of that point might
+ * come to inconsistent conclusions if it checks the actual expression.
  */
 TypeFuncClass
 get_expr_result_type(Node *expr,
@@ -333,6 +340,8 @@ get_expr_result_type(Node *expr,
 										exprCollation(col));
 			i++;
 		}
+		TupleDescFinalize(tupdesc);
+
 		if (resultTypeId)
 			*resultTypeId = rexpr->row_typeid;
 		if (resultTupleDesc)
@@ -537,7 +546,8 @@ internal_get_result_type(Oid funcid,
  * if noError is true, else throws error.
  *
  * This is a simpler version of get_expr_result_type() for use when the caller
- * is only interested in determinate rowtype results.
+ * is only interested in determinate rowtype results.  As with that function,
+ * beware of using this on the funcexpr of a RTE that has a coldeflist.
  */
 TupleDesc
 get_expr_result_tupdesc(Node *expr, bool noError)
@@ -1036,6 +1046,7 @@ resolve_polymorphic_tupdesc(TupleDesc tupdesc, oidvector *declared_args,
 		}
 	}
 
+	TupleDescFinalize(tupdesc);
 	return true;
 }
 
@@ -1402,7 +1413,7 @@ get_func_arg_info(HeapTuple procTup,
 			ARR_ELEMTYPE(arr) != OIDOID)
 			elog(ERROR, "proallargtypes is not a 1-D Oid array or it contains nulls");
 		Assert(numargs >= procStruct->pronargs);
-		*p_argtypes = (Oid *) palloc(numargs * sizeof(Oid));
+		*p_argtypes = palloc_array(Oid, numargs);
 		memcpy(*p_argtypes, ARR_DATA_PTR(arr),
 			   numargs * sizeof(Oid));
 	}
@@ -1411,7 +1422,7 @@ get_func_arg_info(HeapTuple procTup,
 		/* If no proallargtypes, use proargtypes */
 		numargs = procStruct->proargtypes.dim1;
 		Assert(numargs == procStruct->pronargs);
-		*p_argtypes = (Oid *) palloc(numargs * sizeof(Oid));
+		*p_argtypes = palloc_array(Oid, numargs);
 		memcpy(*p_argtypes, procStruct->proargtypes.values,
 			   numargs * sizeof(Oid));
 	}
@@ -1428,7 +1439,7 @@ get_func_arg_info(HeapTuple procTup,
 								  &elems, NULL, &nelems);
 		if (nelems != numargs)	/* should not happen */
 			elog(ERROR, "proargnames must have the same number of elements as the function has arguments");
-		*p_argnames = (char **) palloc(sizeof(char *) * numargs);
+		*p_argnames = palloc_array(char *, numargs);
 		for (i = 0; i < numargs; i++)
 			(*p_argnames)[i] = TextDatumGetCString(elems[i]);
 	}
@@ -1490,7 +1501,7 @@ get_func_trftypes(HeapTuple procTup,
 			ARR_HASNULL(arr) ||
 			ARR_ELEMTYPE(arr) != OIDOID)
 			elog(ERROR, "protrftypes is not a 1-D Oid array or it contains nulls");
-		*p_trftypes = (Oid *) palloc(nelems * sizeof(Oid));
+		*p_trftypes = palloc_array(Oid, nelems);
 		memcpy(*p_trftypes, ARR_DATA_PTR(arr),
 			   nelems * sizeof(Oid));
 
@@ -1845,6 +1856,8 @@ build_function_result_tupdesc_d(char prokind,
 						   0);
 	}
 
+	TupleDescFinalize(desc);
+
 	return desc;
 }
 
@@ -1962,6 +1975,7 @@ TypeGetTupleDesc(Oid typeoid, List *colaliases)
 						   typeoid,
 						   -1,
 						   0);
+		TupleDescFinalize(tupdesc);
 	}
 	else if (functypclass == TYPEFUNC_RECORD)
 	{

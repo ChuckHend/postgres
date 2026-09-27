@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 autoinc_sources = files(
   'autoinc.c',
@@ -18,6 +18,10 @@ contrib_targets += autoinc
 
 install_data('autoinc.control', 'autoinc--1.0.sql',
   kwargs: contrib_data_args,
+)
+
+install_data('autoinc.example',
+  kwargs: contrib_doc_args,
 )
 
 
@@ -43,6 +47,10 @@ install_data(
   kwargs: contrib_data_args,
 )
 
+install_data('insert_username.example',
+  kwargs: contrib_doc_args,
+)
+
 
 moddatetime_sources = files(
   'moddatetime.c',
@@ -66,27 +74,18 @@ install_data(
   kwargs: contrib_data_args,
 )
 
-# this is needed for the regression tests;
-# comment out if you want a quieter refint package for other uses
-refint_cflags = ['-DREFINT_VERBOSE']
-
-refint_sources = files(
-  'refint.c',
+install_data('moddatetime.example',
+  kwargs: contrib_doc_args,
 )
 
-if host_system == 'windows'
-  refint_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
-    '--NAME', 'refint',
-    '--FILEDESC', 'spi - examples of using SPI and triggers',])
-endif
 
-refint = shared_module('refint',
-  refint_sources,
-  c_args: refint_cflags,
-  kwargs: contrib_mod_args,
-)
-contrib_targets += refint
-
-install_data('refint.control', 'refint--1.0.sql',
-  kwargs: contrib_data_args,
-)
+tests += {
+  'name': 'spi',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'regress': {
+    'sql': [
+      'autoinc',
+    ],
+  },
+}

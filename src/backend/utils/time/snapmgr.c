@@ -3,10 +3,69 @@
  * snapmgr.c
  *		PostgreSQL snapshot manager
  *
+ * The following functions return an MVCC snapshot that can be used in tuple
+ * visibility checks:
+ *
+ * - GetTransactionSnapshot
+ * - GetLatestSnapshot
+ * - GetCatalogSnapshot
+ * - GetNonHistoricCatalogSnapshot
+ *
+ * Each of these functions returns a reference to a statically allocated
+ * snapshot.  The statically allocated snapshot is subject to change on any
+ * snapshot-related function call, and should not be used directly.  Instead,
+ * call PushActiveSnapshot() or RegisterSnapshot() to create a longer-lived
+ * copy and use that.
+ *
  * We keep track of snapshots in two ways: those "registered" by resowner.c,
  * and the "active snapshot" stack.  All snapshots in either of them live in
  * persistent memory.  When a snapshot is no longer in any of these lists
  * (tracked by separate refcounts on each snapshot), its memory can be freed.
+ *
+ * In addition to the above-mentioned MVCC snapshots, there are some special
+ * snapshots like SnapshotSelf, SnapshotAny, and "dirty" snapshots.  They can
+ * only be used in limited contexts and cannot be registered or pushed to the
+ * active stack.
+ *
+ * ActiveSnapshot stack
+ * --------------------
+ *
+ * Most visibility checks use the current "active snapshot" returned by
+ * GetActiveSnapshot().  When running normal queries, the active snapshot is
+ * set when query execution begins based on the transaction isolation level.
+ *
+ * The active snapshot is tracked in a stack so that the currently active one
+ * is at the top of the stack.  It mirrors the process call stack: whenever we
+ * recurse or switch context to fetch rows from a different portal for
+ * example, the appropriate snapshot is pushed to become the active snapshot,
+ * and popped on return.  Once upon a time, ActiveSnapshot was just a global
+ * variable that was saved and restored similar to CurrentMemoryContext, but
+ * nowadays it's managed as a separate data structure so that we can keep
+ * track of which snapshots are in use and reset MyProc->xmin when there is no
+ * active snapshot.
+ *
+ * However, there are a couple of exceptions where the active snapshot stack
+ * does not strictly mirror the call stack:
+ *
+ * - VACUUM and a few other utility commands manage their own transactions,
+ *   which take their own snapshots.  They are called with an active snapshot
+ *   set, like most utility commands, but they pop the active snapshot that
+ *   was pushed by the caller.  PortalRunUtility knows about the possibility
+ *   that the snapshot it pushed is no longer active on return.
+ *
+ * - When COMMIT or ROLLBACK is executed within a procedure or DO-block, the
+ *   active snapshot stack is destroyed, and re-established later when
+ *   subsequent statements in the procedure are executed.  There are many
+ *   limitations on when in-procedure COMMIT/ROLLBACK is allowed; one such
+ *   limitation is that all the snapshots on the active snapshot stack are
+ *   known to portals that are being executed, which makes it safe to reset
+ *   the stack.  See EnsurePortalSnapshotExists().
+ *
+ * Registered snapshots
+ * --------------------
+ *
+ * In addition to snapshots pushed to the active snapshot stack, a snapshot
+ * can be registered with a resource owner.
  *
  * The FirstXactSnapshot, if any, is treated a bit specially: we increment its
  * regd_count and list it in RegisteredSnapshots, but this reference is not
@@ -35,7 +94,7 @@
  * stack is empty.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -51,25 +110,20 @@
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
-#include "access/xlog.h"
-#include "catalog/catalog.h"
 #include "datatype/timestamp.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "port/pg_lfind.h"
+#include "storage/fd.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
-#include "storage/sinval.h"
-#include "storage/sinvaladt.h"
-#include "storage/spin.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
-#include "utils/rel.h"
-#include "utils/resowner_private.h"
+#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
-#include "utils/timestamp.h"
 
 
 /*
@@ -86,9 +140,10 @@
  */
 static SnapshotData CurrentSnapshotData = {SNAPSHOT_MVCC};
 static SnapshotData SecondarySnapshotData = {SNAPSHOT_MVCC};
-SnapshotData CatalogSnapshotData = {SNAPSHOT_MVCC};
+static SnapshotData CatalogSnapshotData = {SNAPSHOT_MVCC};
 SnapshotData SnapshotSelfData = {SNAPSHOT_SELF};
 SnapshotData SnapshotAnyData = {SNAPSHOT_ANY};
+SnapshotData SnapshotToastData = {SNAPSHOT_TOAST};
 
 /* Pointers to valid snapshots */
 static Snapshot CurrentSnapshot = NULL;
@@ -125,9 +180,6 @@ typedef struct ActiveSnapshotElt
 /* Top of the stack of active snapshots */
 static ActiveSnapshotElt *ActiveSnapshot = NULL;
 
-/* Bottom of the stack of active snapshots */
-static ActiveSnapshotElt *OldestActiveSnapshot = NULL;
-
 /*
  * Currently registered Snapshots.  Ordered in a heap by xmin, so that we can
  * quickly find the one with lowest xmin, to advance our MyProc->xmin.
@@ -162,8 +214,33 @@ static List *exportedSnapshots = NIL;
 
 /* Prototypes for local functions */
 static Snapshot CopySnapshot(Snapshot snapshot);
+static void UnregisterSnapshotNoOwner(Snapshot snapshot);
 static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
+
+/* ResourceOwner callbacks to track snapshot references */
+static void ResOwnerReleaseSnapshot(Datum res);
+
+static const ResourceOwnerDesc snapshot_resowner_desc =
+{
+	.name = "snapshot reference",
+	.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+	.release_priority = RELEASE_PRIO_SNAPSHOT_REFS,
+	.ReleaseResource = ResOwnerReleaseSnapshot,
+	.DebugPrint = NULL			/* the default message is fine */
+};
+
+/* Convenience wrappers over ResourceOwnerRemember/Forget */
+static inline void
+ResourceOwnerRememberSnapshot(ResourceOwner owner, Snapshot snap)
+{
+	ResourceOwnerRemember(owner, PointerGetDatum(snap), &snapshot_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snap)
+{
+	ResourceOwnerForget(owner, PointerGetDatum(snap), &snapshot_resowner_desc);
+}
 
 /*
  * Snapshot fields to be serialized.
@@ -180,30 +257,35 @@ typedef struct SerializedSnapshotData
 	bool		suboverflowed;
 	bool		takenDuringRecovery;
 	CommandId	curcid;
-	TimestampTz whenTaken;
-	XLogRecPtr	lsn;
 } SerializedSnapshotData;
 
 /*
  * GetTransactionSnapshot
  *		Get the appropriate snapshot for a new query in a transaction.
  *
- * Note that the return value may point at static storage that will be modified
- * by future calls and by CommandCounterIncrement().  Callers should call
- * RegisterSnapshot or PushActiveSnapshot on the returned snap if it is to be
- * used very long.
+ * Note that the return value points at static storage that will be modified
+ * by future calls and by CommandCounterIncrement().  Callers must call
+ * RegisterSnapshot or PushActiveSnapshot on the returned snap before doing
+ * any other non-trivial work that could invalidate it.
  */
 Snapshot
 GetTransactionSnapshot(void)
 {
 	/*
-	 * Return historic snapshot if doing logical decoding. We'll never need a
-	 * non-historic transaction snapshot in this (sub-)transaction, so there's
-	 * no need to be careful to set one up for later calls to
-	 * GetTransactionSnapshot().
+	 * Return historic snapshot if doing logical decoding.
+	 *
+	 * Historic snapshots are only usable for catalog access, not for
+	 * general-purpose queries.  The caller is responsible for ensuring that
+	 * the snapshot is used correctly! (PostgreSQL code never calls this
+	 * during logical decoding, but extensions can do it.)
 	 */
 	if (HistoricSnapshotActive())
 	{
+		/*
+		 * We'll never need a non-historic transaction snapshot in this
+		 * (sub-)transaction, so there's no need to be careful to set one up
+		 * for later calls to GetTransactionSnapshot().
+		 */
 		Assert(!FirstSnapshotSet);
 		return HistoricSnapshot;
 	}
@@ -295,36 +377,6 @@ GetLatestSnapshot(void)
 }
 
 /*
- * GetOldestSnapshot
- *
- *		Get the transaction's oldest known snapshot, as judged by the LSN.
- *		Will return NULL if there are no active or registered snapshots.
- */
-Snapshot
-GetOldestSnapshot(void)
-{
-	Snapshot	OldestRegisteredSnapshot = NULL;
-	XLogRecPtr	RegisteredLSN = InvalidXLogRecPtr;
-
-	if (!pairingheap_is_empty(&RegisteredSnapshots))
-	{
-		OldestRegisteredSnapshot = pairingheap_container(SnapshotData, ph_node,
-														 pairingheap_first(&RegisteredSnapshots));
-		RegisteredLSN = OldestRegisteredSnapshot->lsn;
-	}
-
-	if (OldestActiveSnapshot != NULL)
-	{
-		XLogRecPtr	ActiveLSN = OldestActiveSnapshot->as_snap->lsn;
-
-		if (XLogRecPtrIsInvalid(RegisteredLSN) || RegisteredLSN > ActiveLSN)
-			return OldestActiveSnapshot->as_snap;
-	}
-
-	return OldestRegisteredSnapshot;
-}
-
-/*
  * GetCatalogSnapshot
  *		Get a snapshot that is sufficiently up-to-date for scan of the
  *		system catalog with the specified OID.
@@ -407,6 +459,7 @@ InvalidateCatalogSnapshot(void)
 		pairingheap_remove(&RegisteredSnapshots, &CatalogSnapshot->ph_node);
 		CatalogSnapshot = NULL;
 		SnapshotResetXmin();
+		INJECTION_POINT("invalidate-catalog-snapshot-end", NULL);
 	}
 }
 
@@ -665,8 +718,6 @@ PushActiveSnapshotWithLevel(Snapshot snapshot, int snap_level)
 	newactive->as_snap->active_count++;
 
 	ActiveSnapshot = newactive;
-	if (OldestActiveSnapshot == NULL)
-		OldestActiveSnapshot = ActiveSnapshot;
 }
 
 /*
@@ -737,8 +788,6 @@ PopActiveSnapshot(void)
 
 	pfree(ActiveSnapshot);
 	ActiveSnapshot = newstack;
-	if (ActiveSnapshot == NULL)
-		OldestActiveSnapshot = NULL;
 
 	SnapshotResetXmin();
 }
@@ -796,7 +845,7 @@ RegisterSnapshotOnOwner(Snapshot snapshot, ResourceOwner owner)
 	snap = snapshot->copied ? snapshot : CopySnapshot(snapshot);
 
 	/* and tell resowner.c about it */
-	ResourceOwnerEnlargeSnapshots(owner);
+	ResourceOwnerEnlarge(owner);
 	snap->regd_count++;
 	ResourceOwnerRememberSnapshot(owner, snap);
 
@@ -832,10 +881,15 @@ UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner)
 	if (snapshot == NULL)
 		return;
 
+	ResourceOwnerForgetSnapshot(owner, snapshot);
+	UnregisterSnapshotNoOwner(snapshot);
+}
+
+static void
+UnregisterSnapshotNoOwner(Snapshot snapshot)
+{
 	Assert(snapshot->regd_count > 0);
 	Assert(!pairingheap_is_empty(&RegisteredSnapshots));
-
-	ResourceOwnerForgetSnapshot(owner, snapshot);
 
 	snapshot->regd_count--;
 	if (snapshot->regd_count == 0)
@@ -878,13 +932,6 @@ xmin_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
  * dropped.  For efficiency, we only consider recomputing PGPROC->xmin when
  * the active snapshot stack is empty; this allows us not to need to track
  * which active snapshot is oldest.
- *
- * Note: it's tempting to use GetOldestSnapshot() here so that we can include
- * active snapshots in the calculation.  However, that compares by LSN not
- * xmin so it's not entirely clear that it's the same thing.  Also, we'd be
- * critically dependent on the assumption that the bottommost active snapshot
- * stack entry has the oldest xmin.  (Current uses of GetOldestSnapshot() are
- * not actually critical, but this would be.)
  */
 static void
 SnapshotResetXmin(void)
@@ -896,7 +943,7 @@ SnapshotResetXmin(void)
 
 	if (pairingheap_is_empty(&RegisteredSnapshots))
 	{
-		MyProc->xmin = InvalidTransactionId;
+		MyProc->xmin = TransactionXmin = InvalidTransactionId;
 		return;
 	}
 
@@ -904,7 +951,7 @@ SnapshotResetXmin(void)
 										pairingheap_first(&RegisteredSnapshots));
 
 	if (TransactionIdPrecedes(MyProc->xmin, minSnapshot->xmin))
-		MyProc->xmin = minSnapshot->xmin;
+		MyProc->xmin = TransactionXmin = minSnapshot->xmin;
 }
 
 /*
@@ -956,8 +1003,6 @@ AtSubAbort_Snapshot(int level)
 		pfree(ActiveSnapshot);
 
 		ActiveSnapshot = next;
-		if (ActiveSnapshot == NULL)
-			OldestActiveSnapshot = NULL;
 	}
 
 	SnapshotResetXmin();
@@ -1041,7 +1086,6 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 	 * it'll go away with TopTransactionContext.
 	 */
 	ActiveSnapshot = NULL;
-	OldestActiveSnapshot = NULL;
 	pairingheap_reset(&RegisteredSnapshots);
 
 	CurrentSnapshot = NULL;
@@ -1073,11 +1117,12 @@ ExportSnapshot(Snapshot snapshot)
 	TransactionId topXid;
 	TransactionId *children;
 	ExportedSnapshot *esnap;
+	int			nsubxids;
 	int			nchildren;
 	int			addTopXid;
+	bool		suboverflowed;
 	StringInfoData buf;
 	FILE	   *f;
-	int			i;
 	MemoryContext oldcxt;
 	char		path[MAXPGPATH];
 	char		pathtmp[MAXPGPATH];
@@ -1119,11 +1164,37 @@ ExportSnapshot(Snapshot snapshot)
 	nchildren = xactGetCommittedChildren(&children);
 
 	/*
+	 * We export a recovery snapshot's subxip whole (see below), so refuse an
+	 * export that no importer will accept.  This rare edge case only happens
+	 * when a snapshot taken during recovery is imported after its standby is
+	 * promoted, the importing transaction subcommits many subtransactions,
+	 * and then attempts to export the same snapshot a second time.
+	 */
+	if (snapshot->takenDuringRecovery &&
+		snapshot->subxcnt + nchildren > GetMaxSnapshotSubxidCount())
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg_plural("cannot export snapshot with %d running transaction ID",
+							   "cannot export snapshot with %d running transaction IDs",
+							   snapshot->subxcnt + nchildren,
+							   snapshot->subxcnt + nchildren),
+
+		/*
+		 * The singular and plural strings below are identical in English but
+		 * could differ in translations.
+		 */
+				 errdetail_plural("A snapshot taken during recovery is exported with every transaction ID that it treats as running, and at most %d can be stored.",
+								  "A snapshot taken during recovery is exported with every transaction ID that it treats as running, and at most %d can be stored.",
+								  GetMaxSnapshotSubxidCount(),
+								  GetMaxSnapshotSubxidCount())));
+
+	/*
 	 * Generate file path for the snapshot.  We start numbering of snapshots
 	 * inside the transaction from 1.
 	 */
 	snprintf(path, sizeof(path), SNAPSHOT_EXPORT_DIR "/%08X-%08X-%d",
-			 MyProc->backendId, MyProc->lxid, list_length(exportedSnapshots) + 1);
+			 MyProc->vxid.procNumber, MyProc->vxid.lxid,
+			 list_length(exportedSnapshots) + 1);
 
 	/*
 	 * Copy the snapshot into TopTransactionContext, add it to the
@@ -1134,7 +1205,7 @@ ExportSnapshot(Snapshot snapshot)
 	snapshot = CopySnapshot(snapshot);
 
 	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-	esnap = (ExportedSnapshot *) palloc(sizeof(ExportedSnapshot));
+	esnap = palloc_object(ExportedSnapshot);
 	esnap->snapfile = pstrdup(path);
 	esnap->snapshot = snapshot;
 	exportedSnapshots = lappend(exportedSnapshots, esnap);
@@ -1150,7 +1221,7 @@ ExportSnapshot(Snapshot snapshot)
 	 */
 	initStringInfo(&buf);
 
-	appendStringInfo(&buf, "vxid:%d/%u\n", MyProc->backendId, MyProc->lxid);
+	appendStringInfo(&buf, "vxid:%d/%u\n", MyProc->vxid.procNumber, MyProc->vxid.lxid);
 	appendStringInfo(&buf, "pid:%d\n", MyProcPid);
 	appendStringInfo(&buf, "dbid:%u\n", MyDatabaseId);
 	appendStringInfo(&buf, "iso:%d\n", XactIsoLevel);
@@ -1173,25 +1244,38 @@ ExportSnapshot(Snapshot snapshot)
 	addTopXid = (TransactionIdIsValid(topXid) &&
 				 TransactionIdPrecedes(topXid, snapshot->xmax)) ? 1 : 0;
 	appendStringInfo(&buf, "xcnt:%d\n", snapshot->xcnt + addTopXid);
-	for (i = 0; i < snapshot->xcnt; i++)
+	for (uint32 i = 0; i < snapshot->xcnt; i++)
 		appendStringInfo(&buf, "xip:%u\n", snapshot->xip[i]);
 	if (addTopXid)
 		appendStringInfo(&buf, "xip:%u\n", topXid);
 
 	/*
-	 * Similarly, we add our subcommitted child XIDs to the subxid data. Here,
-	 * we have to cope with possible overflow.
+	 * Similarly, we add our subcommitted child XIDs to the subxid data.
+	 *
+	 * Report overflow when the snapshot overflowed, and also when our subxids
+	 * won't fit in what a snapshot can hold.  For a snapshot taken outside
+	 * recovery, claiming overflow is always safe, since it just makes
+	 * importers fall back on pg_subtrans.
 	 */
-	if (snapshot->suboverflowed ||
-		snapshot->subxcnt + nchildren > GetMaxSnapshotSubxidCount())
-		appendStringInfoString(&buf, "sof:1\n");
-	else
+	nsubxids = snapshot->subxcnt + nchildren;
+	suboverflowed = snapshot->suboverflowed ||
+		nsubxids > GetMaxSnapshotSubxidCount();
+
+	/*
+	 * Ignore the subxid array if it has overflowed, unless the snapshot was
+	 * taken during recovery - in that case, top-level XIDs are in subxip as
+	 * well, and we mustn't lose them.
+	 */
+	if (suboverflowed && !snapshot->takenDuringRecovery)
+		nsubxids = 0;
+
+	appendStringInfo(&buf, "sof:%u\n", suboverflowed);
+	appendStringInfo(&buf, "sxcnt:%d\n", nsubxids);
+	if (nsubxids > 0)
 	{
-		appendStringInfoString(&buf, "sof:0\n");
-		appendStringInfo(&buf, "sxcnt:%d\n", snapshot->subxcnt + nchildren);
-		for (i = 0; i < snapshot->subxcnt; i++)
+		for (int32 i = 0; i < snapshot->subxcnt; i++)
 			appendStringInfo(&buf, "sxp:%u\n", snapshot->subxip[i]);
-		for (i = 0; i < nchildren; i++)
+		for (int32 i = 0; i < nchildren; i++)
 			appendStringInfo(&buf, "sxp:%u\n", children[i]);
 	}
 	appendStringInfo(&buf, "rec:%u\n", snapshot->takenDuringRecovery);
@@ -1320,7 +1404,7 @@ parseVxidFromText(const char *prefix, char **s, const char *filename,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid snapshot data in file \"%s\"", filename)));
 	ptr += prefixlen;
-	if (sscanf(ptr, "%d/%u", &vxid->backendId, &vxid->localTransactionId) != 2)
+	if (sscanf(ptr, "%d/%u", &vxid->procNumber, &vxid->localTransactionId) != 2)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid snapshot data in file \"%s\"", filename)));
@@ -1444,30 +1528,25 @@ ImportSnapshot(const char *idstr)
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid snapshot data in file \"%s\"", path)));
 
-	snapshot.xip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
+	snapshot.xip = palloc_array(TransactionId, xcnt);
 	for (i = 0; i < xcnt; i++)
 		snapshot.xip[i] = parseXidFromText("xip:", &filebuf, path);
 
 	snapshot.suboverflowed = parseIntFromText("sof:", &filebuf, path);
+	snapshot.subxcnt = xcnt = parseIntFromText("sxcnt:", &filebuf, path);
+	snapshot.subxip = NULL;
 
-	if (!snapshot.suboverflowed)
+	if (snapshot.subxcnt)
 	{
-		snapshot.subxcnt = xcnt = parseIntFromText("sxcnt:", &filebuf, path);
-
 		/* sanity-check the xid count before palloc */
 		if (xcnt < 0 || xcnt > GetMaxSnapshotSubxidCount())
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid snapshot data in file \"%s\"", path)));
 
-		snapshot.subxip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
+		snapshot.subxip = palloc_array(TransactionId, xcnt);
 		for (i = 0; i < xcnt; i++)
 			snapshot.subxip[i] = parseXidFromText("sxp:", &filebuf, path);
-	}
-	else
-	{
-		snapshot.subxcnt = 0;
-		snapshot.subxip = NULL;
 	}
 
 	snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
@@ -1690,7 +1769,7 @@ EstimateSnapshotSpace(Snapshot snapshot)
 void
 SerializeSnapshot(Snapshot snapshot, char *start_address)
 {
-	SerializedSnapshotData serialized_snapshot;
+	SerializedSnapshotData serialized_snapshot = {0};
 
 	Assert(snapshot->subxcnt >= 0);
 
@@ -1702,8 +1781,6 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.suboverflowed = snapshot->suboverflowed;
 	serialized_snapshot.takenDuringRecovery = snapshot->takenDuringRecovery;
 	serialized_snapshot.curcid = snapshot->curcid;
-	serialized_snapshot.whenTaken = snapshot->whenTaken;
-	serialized_snapshot.lsn = snapshot->lsn;
 
 	/*
 	 * Ignore the SubXID array if it has overflowed, unless the snapshot was
@@ -1776,8 +1853,6 @@ RestoreSnapshot(char *start_address)
 	snapshot->suboverflowed = serialized_snapshot.suboverflowed;
 	snapshot->takenDuringRecovery = serialized_snapshot.takenDuringRecovery;
 	snapshot->curcid = serialized_snapshot.curcid;
-	snapshot->whenTaken = serialized_snapshot.whenTaken;
-	snapshot->lsn = serialized_snapshot.lsn;
 	snapshot->snapXactCompletionCount = 0;
 
 	/* Copy XIDs, if present. */
@@ -1807,12 +1882,9 @@ RestoreSnapshot(char *start_address)
 
 /*
  * Install a restored snapshot as the transaction snapshot.
- *
- * The second argument is of type void * so that snapmgr.h need not include
- * the declaration for PGPROC.
  */
 void
-RestoreTransactionSnapshot(Snapshot snapshot, void *source_pgproc)
+RestoreTransactionSnapshot(Snapshot snapshot, PGPROC *source_pgproc)
 {
 	SetTransactionSnapshot(snapshot, NULL, InvalidPid, source_pgproc);
 }
@@ -1922,4 +1994,12 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	}
 
 	return false;
+}
+
+/* ResourceOwner callbacks */
+
+static void
+ResOwnerReleaseSnapshot(Datum res)
+{
+	UnregisterSnapshotNoOwner((Snapshot) DatumGetPointer(res));
 }

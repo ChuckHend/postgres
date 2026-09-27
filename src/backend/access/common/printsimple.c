@@ -8,7 +8,7 @@
  *	  doesn't handle standalone backends or protocol versions other than
  *	  3.0, because we don't need such handling for current applications.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,9 +20,10 @@
 
 #include "access/printsimple.h"
 #include "catalog/pg_type.h"
-#include "libpq/protocol.h"
 #include "libpq/pqformat.h"
+#include "libpq/protocol.h"
 #include "utils/builtins.h"
+#include "varatt.h"
 
 /*
  * At startup time, send a RowDescription message.
@@ -95,8 +96,7 @@ printsimple(TupleTableSlot *slot, DestReceiver *self)
 
 					pq_sendcountedtext(&buf,
 									   VARDATA_ANY(t),
-									   VARSIZE_ANY_EXHDR(t),
-									   false);
+									   VARSIZE_ANY_EXHDR(t));
 				}
 				break;
 
@@ -107,7 +107,7 @@ printsimple(TupleTableSlot *slot, DestReceiver *self)
 					int			len;
 
 					len = pg_ltoa(num, str);
-					pq_sendcountedtext(&buf, str, len, false);
+					pq_sendcountedtext(&buf, str, len);
 				}
 				break;
 
@@ -118,18 +118,18 @@ printsimple(TupleTableSlot *slot, DestReceiver *self)
 					int			len;
 
 					len = pg_lltoa(num, str);
-					pq_sendcountedtext(&buf, str, len, false);
+					pq_sendcountedtext(&buf, str, len);
 				}
 				break;
 
 			case OIDOID:
 				{
-					Oid			num = ObjectIdGetDatum(value);
+					Oid			num = DatumGetObjectId(value);
 					char		str[10];	/* 10 digits */
 					int			len;
 
 					len = pg_ultoa_n(num, str);
-					pq_sendcountedtext(&buf, str, len, false);
+					pq_sendcountedtext(&buf, str, len);
 				}
 				break;
 

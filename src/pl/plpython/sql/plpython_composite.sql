@@ -208,6 +208,17 @@ SELECT * FROM return_record_2('v4') AS (v1 int, v3 int, v2 int);
 SELECT * FROM return_record_2('v3') AS (v1 int, v3 int, v2 int);
 SELECT * FROM return_record_2('v3') AS (v1 int, v2 int, v3 int);
 
+-- recursion with a different inner result type didn't use to work
+CREATE FUNCTION return_record_3(t text) RETURNS record AS $$
+if t == "text":
+     plpy.execute("SELECT * FROM return_record_3('int') AS (a int)");
+     return { "a": "x" }
+elif t == "int":
+     return { "a": 1 }
+$$ LANGUAGE plpython3u;
+
+SELECT * FROM return_record_3('text') AS (a text);
+
 -- multi-dimensional array of composite types.
 CREATE FUNCTION composite_type_as_list()  RETURNS type_record[] AS $$
   return [[('first', 1), ('second', 1)], [('first', 2), ('second', 2)], [('first', 3), ('second', 3)]];
@@ -222,3 +233,15 @@ CREATE FUNCTION composite_type_as_list_broken()  RETURNS type_record[] AS $$
   return [['first', 1]];
 $$ LANGUAGE plpython3u;
 SELECT * FROM composite_type_as_list_broken();
+
+-- A custom sequence whose length matches the tuple but whose __getitem__
+-- raises should be reported as an error, not crash the backend.
+CREATE FUNCTION composite_type_as_broken_sequence() RETURNS type_record AS $$
+class C:
+    def __len__(self):
+        return 2
+    def __getitem__(self, i):
+        raise ValueError('getitem failed')
+return C()
+$$ LANGUAGE plpython3u;
+SELECT * FROM composite_type_as_broken_sequence();

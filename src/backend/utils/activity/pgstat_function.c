@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_function.c
@@ -113,7 +113,7 @@ pgstat_init_function_usage(FunctionCallInfo fcinfo,
 		if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(fcinfo->flinfo->fn_oid)))
 		{
 			pgstat_drop_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId,
-							  fcinfo->flinfo->fn_oid);
+							  fcinfo->flinfo->fn_oid, true);
 			ereport(ERROR, errcode(ERRCODE_UNDEFINED_FUNCTION),
 					errmsg("function call to dropped function"));
 		}
@@ -186,8 +186,8 @@ pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu, bool finalize)
 /*
  * Flush out pending stats for the entry
  *
- * If nowait is true, this function returns false if lock could not
- * immediately acquired, otherwise true is returned.
+ * If nowait is true and the lock could not be immediately acquired, returns
+ * false without flushing the entry.  Otherwise returns true.
  */
 bool
 pgstat_function_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
@@ -212,6 +212,12 @@ pgstat_function_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	pgstat_unlock_entry(entry_ref);
 
 	return true;
+}
+
+void
+pgstat_function_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
+{
+	((PgStatShared_Function *) header)->stats.stat_reset_timestamp = ts;
 }
 
 /*
@@ -239,5 +245,5 @@ PgStat_StatFuncEntry *
 pgstat_fetch_stat_funcentry(Oid func_id)
 {
 	return (PgStat_StatFuncEntry *)
-		pgstat_fetch_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id);
+		pgstat_fetch_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id, NULL);
 }

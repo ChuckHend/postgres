@@ -222,6 +222,7 @@ RESET enable_bitmapscan;
 
 DROP INDEX wowidx;
 
+ALTER TABLE test_tsvector SET (parallel_workers = 2);
 CREATE INDEX wowidx ON test_tsvector USING gin (a);
 
 SET enable_seqscan=OFF;
@@ -646,6 +647,14 @@ SELECT ts_headline('english',
 SELECT ts_headline('english',
 'foo bar', to_tsquery('english', ''));
 
+-- Test for large values of StartSel, StopSel and FragmentDelimiter
+SELECT ts_headline('english', 'foo barbar', to_tsquery('english', 'foo'),
+  'StartSel=' || repeat('x', 32768));
+SELECT ts_headline('english', 'foo barbar', to_tsquery('english', 'foo'),
+  'StopSel=' || repeat('x', 32768));
+SELECT ts_headline('english', 'foo barbar', to_tsquery('english', 'foo'),
+  'FragmentDelimiter=' || repeat('x', 32768));
+
 --Rewrite sub system
 
 CREATE TABLE test_tsquery (txtkeyword TEXT, txtsample TEXT);
@@ -818,7 +827,10 @@ select websearch_to_tsquery('simple', ':');
 select websearch_to_tsquery('simple', 'abc & def');
 select websearch_to_tsquery('simple', 'abc | def');
 select websearch_to_tsquery('simple', 'abc <-> def');
+
+-- parens are ignored, too
 select websearch_to_tsquery('simple', 'abc (pg or class)');
+select websearch_to_tsquery('simple', '(foo bar) or (ding dong)');
 
 -- NOT is ignored in quotes
 select websearch_to_tsquery('english', 'My brand new smartphone');

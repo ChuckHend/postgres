@@ -8,6 +8,19 @@
 -- conditio sine qua non
 SHOW track_counts;  -- must be on
 
+-- List of backend types, contexts and objects tracked in pg_stat_io.
+\a
+SELECT backend_type, object, context FROM pg_stat_io
+  ORDER BY backend_type COLLATE "C", object COLLATE "C", context COLLATE "C";
+\a
+
+-- List of registered statistics kinds.
+SELECT id, name, fixed_amount,
+    accessed_across_databases AS across_db, write_to_file
+  FROM pg_stat_kind_info
+  WHERE builtin
+  ORDER BY id;
+
 -- ensure that both seqscan and indexscan plans are allowed
 SET enable_seqscan TO on;
 SET enable_indexscan TO on;
@@ -38,6 +51,7 @@ CREATE TABLE trunc_stats_test1(id serial, stuff text);
 CREATE TABLE trunc_stats_test2(id serial);
 CREATE TABLE trunc_stats_test3(id serial, stuff text);
 CREATE TABLE trunc_stats_test4(id serial);
+CREATE TABLE trunc_stats_test5(id serial);
 
 -- check that n_live_tup is reset to 0 after truncate
 INSERT INTO trunc_stats_test DEFAULT VALUES;
@@ -90,6 +104,15 @@ TRUNCATE trunc_stats_test4;
 INSERT INTO trunc_stats_test4 DEFAULT VALUES;
 ROLLBACK;
 
+-- truncate-only flush: this should count 3 inserts, 1 update and 1 delete.
+INSERT INTO trunc_stats_test5 DEFAULT VALUES;
+INSERT INTO trunc_stats_test5 DEFAULT VALUES;
+INSERT INTO trunc_stats_test5 DEFAULT VALUES;
+UPDATE trunc_stats_test5 SET id = id + 10 WHERE id = 1;
+DELETE FROM trunc_stats_test5 WHERE id = 2;
+SELECT pg_stat_force_next_flush();
+TRUNCATE trunc_stats_test5;
+
 -- do a seqscan
 SELECT count(*) FROM tenk2;
 -- do an indexscan
@@ -109,6 +132,10 @@ SELECT relname, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup
   FROM pg_stat_user_tables
  WHERE relname like 'trunc_stats_test%' order by relname;
 
+SELECT relname, n_ins_since_vacuum
+  FROM pg_stat_user_tables
+ WHERE relname = 'trunc_stats_test5';
+
 SELECT st.seq_scan >= pr.seq_scan + 1,
        st.seq_tup_read >= pr.seq_tup_read + cl.reltuples,
        st.idx_scan >= pr.idx_scan + 1,
@@ -125,6 +152,38 @@ SELECT pr.snap_ts < pg_stat_get_snapshot_timestamp() as snapshot_newer
 FROM prevstats AS pr;
 
 COMMIT;
+
+-----
+-- Basic tests for pg_stat_all_indexes
+-----
+CREATE TEMPORARY TABLE test_idx_tup_read AS
+  SELECT g AS a FROM generate_series(1, 200) g;
+CREATE INDEX ON test_idx_tup_read(a);
+
+BEGIN;
+SET LOCAL enable_seqscan TO off;
+
+-- plain index scan
+SET LOCAL enable_bitmapscan TO off;
+EXPLAIN (COSTS off) SELECT count(*) FROM test_idx_tup_read WHERE a BETWEEN 1 AND 200;
+SELECT count(*) FROM test_idx_tup_read WHERE a BETWEEN 1 AND 200;
+-- bitmap index scan
+SET LOCAL enable_indexscan TO off;
+SET LOCAL enable_bitmapscan TO on;
+EXPLAIN (COSTS off) SELECT count(*) FROM test_idx_tup_read WHERE a BETWEEN 1 AND 200;
+SELECT count(*) FROM test_idx_tup_read WHERE a BETWEEN 1 AND 200;
+
+COMMIT;
+
+-- We expect 2 index scans and a total of 400 tuples read (200 from plain
+-- index scan, 200 from bitmap index scan).  However, we only expect 200 tuple
+-- fetches, because bitmap index scans/heap scans don't affect the relevant
+-- counter.
+SELECT pg_stat_force_next_flush();
+SELECT idx_scan, idx_tup_read, idx_tup_fetch FROM pg_stat_all_indexes
+  WHERE indexrelid = 'test_idx_tup_read_a_idx'::regclass;
+
+DROP TABLE test_idx_tup_read;
 
 ----
 -- Basic tests for track_functions
@@ -286,7 +345,7 @@ RELEASE SAVEPOINT sp1;
 COMMIT;
 SELECT pg_stat_get_live_tuples(:drop_stats_test_subxact_oid);
 
-DROP TABLE trunc_stats_test, trunc_stats_test1, trunc_stats_test2, trunc_stats_test3, trunc_stats_test4;
+DROP TABLE trunc_stats_test, trunc_stats_test1, trunc_stats_test2, trunc_stats_test3, trunc_stats_test4, trunc_stats_test5;
 DROP TABLE prevstats;
 
 
@@ -306,8 +365,11 @@ SELECT pg_stat_force_next_flush();
 SELECT last_seq_scan, last_idx_scan FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
 COMMIT;
 
+SELECT stats_reset IS NOT NULL AS has_stats_reset
+  FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
 SELECT pg_stat_reset_single_table_counters('test_last_scan'::regclass);
-SELECT seq_scan, idx_scan FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
+SELECT seq_scan, idx_scan, stats_reset IS NOT NULL AS has_stats_reset
+  FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
 
 -- ensure we start out with exactly one index and sequential scan
 BEGIN;
@@ -376,6 +438,17 @@ COMMIT;
 SELECT seq_scan, :'test_last_seq' = last_seq_scan AS seq_ok, idx_scan, :'test_last_idx' < last_idx_scan AS idx_ok
 FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
 
+-- check the stats in pg_stat_all_indexes
+SELECT idx_scan, :'test_last_idx' < last_idx_scan AS idx_ok,
+  stats_reset IS NOT NULL AS has_stats_reset
+  FROM pg_stat_all_indexes WHERE indexrelid = 'test_last_scan_pkey'::regclass;
+
+-- check that the stats in pg_stat_all_indexes are reset
+SELECT pg_stat_reset_single_index_counters('test_last_scan_pkey'::regclass);
+
+SELECT idx_scan, stats_reset IS NOT NULL AS has_stats_reset
+  FROM pg_stat_all_indexes WHERE indexrelid = 'test_last_scan_pkey'::regclass;
+
 -----
 -- Test reset of some stats for shared table
 -----
@@ -396,9 +469,17 @@ COMMIT;
 -- check that the stats are reset.
 SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
   WHERE relid = 'pg_shdescription'::regclass;
+-- stats_reset may not be set for datid=0 and shared objects in
+-- pg_stat_database, so reset once.
 SELECT pg_stat_reset_single_table_counters('pg_shdescription'::regclass);
 SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
   WHERE relid = 'pg_shdescription'::regclass;
+SELECT stats_reset AS shared_db_reset_before
+  FROM pg_stat_database WHERE datid = 0 \gset
+-- Second reset for comparison.
+SELECT pg_stat_reset_single_table_counters('pg_shdescription'::regclass);
+SELECT stats_reset > :'shared_db_reset_before'::timestamptz AS has_updated
+  FROM pg_stat_database WHERE datid = 0;
 
 -- set back comment
 \if :{?description_before}
@@ -412,28 +493,40 @@ SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
 -----
 
 -- Test that sessions is incremented when a new session is started in pg_stat_database
-SELECT sessions AS db_stat_sessions FROM pg_stat_database WHERE datname = (SELECT current_database()) \gset
+SELECT sessions AS db_stat_sessions FROM pg_stat_database WHERE datname = current_database() \gset
 \c
 SELECT pg_stat_force_next_flush();
-SELECT sessions > :db_stat_sessions FROM pg_stat_database WHERE datname = (SELECT current_database());
+SELECT sessions > :db_stat_sessions FROM pg_stat_database WHERE datname = current_database();
 
--- Test pg_stat_bgwriter checkpointer-related stats, together with pg_stat_wal
-SELECT checkpoints_req AS rqst_ckpts_before FROM pg_stat_bgwriter \gset
+-- Test pg_stat_checkpointer checkpointer-related stats, together with pg_stat_wal
+SELECT num_requested AS rqst_ckpts_before FROM pg_stat_checkpointer \gset
 
--- Test pg_stat_wal (and make a temp table so our temp schema exists)
+-- Test pg_stat_wal
 SELECT wal_bytes AS wal_bytes_before FROM pg_stat_wal \gset
 
+-- Test pg_stat_get_backend_wal()
+SELECT wal_bytes AS backend_wal_bytes_before from pg_stat_get_backend_wal(pg_backend_pid()) \gset
+
+-- Make a temp table so our temp schema exists
 CREATE TEMP TABLE test_stats_temp AS SELECT 17;
 DROP TABLE test_stats_temp;
 
 -- Checkpoint twice: The checkpointer reports stats after reporting completion
 -- of the checkpoint. But after a second checkpoint we'll see at least the
 -- results of the first.
-CHECKPOINT;
-CHECKPOINT;
+--
+-- While at it, test checkpoint options.  Note that we don't test MODE SPREAD
+-- because it would prolong the test.
+CHECKPOINT (WRONG);
+CHECKPOINT (MODE WRONG);
+CHECKPOINT (MODE FAST, FLUSH_UNLOGGED FALSE);
+CHECKPOINT (FLUSH_UNLOGGED);
 
-SELECT checkpoints_req > :rqst_ckpts_before FROM pg_stat_bgwriter;
+SELECT num_requested > :rqst_ckpts_before FROM pg_stat_checkpointer;
 SELECT wal_bytes > :wal_bytes_before FROM pg_stat_wal;
+
+SELECT pg_stat_force_next_flush();
+SELECT wal_bytes > :backend_wal_bytes_before FROM pg_stat_get_backend_wal(pg_backend_pid());
 
 -- Test pg_stat_get_backend_idset() and some allied functions.
 -- In particular, verify that their notion of backend ID matches
@@ -447,48 +540,77 @@ WHERE pg_stat_get_backend_pid(beid) = pg_backend_pid();
 -----
 
 -- Test that reset_slru with a specified SLRU works.
-SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'CommitTs' \gset
-SELECT stats_reset AS slru_notify_reset_ts FROM pg_stat_slru WHERE name = 'Notify' \gset
-SELECT pg_stat_reset_slru('CommitTs');
-SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'CommitTs';
-SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'CommitTs' \gset
+SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'commit_timestamp' \gset
+SELECT stats_reset AS slru_notify_reset_ts FROM pg_stat_slru WHERE name = 'notify' \gset
+SELECT pg_stat_reset_slru('commit_timestamp');
+SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'commit_timestamp';
+SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'commit_timestamp' \gset
 
 -- Test that multiple SLRUs are reset when no specific SLRU provided to reset function
-SELECT pg_stat_reset_slru(NULL);
-SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'CommitTs';
-SELECT stats_reset > :'slru_notify_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'Notify';
+SELECT pg_stat_reset_slru();
+SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'commit_timestamp';
+SELECT stats_reset > :'slru_notify_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'notify';
 
 -- Test that reset_shared with archiver specified as the stats type works
 SELECT stats_reset AS archiver_reset_ts FROM pg_stat_archiver \gset
 SELECT pg_stat_reset_shared('archiver');
 SELECT stats_reset > :'archiver_reset_ts'::timestamptz FROM pg_stat_archiver;
-SELECT stats_reset AS archiver_reset_ts FROM pg_stat_archiver \gset
 
 -- Test that reset_shared with bgwriter specified as the stats type works
 SELECT stats_reset AS bgwriter_reset_ts FROM pg_stat_bgwriter \gset
 SELECT pg_stat_reset_shared('bgwriter');
 SELECT stats_reset > :'bgwriter_reset_ts'::timestamptz FROM pg_stat_bgwriter;
-SELECT stats_reset AS bgwriter_reset_ts FROM pg_stat_bgwriter \gset
+
+-- Test that reset_shared with checkpointer specified as the stats type works
+SELECT stats_reset AS checkpointer_reset_ts FROM pg_stat_checkpointer \gset
+SELECT pg_stat_reset_shared('checkpointer');
+SELECT stats_reset > :'checkpointer_reset_ts'::timestamptz FROM pg_stat_checkpointer;
+
+-- Test that reset_shared with recovery_prefetch specified as the stats type works
+SELECT stats_reset AS recovery_prefetch_reset_ts FROM pg_stat_recovery_prefetch \gset
+SELECT pg_stat_reset_shared('recovery_prefetch');
+SELECT stats_reset > :'recovery_prefetch_reset_ts'::timestamptz FROM pg_stat_recovery_prefetch;
+
+-- Test that reset_shared with slru specified as the stats type works
+SELECT max(stats_reset) AS slru_reset_ts FROM pg_stat_slru \gset
+SELECT pg_stat_reset_shared('slru');
+SELECT max(stats_reset) > :'slru_reset_ts'::timestamptz FROM pg_stat_slru;
 
 -- Test that reset_shared with wal specified as the stats type works
 SELECT stats_reset AS wal_reset_ts FROM pg_stat_wal \gset
 SELECT pg_stat_reset_shared('wal');
 SELECT stats_reset > :'wal_reset_ts'::timestamptz FROM pg_stat_wal;
-SELECT stats_reset AS wal_reset_ts FROM pg_stat_wal \gset
 
--- Test that reset_shared with no specified stats type doesn't reset anything
-SELECT pg_stat_reset_shared(NULL);
-SELECT stats_reset = :'archiver_reset_ts'::timestamptz FROM pg_stat_archiver;
-SELECT stats_reset = :'bgwriter_reset_ts'::timestamptz FROM pg_stat_bgwriter;
-SELECT stats_reset = :'wal_reset_ts'::timestamptz FROM pg_stat_wal;
+-- Test error case for reset_shared with unknown stats type
+SELECT pg_stat_reset_shared('unknown');
 
--- Test that reset works for pg_stat_database
+-- Test that reset works for pg_stat_database and pg_stat_database_conflicts
 
--- Since pg_stat_database stats_reset starts out as NULL, reset it once first so we have something to compare it to
+-- Since pg_stat_database stats_reset starts out as NULL, reset it once first so that we
+-- have a baseline for comparison. The same for pg_stat_database_conflicts as it shares
+-- the same stats_reset as pg_stat_database.
 SELECT pg_stat_reset();
-SELECT stats_reset AS db_reset_ts FROM pg_stat_database WHERE datname = (SELECT current_database()) \gset
+SELECT stats_reset AS db_reset_ts FROM pg_stat_database WHERE datname = current_database() \gset
+SELECT stats_reset AS dbc_reset_ts FROM pg_stat_database_conflicts WHERE datname = current_database() \gset
+SELECT :'db_reset_ts'::timestamptz = :'dbc_reset_ts'::timestamptz;
 SELECT pg_stat_reset();
-SELECT stats_reset > :'db_reset_ts'::timestamptz FROM pg_stat_database WHERE datname = (SELECT current_database());
+SELECT stats_reset > :'db_reset_ts'::timestamptz FROM pg_stat_database WHERE datname = current_database();
+SELECT stats_reset > :'dbc_reset_ts'::timestamptz FROM pg_stat_database_conflicts WHERE datname = current_database();
+
+-- Test that reset works for pg_statio_all_sequences
+
+-- Use the sequence to accumulate its stats, and reset them once first
+-- so that we have a baseline for comparison, similar to the previous test.
+-- stats_reset to compare to.
+CREATE SEQUENCE test_seq1;
+SELECT nextval('test_seq1');
+SELECT pg_stat_reset_single_table_counters('test_seq1'::regclass);
+SELECT stats_reset AS seq_reset_ts
+  FROM pg_statio_all_sequences WHERE relname ='test_seq1' \gset
+SELECT pg_stat_reset_single_table_counters('test_seq1'::regclass);
+SELECT stats_reset > :'seq_reset_ts'::timestamptz
+  FROM pg_statio_all_sequences WHERE relname ='test_seq1';
+DROP SEQUENCE test_seq1;
 
 
 ----
@@ -533,7 +655,7 @@ ROLLBACK;
 SELECT pg_stat_have_stats('bgwriter', 0, 0);
 -- unknown stats kinds error out
 SELECT pg_stat_have_stats('zaphod', 0, 0);
--- db stats have objoid 0
+-- db stats have objid 0
 SELECT pg_stat_have_stats('database', :dboid, 1);
 SELECT pg_stat_have_stats('database', :dboid, 0);
 
@@ -543,40 +665,40 @@ CREATE index stats_test_idx1 on stats_test_tab1(a);
 SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
 SET enable_seqscan TO off;
 select a from stats_test_tab1 where a = 3;
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 
 -- pg_stat_have_stats returns false for dropped index with stats
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 DROP index stats_test_idx1;
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 
 -- pg_stat_have_stats returns false for rolled back index creation
 BEGIN;
 CREATE index stats_test_idx1 on stats_test_tab1(a);
 SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
 select a from stats_test_tab1 where a = 3;
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 ROLLBACK;
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 
 -- pg_stat_have_stats returns true for reindex CONCURRENTLY
 CREATE index stats_test_idx1 on stats_test_tab1(a);
 SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
 select a from stats_test_tab1 where a = 3;
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 REINDEX index CONCURRENTLY stats_test_idx1;
 -- false for previous oid
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 -- true for new oid
 SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 
 -- pg_stat_have_stats returns true for a rolled back drop index with stats
 BEGIN;
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 DROP index stats_test_idx1;
 ROLLBACK;
-SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+SELECT pg_stat_have_stats('index', :dboid, :stats_test_idx1_oid);
 
 -- put enable_seqscan back to on
 SET enable_seqscan TO on;
@@ -586,32 +708,49 @@ SELECT pg_stat_get_replication_slot(NULL);
 SELECT pg_stat_get_subscription_stats(NULL);
 
 
--- Test that the following operations are tracked in pg_stat_io:
+-- Test that the following operations are tracked in pg_stat_io and in
+-- backend stats:
 -- - reads of target blocks into shared buffers
 -- - writes of shared buffers to permanent storage
 -- - extends of relations using shared buffers
 -- - fsyncs done to ensure the durability of data dirtying shared buffers
 -- - shared buffer hits
+-- - WAL writes and fsyncs in IOContext IOCONTEXT_NORMAL
 
 -- There is no test for blocks evicted from shared buffers, because we cannot
 -- be sure of the state of shared buffers at the point the test is run.
 
 -- Create a regular table and insert some data to generate IOCONTEXT_NORMAL
 -- extends.
+SELECT pid AS checkpointer_pid FROM pg_stat_activity
+  WHERE backend_type = 'checkpointer' \gset
 SELECT sum(extends) AS io_sum_shared_before_extends
   FROM pg_stat_io WHERE context = 'normal' AND object = 'relation' \gset
+SELECT sum(extends) AS my_io_sum_shared_before_extends
+  FROM pg_stat_get_backend_io(pg_backend_pid())
+  WHERE context = 'normal' AND object = 'relation' \gset
 SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
   FROM pg_stat_io
   WHERE object = 'relation' \gset io_sum_shared_before_
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_get_backend_io(pg_backend_pid())
+  WHERE object = 'relation' \gset my_io_sum_shared_before_
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE context = 'normal' AND object = 'wal' \gset io_sum_wal_normal_before_
 CREATE TABLE test_io_shared(a int);
 INSERT INTO test_io_shared SELECT i FROM generate_series(1,100)i;
 SELECT pg_stat_force_next_flush();
 SELECT sum(extends) AS io_sum_shared_after_extends
   FROM pg_stat_io WHERE context = 'normal' AND object = 'relation' \gset
 SELECT :io_sum_shared_after_extends > :io_sum_shared_before_extends;
+SELECT sum(extends) AS my_io_sum_shared_after_extends
+  FROM pg_stat_get_backend_io(pg_backend_pid())
+  WHERE context = 'normal' AND object = 'relation' \gset
+SELECT :my_io_sum_shared_after_extends > :my_io_sum_shared_before_extends;
 
 -- After a checkpoint, there should be some additional IOCONTEXT_NORMAL writes
--- and fsyncs.
+-- and fsyncs in the global stats (usually not for the backend).
 -- See comment above for rationale for two explicit CHECKPOINTs.
 CHECKPOINT;
 CHECKPOINT;
@@ -621,6 +760,20 @@ SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
 SELECT :io_sum_shared_after_writes > :io_sum_shared_before_writes;
 SELECT current_setting('fsync') = 'off'
   OR :io_sum_shared_after_fsyncs > :io_sum_shared_before_fsyncs;
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_get_backend_io(pg_backend_pid())
+  WHERE object = 'relation' \gset my_io_sum_shared_after_
+SELECT :my_io_sum_shared_after_writes >= :my_io_sum_shared_before_writes;
+SELECT current_setting('fsync') = 'off'
+  OR :my_io_sum_shared_after_fsyncs >= :my_io_sum_shared_before_fsyncs;
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE context = 'normal' AND object = 'wal' \gset io_sum_wal_normal_after_
+SELECT current_setting('synchronous_commit') = 'on';
+SELECT :io_sum_wal_normal_after_writes > :io_sum_wal_normal_before_writes;
+SELECT current_setting('fsync') = 'off'
+  OR current_setting('wal_sync_method') IN ('open_sync', 'open_datasync')
+  OR :io_sum_wal_normal_after_fsyncs > :io_sum_wal_normal_before_fsyncs;
 
 -- Change the tablespace so that the table is rewritten directly, then SELECT
 -- from it to cause it to be read back into shared buffers.
@@ -753,11 +906,27 @@ SELECT :io_sum_bulkwrite_strategy_extends_after > :io_sum_bulkwrite_strategy_ext
 SELECT pg_stat_have_stats('io', 0, 0);
 SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_pre_reset
   FROM pg_stat_io \gset
+SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS my_io_stats_pre_reset
+  FROM pg_stat_get_backend_io(pg_backend_pid()) \gset
 SELECT pg_stat_reset_shared('io');
 SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_post_reset
   FROM pg_stat_io \gset
 SELECT :io_stats_post_reset < :io_stats_pre_reset;
+SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS my_io_stats_post_reset
+  FROM pg_stat_get_backend_io(pg_backend_pid()) \gset
+-- pg_stat_reset_shared() did not reset backend IO stats
+SELECT :my_io_stats_pre_reset <= :my_io_stats_post_reset;
+-- but pg_stat_reset_backend_stats() does
+SELECT pg_stat_reset_backend_stats(pg_backend_pid());
+SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS my_io_stats_post_backend_reset
+  FROM pg_stat_get_backend_io(pg_backend_pid()) \gset
+SELECT :my_io_stats_pre_reset > :my_io_stats_post_backend_reset;
 
+-- Check invalid input for pg_stat_get_backend_io()
+SELECT pg_stat_get_backend_io(NULL);
+SELECT pg_stat_get_backend_io(0);
+-- Auxiliary processes return no data.
+SELECT pg_stat_get_backend_io(:checkpointer_pid);
 
 -- test BRIN index doesn't block HOT update
 CREATE TABLE brin_hot (
@@ -839,5 +1008,66 @@ SELECT COUNT(*) FROM brin_hot_3 WHERE a = 2;
 DROP TABLE brin_hot_3;
 
 SET enable_seqscan = on;
+
+-- Test that estimation of relation size works with tuples wider than the
+-- relation fillfactor. We create a table with wide inline attributes and
+-- low fillfactor, insert rows and then see how many rows EXPLAIN shows
+-- before running analyze. We disable autovacuum so that it does not
+-- interfere with the test.
+CREATE TABLE table_fillfactor (
+  n char(1000)
+) with (fillfactor=10, autovacuum_enabled=off);
+
+INSERT INTO table_fillfactor
+SELECT 'x' FROM generate_series(1,1000);
+
+SELECT * FROM check_estimated_rows('SELECT * FROM table_fillfactor');
+
+DROP TABLE table_fillfactor;
+
+-- Test fastpath_exceeded stat
+CREATE TABLE part_test (id int) PARTITION BY RANGE (id);
+
+SELECT pg_stat_reset_shared('lock');
+
+-- Create partitions (exceeds number of slots)
+DO $$
+DECLARE
+  max_locks int;
+BEGIN
+  SELECT setting::int INTO max_locks
+  FROM pg_settings
+  WHERE name = 'max_locks_per_transaction';
+
+  FOR i IN 1..(max_locks + 10) LOOP
+    EXECUTE format(
+      'CREATE TABLE part_test_%s PARTITION OF part_test
+       FOR VALUES FROM (%s) TO (%s)',
+      i, (i-1)*1000, i*1000
+    );
+  END LOOP;
+END;
+$$;
+
+SELECT fastpath_exceeded AS fastpath_exceeded_before FROM pg_stat_lock WHERE locktype = 'relation' \gset
+
+-- Test pg_stat_get_backend_lock()
+SELECT fastpath_exceeded AS backend_fastpath_exceeded_before
+  FROM pg_stat_get_backend_lock(pg_backend_pid())
+  WHERE locktype = 'relation' \gset
+
+-- Needs a lock on each partition
+SELECT count(*) FROM part_test;
+
+-- Ensure pending stats are flushed
+SELECT pg_stat_force_next_flush();
+
+SELECT fastpath_exceeded > :fastpath_exceeded_before FROM pg_stat_lock WHERE locktype = 'relation';
+
+SELECT fastpath_exceeded > :backend_fastpath_exceeded_before
+  FROM pg_stat_get_backend_lock(pg_backend_pid())
+  WHERE locktype = 'relation';
+
+DROP TABLE part_test;
 
 -- End of Stats Test

@@ -22,7 +22,7 @@
  * the logic directly into that file as it's fairly simple, but it seems
  * cleaner to have everything related to progress reporting in one place.)
  *
- * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_progress.c
@@ -31,17 +31,14 @@
  */
 #include "postgres.h"
 
-#include "backup/basebackup.h"
 #include "backup/basebackup_sink.h"
 #include "commands/progress.h"
-#include "miscadmin.h"
 #include "pgstat.h"
-#include "storage/latch.h"
-#include "utils/timestamp.h"
 
 static void bbsink_progress_begin_backup(bbsink *sink);
 static void bbsink_progress_archive_contents(bbsink *sink, size_t len);
 static void bbsink_progress_end_archive(bbsink *sink);
+static void bbsink_progress_cleanup(bbsink *sink);
 
 static const bbsink_ops bbsink_progress_ops = {
 	.begin_backup = bbsink_progress_begin_backup,
@@ -52,7 +49,7 @@ static const bbsink_ops bbsink_progress_ops = {
 	.manifest_contents = bbsink_forward_manifest_contents,
 	.end_manifest = bbsink_forward_end_manifest,
 	.end_backup = bbsink_forward_end_backup,
-	.cleanup = bbsink_forward_cleanup
+	.cleanup = bbsink_progress_cleanup
 };
 
 /*
@@ -60,23 +57,28 @@ static const bbsink_ops bbsink_progress_ops = {
  * forwards data to a successor sink.
  */
 bbsink *
-bbsink_progress_new(bbsink *next, bool estimate_backup_size)
+bbsink_progress_new(bbsink *next, bool estimate_backup_size, bool incremental)
 {
 	bbsink	   *sink;
 
 	Assert(next != NULL);
 
-	sink = palloc0(sizeof(bbsink));
+	sink = palloc0_object(bbsink);
 	*((const bbsink_ops **) &sink->bbs_ops) = &bbsink_progress_ops;
 	sink->bbs_next = next;
 
 	/*
 	 * Report that a base backup is in progress, and set the total size of the
 	 * backup to -1, which will get translated to NULL. If we're estimating
-	 * the backup size, we'll insert the real estimate when we have it.
+	 * the backup size, we'll insert the real estimate when we have it. Also,
+	 * the backup type is set.
 	 */
 	pgstat_progress_start_command(PROGRESS_COMMAND_BASEBACKUP, InvalidOid);
 	pgstat_progress_update_param(PROGRESS_BASEBACKUP_BACKUP_TOTAL, -1);
+	pgstat_progress_update_param(PROGRESS_BASEBACKUP_BACKUP_TYPE,
+								 incremental
+								 ? PROGRESS_BASEBACKUP_BACKUP_TYPE_INCREMENTAL
+								 : PROGRESS_BASEBACKUP_BACKUP_TYPE_FULL);
 
 	return sink;
 }
@@ -184,6 +186,16 @@ bbsink_progress_archive_contents(bbsink *sink, size_t len)
 }
 
 /*
+ * Clean up progress reporting.
+ */
+static void
+bbsink_progress_cleanup(bbsink *sink)
+{
+	pgstat_progress_end_command();
+	bbsink_forward_cleanup(sink);
+}
+
+/*
  * Advertise that we are waiting for the start-of-backup checkpoint.
  */
 void
@@ -234,13 +246,4 @@ basebackup_progress_transfer_wal(void)
 {
 	pgstat_progress_update_param(PROGRESS_BASEBACKUP_PHASE,
 								 PROGRESS_BASEBACKUP_PHASE_TRANSFER_WAL);
-}
-
-/*
- * Advertise that we are no longer performing a backup.
- */
-void
-basebackup_progress_done(void)
-{
-	pgstat_progress_end_command();
 }

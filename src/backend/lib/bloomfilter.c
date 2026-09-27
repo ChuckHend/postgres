@@ -24,7 +24,7 @@
  * caller many authoritative lookups, such as expensive probes of a much larger
  * on-disk structure.
  *
- * Copyright (c) 2018-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2018-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/lib/bloomfilter.c
@@ -256,7 +256,7 @@ k_hashes(bloom_filter *filter, uint32 *hashes, unsigned char *elem, size_t len)
 	int			i;
 
 	/* Use 64-bit hashing to get two independent 32-bit hashes */
-	hash = DatumGetUInt64(hash_any_extended(elem, len, filter->seed));
+	hash = hash_bytes_extended(elem, len, filter->seed);
 	x = (uint32) hash;
 	y = (uint32) (hash >> 32);
 	m = filter->m;

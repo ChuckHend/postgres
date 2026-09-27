@@ -4,7 +4,7 @@
  *	  routines for dealing with posting lists.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -84,7 +84,7 @@
 #define MaxBytesPerInteger				7
 
 static inline uint64
-itemptr_to_uint64(const ItemPointer iptr)
+itemptr_to_uint64(const ItemPointerData *iptr)
 {
 	uint64		val;
 
@@ -194,7 +194,7 @@ decode_varbyte(unsigned char **ptr)
  * byte at the end, if any, is zero.
  */
 GinPostingList *
-ginCompressPostingList(const ItemPointer ipd, int nipd, int maxsize,
+ginCompressPostingList(const ItemPointerData *ipd, int nipd, int maxsize,
 					   int *nwritten)
 {
 	uint64		prev;
@@ -308,7 +308,7 @@ ginPostingListDecodeAllSegments(GinPostingList *segment, int len, int *ndecoded_
 	 * Guess an initial size of the array.
 	 */
 	nallocated = segment->nbytes * 2 + 1;
-	result = palloc(nallocated * sizeof(ItemPointerData));
+	result = palloc_array(ItemPointerData, nallocated);
 
 	ndecoded = 0;
 	while ((char *) segment < endseg)
@@ -317,7 +317,7 @@ ginPostingListDecodeAllSegments(GinPostingList *segment, int len, int *ndecoded_
 		if (ndecoded >= nallocated)
 		{
 			nallocated *= 2;
-			result = repalloc(result, nallocated * sizeof(ItemPointerData));
+			result = repalloc_array(result, ItemPointerData, nallocated);
 		}
 
 		/* copy the first item */
@@ -335,7 +335,7 @@ ginPostingListDecodeAllSegments(GinPostingList *segment, int len, int *ndecoded_
 			if (ndecoded >= nallocated)
 			{
 				nallocated *= 2;
-				result = repalloc(result, nallocated * sizeof(ItemPointerData));
+				result = repalloc_array(result, ItemPointerData, nallocated);
 			}
 
 			val += decode_varbyte(&ptr);
@@ -381,7 +381,7 @@ ginMergeItemPointers(ItemPointerData *a, uint32 na,
 {
 	ItemPointerData *dst;
 
-	dst = (ItemPointer) palloc((na + nb) * sizeof(ItemPointerData));
+	dst = palloc_array(ItemPointerData, na + nb);
 
 	/*
 	 * If the argument arrays don't overlap, we can just append them to each

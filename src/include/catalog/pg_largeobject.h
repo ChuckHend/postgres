@@ -4,7 +4,7 @@
  *	  definition of the "large object" system catalog (pg_largeobject)
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_largeobject.h
@@ -19,13 +19,16 @@
 #define PG_LARGEOBJECT_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_largeobject_d.h"
+#include "catalog/pg_largeobject_d.h"	/* IWYU pragma: export */
+#include "utils/snapshot.h"
 
 /* ----------------
  *		pg_largeobject definition.  cpp turns this into
  *		typedef struct FormData_pg_largeobject
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_largeobject,2613,LargeObjectRelationId)
 {
 	Oid			loid BKI_LOOKUP(pg_largeobject_metadata);	/* Identifier of large
@@ -36,6 +39,8 @@ CATALOG(pg_largeobject,2613,LargeObjectRelationId)
 	bytea		data BKI_FORCE_NOT_NULL;	/* Data for page (may be
 											 * zero-length) */
 } FormData_pg_largeobject;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_largeobject corresponds to a pointer to a tuple with
@@ -49,5 +54,6 @@ DECLARE_UNIQUE_INDEX_PKEY(pg_largeobject_loid_pn_index, 2683, LargeObjectLOidPNI
 extern Oid	LargeObjectCreate(Oid loid);
 extern void LargeObjectDrop(Oid loid);
 extern bool LargeObjectExists(Oid loid);
+extern bool LargeObjectExistsWithSnapshot(Oid loid, Snapshot snapshot);
 
 #endif							/* PG_LARGEOBJECT_H */

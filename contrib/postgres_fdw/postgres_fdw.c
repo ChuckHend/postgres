@@ -3,7 +3,7 @@
  * postgres_fdw.c
  *		  Foreign-data wrapper for remote PostgreSQL servers
  *
- * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/postgres_fdw.c
@@ -17,12 +17,13 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/table.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_opfamily.h"
 #include "commands/defrem.h"
-#include "commands/explain.h"
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
 #include "commands/vacuum.h"
 #include "executor/execAsync.h"
+#include "executor/instrument.h"
 #include "foreign/fdwapi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -40,24 +41,32 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
+#include "pgstat.h"
 #include "postgres_fdw.h"
+#include "statistics/statistics.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
+#include "utils/timestamp.h"
+#include "utils/typcache.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "postgres_fdw",
+					.version = PG_VERSION
+);
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST	100.0
 
 /* Default CPU cost to process 1 row (above and beyond cpu_tuple_cost). */
-#define DEFAULT_FDW_TUPLE_COST		0.01
+#define DEFAULT_FDW_TUPLE_COST		0.2
 
 /* If no remote estimates, assume a sort costs 20% extra */
 #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
@@ -82,7 +91,23 @@ enum FdwScanPrivateIndex
 	 * String describing join i.e. names of relations being joined and types
 	 * of join, added when the scan is join
 	 */
-	FdwScanPrivateRelations
+	FdwScanPrivateRelations,
+
+	/*
+	 * List of per-RTE function metadata, indexed by base RTI offset.  Each
+	 * element is either NULL (for non-RTE_FUNCTION rels in this scan) or a
+	 * list of three-element lists (funcid, funcrettype, funccollation) -- one
+	 * inner list per function in the RTE.  Allows the executor to rebuild
+	 * TupleDesc entries for whole-row references to function RTEs.
+	 */
+	FdwScanPrivateFunctions,
+
+	/*
+	 * Integer node: minimum base RT index covered by the scan, used to
+	 * translate scan-local indexes to estate-rtable indexes after setrefs.c
+	 * flattens rtables.
+	 */
+	FdwScanPrivateMinRTIndex,
 };
 
 /*
@@ -108,7 +133,7 @@ enum FdwModifyPrivateIndex
 	/* has-returning flag (as a Boolean node) */
 	FdwModifyPrivateHasReturning,
 	/* Integer list of attribute numbers retrieved by RETURNING */
-	FdwModifyPrivateRetrievedAttrs
+	FdwModifyPrivateRetrievedAttrs,
 };
 
 /*
@@ -119,6 +144,11 @@ enum FdwModifyPrivateIndex
  * 2) Boolean flag showing if the remote query has a RETURNING clause
  * 3) Integer list of attribute numbers retrieved by RETURNING, if any
  * 4) Boolean flag showing if we set the command es_processed
+ * 5) Per-RTE function metadata (mirrors FdwScanPrivateFunctions; lets
+ *    the executor rebuild TupleDesc entries for whole-row Vars over
+ *    function RTEs absorbed into a foreign join)
+ * 6) Integer node: minimum base RT index of the scan (mirrors
+ *    FdwScanPrivateMinRTIndex)
  */
 enum FdwDirectModifyPrivateIndex
 {
@@ -129,7 +159,11 @@ enum FdwDirectModifyPrivateIndex
 	/* Integer list of attribute numbers retrieved by RETURNING */
 	FdwDirectModifyPrivateRetrievedAttrs,
 	/* set-processed flag (as a Boolean node) */
-	FdwDirectModifyPrivateSetProcessed
+	FdwDirectModifyPrivateSetProcessed,
+	/* Per-RTE function metadata, indexed by base RTI offset */
+	FdwDirectModifyPrivateFunctions,
+	/* Integer node: minimum base RT index in the scan */
+	FdwDirectModifyPrivateMinRTIndex,
 };
 
 /*
@@ -285,7 +319,7 @@ enum FdwPathPrivateIndex
 	/* has-final-sort flag (as a Boolean node) */
 	FdwPathPrivateHasFinalSort,
 	/* has-limit flag (as a Boolean node) */
-	FdwPathPrivateHasLimit
+	FdwPathPrivateHasLimit,
 };
 
 /* Struct for extra information passed to estimate_path_cost_size() */
@@ -315,6 +349,55 @@ typedef struct
 	Expr	   *current;		/* current expr, or NULL if not yet found */
 	List	   *already_used;	/* expressions already dealt with */
 } ec_member_foreign_arg;
+
+/* Column order in relation stats query */
+enum RelStatsColumns
+{
+	RELSTATS_RELPAGES = 0,
+	RELSTATS_RELTUPLES,
+	RELSTATS_RELKIND,
+	RELSTATS_RELHASSUBCLASS,
+	RELSTATS_NUM_FIELDS,
+};
+
+/* Column order in attribute stats query */
+enum AttStatsColumns
+{
+	ATTSTATS_ATTNAME = 0,
+	ATTSTATS_NULL_FRAC,
+	ATTSTATS_AVG_WIDTH,
+	ATTSTATS_N_DISTINCT,
+	ATTSTATS_MOST_COMMON_VALS,
+	ATTSTATS_MOST_COMMON_FREQS,
+	ATTSTATS_HISTOGRAM_BOUNDS,
+	ATTSTATS_CORRELATION,
+	ATTSTATS_MOST_COMMON_ELEMS,
+	ATTSTATS_MOST_COMMON_ELEM_FREQS,
+	ATTSTATS_ELEM_COUNT_HISTOGRAM,
+	ATTSTATS_RANGE_LENGTH_HISTOGRAM,
+	ATTSTATS_RANGE_EMPTY_FRAC,
+	ATTSTATS_RANGE_BOUNDS_HISTOGRAM,
+	ATTSTATS_NUM_FIELDS,
+};
+
+/* Results that are returned from a foreign statistics scan */
+typedef struct
+{
+	int			version;		/* version of remote server */
+	BlockNumber relpages;		/* # of pages in remote table */
+	double		reltuples;		/* # of tuples in remote table */
+	PGresult   *rel;			/* result for relation stats query */
+	PGresult   *att;			/* result for attribute stats query */
+} RemoteStatsResults;
+
+/* Pairs of remote columns with local columns */
+typedef struct
+{
+	AttrNumber	local_attnum;	/* attribute number of local column */
+	char	   *local_attname;	/* attribute name of local column */
+	char	   *remote_attname; /* attribute name of remote column */
+	int			res_index;		/* index of row in attribute stats result */
+} RemoteAttributeMapping;
 
 /*
  * SQL functions
@@ -401,6 +484,9 @@ static void postgresExecForeignTruncate(List *rels,
 static bool postgresAnalyzeForeignTable(Relation relation,
 										AcquireSampleRowsFunc *func,
 										BlockNumber *totalpages);
+static bool postgresImportForeignStatistics(Relation relation,
+											List *va_cols,
+											int elevel);
 static List *postgresImportForeignSchema(ImportForeignSchemaStmt *stmt,
 										 Oid serverOid);
 static void postgresGetForeignJoinPaths(PlannerInfo *root,
@@ -430,6 +516,7 @@ static void estimate_path_cost_size(PlannerInfo *root,
 									List *pathkeys,
 									PgFdwPathExtraData *fpextra,
 									double *p_rows, int *p_width,
+									int *p_disabled_nodes,
 									Cost *p_startup_cost, Cost *p_total_cost);
 static void get_remote_estimate(const char *sql,
 								PGconn *conn,
@@ -442,6 +529,7 @@ static void adjust_foreign_grouping_path_cost(PlannerInfo *root,
 											  double retrieved_rows,
 											  double width,
 											  double limit_tuples,
+											  int *p_disabled_nodes,
 											  Cost *p_startup_cost,
 											  Cost *p_run_cost);
 static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
@@ -504,6 +592,42 @@ static int	postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 										  double *totaldeadrows);
 static void analyze_row_processor(PGresult *res, int row,
 								  PgFdwAnalyzeState *astate);
+static bool fetch_remote_statistics(Relation relation,
+									List *va_cols,
+									const char *local_schemaname,
+									const char *local_relname,
+									ForeignTable *table,
+									ForeignServer *server,
+									RemoteStatsResults *remstats,
+									RemoteAttributeMapping **p_remattrmap,
+									int *p_attrcnt);
+static PGresult *fetch_relstats(PGconn *conn, Relation relation);
+static PGresult *fetch_attstats(PGconn *conn, int server_version_num,
+								const char *remote_schemaname, const char *remote_relname,
+								const char *column_list);
+static RemoteAttributeMapping *build_remattrmap(Relation relation, List *va_cols,
+												int *p_attrcnt, StringInfo column_list);
+static void free_remattrmap(RemoteAttributeMapping *map, int len);
+static bool attname_in_list(const char *attname, List *va_cols);
+static int	remattrmap_cmp(const void *v1, const void *v2);
+static bool match_attrmap(PGresult *res,
+						  const char *local_schemaname,
+						  const char *local_relname,
+						  const char *remote_schemaname,
+						  const char *remote_relname,
+						  RemoteAttributeMapping *remattrmap,
+						  int attrcnt);
+static bool import_fetched_statistics(Relation relation,
+									  const char *schemaname,
+									  const char *relname,
+									  RemoteStatsResults *remstats,
+									  const RemoteAttributeMapping *remattrmap,
+									  int attrcnt);
+static char *get_opt_value(PGresult *res, int row, int col);
+static void set_text_arg(NullableDatum *arg, const char *s);
+static void set_int32_arg(NullableDatum *arg, const char *s);
+static void set_float_arg(NullableDatum *arg, const char *s);
+static void set_floatarr_arg(NullableDatum *arg, const char *s);
 static void produce_tuple_asynchronously(AsyncRequest *areq, bool fetch);
 static void fetch_more_data_begin(AsyncRequest *areq);
 static void complete_pending_request(AsyncRequest *areq);
@@ -523,6 +647,9 @@ static bool foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 static List *get_useful_pathkeys_for_relation(PlannerInfo *root,
 											  RelOptInfo *rel);
 static List *get_useful_ecs_for_relation(PlannerInfo *root, RelOptInfo *rel);
+static Relids get_base_relids(PlannerInfo *root, RelOptInfo *rel);
+static int	get_min_base_rti(PlannerInfo *root, RelOptInfo *rel);
+static List *get_functions_data(PlannerInfo *root, RelOptInfo *rel);
 static void add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 											Path *epq_path, List *restrictlist);
 static void add_foreign_grouping_paths(PlannerInfo *root,
@@ -592,6 +719,7 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 
 	/* Support functions for ANALYZE */
 	routine->AnalyzeForeignTable = postgresAnalyzeForeignTable;
+	routine->ImportForeignStatistics = postgresImportForeignStatistics;
 
 	/* Support functions for IMPORT FOREIGN SCHEMA */
 	routine->ImportForeignSchema = postgresImportForeignSchema;
@@ -630,8 +758,8 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 * We use PgFdwRelationInfo to pass various information to subsequent
 	 * functions.
 	 */
-	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
-	baserel->fdw_private = (void *) fpinfo;
+	fpinfo = palloc0_object(PgFdwRelationInfo);
+	baserel->fdw_private = fpinfo;
 
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
@@ -675,7 +803,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 * Identify which baserestrictinfo clauses can be sent to the remote
 	 * server and which can't.
 	 */
-	classifyConditions(root, baserel, baserel->baserestrictinfo,
+	classifyConditions(root, baserel, fpinfo, baserel->baserestrictinfo,
 					   &fpinfo->remote_conds, &fpinfo->local_conds);
 
 	/*
@@ -735,6 +863,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 		 */
 		estimate_path_cost_size(root, baserel, NIL, NIL, NULL,
 								&fpinfo->rows, &fpinfo->width,
+								&fpinfo->disabled_nodes,
 								&fpinfo->startup_cost, &fpinfo->total_cost);
 
 		/* Report estimated baserel size to planner. */
@@ -765,6 +894,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 		/* Fill in basically-bogus cost estimates for use later. */
 		estimate_path_cost_size(root, baserel, NIL, NIL, NULL,
 								&fpinfo->rows, &fpinfo->width,
+								&fpinfo->disabled_nodes,
 								&fpinfo->startup_cost, &fpinfo->total_cost);
 	}
 
@@ -779,6 +909,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	fpinfo->make_outerrel_subquery = false;
 	fpinfo->make_innerrel_subquery = false;
 	fpinfo->lower_subquery_rels = NULL;
+	fpinfo->hidden_subquery_rels = NULL;
 	/* Set the relation index. */
 	fpinfo->relation_index = baserel->relid;
 }
@@ -993,7 +1124,7 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 		/* Looks like we can generate a pathkey, so let's do it. */
 		pathkey = make_canonical_pathkey(root, cur_ec,
 										 linitial_oid(cur_ec->ec_opfamilies),
-										 BTLessStrategyNumber,
+										 COMPARE_LT,
 										 false);
 		useful_pathkeys_list = lappend(useful_pathkeys_list,
 									   list_make1(pathkey));
@@ -1029,6 +1160,7 @@ postgresGetForeignPaths(PlannerInfo *root,
 	path = create_foreignscan_path(root, baserel,
 								   NULL,	/* default pathtarget */
 								   fpinfo->rows,
+								   fpinfo->disabled_nodes,
 								   fpinfo->startup_cost,
 								   fpinfo->total_cost,
 								   NIL, /* no pathkeys */
@@ -1075,7 +1207,7 @@ postgresGetForeignPaths(PlannerInfo *root,
 			continue;
 
 		/* See if it is safe to send to remote */
-		if (!is_foreign_expr(root, baserel, rinfo->clause))
+		if (!is_foreign_expr(root, baserel, fpinfo, rinfo->clause))
 			continue;
 
 		/* Calculate required outer rels for the resulting path */
@@ -1129,7 +1261,7 @@ postgresGetForeignPaths(PlannerInfo *root,
 			clauses = generate_implied_equalities_for_column(root,
 															 baserel,
 															 ec_member_matches_foreign,
-															 (void *) &arg,
+															 &arg,
 															 baserel->lateral_referencers);
 
 			/* Done if there are no more expressions in the foreign rel */
@@ -1151,7 +1283,7 @@ postgresGetForeignPaths(PlannerInfo *root,
 					continue;
 
 				/* See if it is safe to send to remote */
-				if (!is_foreign_expr(root, baserel, rinfo->clause))
+				if (!is_foreign_expr(root, baserel, fpinfo, rinfo->clause))
 					continue;
 
 				/* Calculate required outer rels for the resulting path */
@@ -1183,13 +1315,14 @@ postgresGetForeignPaths(PlannerInfo *root,
 		ParamPathInfo *param_info = (ParamPathInfo *) lfirst(lc);
 		double		rows;
 		int			width;
+		int			disabled_nodes;
 		Cost		startup_cost;
 		Cost		total_cost;
 
 		/* Get a cost estimate from the remote */
 		estimate_path_cost_size(root, baserel,
 								param_info->ppi_clauses, NIL, NULL,
-								&rows, &width,
+								&rows, &width, &disabled_nodes,
 								&startup_cost, &total_cost);
 
 		/*
@@ -1202,6 +1335,7 @@ postgresGetForeignPaths(PlannerInfo *root,
 		path = create_foreignscan_path(root, baserel,
 									   NULL,	/* default pathtarget */
 									   rows,
+									   disabled_nodes,
 									   startup_cost,
 									   total_cost,
 									   NIL, /* no pathkeys */
@@ -1289,7 +1423,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 				remote_exprs = lappend(remote_exprs, rinfo->clause);
 			else if (list_member_ptr(fpinfo->local_conds, rinfo))
 				local_exprs = lappend(local_exprs, rinfo->clause);
-			else if (is_foreign_expr(root, foreignrel, rinfo->clause))
+			else if (is_foreign_expr(root, foreignrel, fpinfo, rinfo->clause))
 				remote_exprs = lappend(remote_exprs, rinfo->clause);
 			else
 				local_exprs = lappend(local_exprs, rinfo->clause);
@@ -1410,9 +1544,26 @@ postgresGetForeignPlan(PlannerInfo *root,
 	fdw_private = list_make3(makeString(sql.data),
 							 retrieved_attrs,
 							 makeInteger(fpinfo->fetch_size));
+
+	/*
+	 * Position FdwScanPrivateRelations: either the EXPLAIN relation string
+	 * (joins/upper rels) or a NULL placeholder, so that subsequent indexes
+	 * stay valid for the base-rel scan case.
+	 */
 	if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel))
 		fdw_private = lappend(fdw_private,
 							  makeString(fpinfo->relation_name));
+	else
+		fdw_private = lappend(fdw_private, NULL);
+
+	/*
+	 * FdwScanPrivateFunctions / FdwScanPrivateMinRTIndex carry the metadata
+	 * the executor needs to rebuild TupleDesc entries for whole-row Vars
+	 * pointing at RTE_FUNCTION rels absorbed into the foreign scan.
+	 */
+	fdw_private = lappend(fdw_private, get_functions_data(root, foreignrel));
+	fdw_private = lappend(fdw_private,
+						  makeInteger(get_min_base_rti(root, foreignrel)));
 
 	/*
 	 * Create the ForeignScan node for the given relation.
@@ -1433,9 +1584,15 @@ postgresGetForeignPlan(PlannerInfo *root,
 
 /*
  * Construct a tuple descriptor for the scan tuples handled by a foreign join.
+ *
+ * 'rtfuncdata' is the FdwScanPrivateFunctions list saved at plan time, and
+ * 'rtoffset' is the difference between the executor's RT indexes and the
+ * scan-local RT indexes captured in that list.  Both may be 0/NIL when the
+ * scan has no RTE_FUNCTION dependents.
  */
 static TupleDesc
-get_tupdesc_for_join_scan_tuples(ForeignScanState *node)
+get_tupdesc_for_join_scan_tuples(ForeignScanState *node,
+								 List *rtfuncdata, int rtoffset)
 {
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	EState	   *estate = node->ss.ps.state;
@@ -1471,13 +1628,67 @@ get_tupdesc_for_join_scan_tuples(ForeignScanState *node)
 		if (!IsA(var, Var) || var->varattno != 0)
 			continue;
 		rte = list_nth(estate->es_range_table, var->varno - 1);
-		if (rte->rtekind != RTE_RELATION)
-			continue;
-		reltype = get_rel_type_id(rte->relid);
-		if (!OidIsValid(reltype))
-			continue;
-		att->atttypid = reltype;
-		/* shouldn't need to change anything else */
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			reltype = get_rel_type_id(rte->relid);
+			if (!OidIsValid(reltype))
+				continue;
+			att->atttypid = reltype;
+			/* shouldn't need to change anything else */
+		}
+		else if (rte->rtekind == RTE_FUNCTION)
+		{
+			/*
+			 * A whole-row Var points at a FUNCTION RTE absorbed into the
+			 * foreign join.  Synthesize an anonymous composite TupleDesc from
+			 * the per-function return-type metadata we saved at plan time;
+			 * the deparser emits these as ROW(f<rti>.c1, f<rti>.c2, ...).
+			 *
+			 * For an upperrel scan (the only path that reaches here)
+			 * postgresGetForeignPlan always builds rtfuncdata via
+			 * get_functions_data(), so it is never NIL; the per-RTE slot for
+			 * the function RTE referenced by this Var must likewise be
+			 * populated.
+			 */
+			List	   *funcdata;
+			TupleDesc	rte_tupdesc;
+			int			num_funcs;
+			int			attnum;
+			ListCell   *lc1,
+					   *lc2;
+
+			Assert(rtfuncdata != NIL);
+			funcdata = list_nth(rtfuncdata, var->varno - rtoffset);
+			Assert(funcdata != NIL);
+			num_funcs = list_length(funcdata);
+			Assert(num_funcs == list_length(rte->eref->colnames));
+			rte_tupdesc = CreateTemplateTupleDesc(num_funcs);
+
+			attnum = 1;
+			forboth(lc1, funcdata, lc2, rte->eref->colnames)
+			{
+				List	   *fdata = lfirst_node(List, lc1);
+				char	   *colname = strVal(lfirst(lc2));
+				Oid			funcrettype;
+				Oid			funccollation;
+
+				funcrettype = lsecond_node(Integer, fdata)->ival;
+				funccollation = lthird_node(Integer, fdata)->ival;
+
+				/* get_functions_data() already validated the return type. */
+				Assert(OidIsValid(funcrettype) && funcrettype != RECORDOID);
+
+				TupleDescInitEntry(rte_tupdesc, (AttrNumber) attnum, colname,
+								   funcrettype, -1, 0);
+				TupleDescInitEntryCollation(rte_tupdesc, (AttrNumber) attnum,
+											funccollation);
+				attnum++;
+			}
+
+			assign_record_type_typmod(rte_tupdesc);
+			att->atttypmod = rte_tupdesc->tdtypmod;
+		}
 	}
 	return tupdesc;
 }
@@ -1508,19 +1719,35 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	/*
 	 * We'll save private state in node->fdw_state.
 	 */
-	fsstate = (PgFdwScanState *) palloc0(sizeof(PgFdwScanState));
-	node->fdw_state = (void *) fsstate;
+	fsstate = palloc0_object(PgFdwScanState);
+	node->fdw_state = fsstate;
 
 	/*
 	 * Identify which user to do the remote access as.  This should match what
-	 * ExecCheckPermissions() does.
+	 * ExecCheckPermissions() does.  For a join, scan the base relids until we
+	 * find an RTE_RELATION (the foreign-table side); ignore any RTE_FUNCTION
+	 * absorbed into the join, which contributes no relation OID to look up.
 	 */
 	userid = OidIsValid(fsplan->checkAsUser) ? fsplan->checkAsUser : GetUserId();
+	rte = NULL;
 	if (fsplan->scan.scanrelid > 0)
+	{
 		rtindex = fsplan->scan.scanrelid;
+		rte = exec_rt_fetch(rtindex, estate);
+	}
 	else
-		rtindex = bms_next_member(fsplan->fs_base_relids, -1);
-	rte = exec_rt_fetch(rtindex, estate);
+	{
+		rtindex = -1;
+		while ((rtindex = bms_next_member(fsplan->fs_base_relids, rtindex)) >= 0)
+		{
+			rte = exec_rt_fetch(rtindex, estate);
+			if (rte != NULL && rte->rtekind == RTE_RELATION)
+				break;
+			rte = NULL;
+		}
+		if (rte == NULL)
+			elog(ERROR, "could not locate a foreign relation RTE in foreign scan");
+	}
 
 	/* Get info about foreign table. */
 	table = GetForeignTable(rte->relid);
@@ -1563,8 +1790,19 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 	else
 	{
+		List	   *rtfuncdata = (List *) list_nth(fsplan->fdw_private,
+												   FdwScanPrivateFunctions);
+		int			min_base_rti = intVal(list_nth(fsplan->fdw_private,
+												   FdwScanPrivateMinRTIndex));
+		int			rtoffset = bms_next_member(fsplan->fs_base_relids, -1) -
+			min_base_rti;
+
+		Assert(min_base_rti > 0);
+		Assert(rtoffset >= 0);
+
 		fsstate->rel = NULL;
-		fsstate->tupdesc = get_tupdesc_for_join_scan_tuples(node);
+		fsstate->tupdesc = get_tupdesc_for_join_scan_tuples(node, rtfuncdata,
+															rtoffset);
 	}
 
 	fsstate->attinmeta = TupleDescGetAttInMetadata(fsstate->tupdesc);
@@ -1648,22 +1886,20 @@ postgresReScanForeignScan(ForeignScanState *node)
 		return;
 
 	/*
-	 * If the node is async-capable, and an asynchronous fetch for it has
-	 * begun, the asynchronous fetch might not have yet completed.  Check if
-	 * the node is async-capable, and an asynchronous fetch for it is still in
-	 * progress; if so, complete the asynchronous fetch before restarting the
-	 * scan.
+	 * If the node is async-capable, any asynchronous fetch made for it should
+	 * have been processed before we get here (see ExecAppendAsyncReset()).
 	 */
-	if (fsstate->async_capable &&
-		fsstate->conn_state->pendingAreq &&
-		fsstate->conn_state->pendingAreq->requestee == (PlanState *) node)
-		fetch_more_data(node);
+	Assert(!fsstate->async_capable || !fsstate->conn_state->pendingAreq ||
+		   fsstate->conn_state->pendingAreq->requestee != (PlanState *) node);
 
 	/*
 	 * If any internal parameters affecting this node have changed, we'd
-	 * better destroy and recreate the cursor.  Otherwise, rewinding it should
-	 * be good enough.  If we've only fetched zero or one batch, we needn't
-	 * even rewind the cursor, just rescan what we have.
+	 * better destroy and recreate the cursor.  Otherwise, if the remote
+	 * server is v14 or older, rewinding it should be good enough; if not,
+	 * rewind is only allowed for scrollable cursors, but we don't have a way
+	 * to check the scrollability of it, so destroy and recreate it in any
+	 * case.  If we've only fetched zero or one batch, we needn't even rewind
+	 * the cursor, just rescan what we have.
 	 */
 	if (node->ss.ps.chgParam != NULL)
 	{
@@ -1673,8 +1909,15 @@ postgresReScanForeignScan(ForeignScanState *node)
 	}
 	else if (fsstate->fetch_ct_2 > 1)
 	{
-		snprintf(sql, sizeof(sql), "MOVE BACKWARD ALL IN c%u",
-				 fsstate->cursor_number);
+		if (PQserverVersion(fsstate->conn) < 150000)
+			snprintf(sql, sizeof(sql), "MOVE BACKWARD ALL IN c%u",
+					 fsstate->cursor_number);
+		else
+		{
+			fsstate->cursor_exists = false;
+			snprintf(sql, sizeof(sql), "CLOSE c%u",
+					 fsstate->cursor_number);
+		}
 	}
 	else
 	{
@@ -1683,13 +1926,9 @@ postgresReScanForeignScan(ForeignScanState *node)
 		return;
 	}
 
-	/*
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
-	 */
 	res = pgfdw_exec_query(fsstate->conn, sql, fsstate->conn_state);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, fsstate->conn, true, sql);
+		pgfdw_report_error(res, fsstate->conn, sql);
 	PQclear(res);
 
 	/* Now force a fresh FETCH. */
@@ -1765,7 +2004,7 @@ postgresPlanForeignModify(PlannerInfo *root,
 {
 	CmdType		operation = plan->operation;
 	RangeTblEntry *rte = planner_rt_fetch(resultRelation, root);
-	Relation	rel;
+	Relation	targetrel;
 	StringInfoData sql;
 	List	   *targetAttrs = NIL;
 	List	   *withCheckOptionList = NIL;
@@ -1780,7 +2019,7 @@ postgresPlanForeignModify(PlannerInfo *root,
 	 * Core code already has some lock on each rel being planned, so we can
 	 * use NoLock here.
 	 */
-	rel = table_open(rte->relid, NoLock);
+	targetrel = table_open(rte->relid, NoLock);
 
 	/*
 	 * In an INSERT, we transmit all columns that are defined in the foreign
@@ -1795,15 +2034,15 @@ postgresPlanForeignModify(PlannerInfo *root,
 	 */
 	if (operation == CMD_INSERT ||
 		(operation == CMD_UPDATE &&
-		 rel->trigdesc &&
-		 rel->trigdesc->trig_update_before_row))
+		 targetrel->trigdesc &&
+		 targetrel->trigdesc->trig_update_before_row))
 	{
-		TupleDesc	tupdesc = RelationGetDescr(rel);
+		TupleDesc	tupdesc = RelationGetDescr(targetrel);
 		int			attnum;
 
 		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 		{
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+			CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
 
 			if (!attr->attisdropped)
 				targetAttrs = lappend_int(targetAttrs, attnum);
@@ -1812,8 +2051,8 @@ postgresPlanForeignModify(PlannerInfo *root,
 	else if (operation == CMD_UPDATE)
 	{
 		int			col;
-		RelOptInfo *rel = find_base_rel(root, resultRelation);
-		Bitmapset  *allUpdatedCols = get_rel_all_updated_cols(root, rel);
+		RelOptInfo *baserel = find_base_rel(root, resultRelation);
+		Bitmapset  *allUpdatedCols = get_rel_all_updated_cols(root, baserel);
 
 		col = -1;
 		while ((col = bms_next_member(allUpdatedCols, col)) >= 0)
@@ -1841,7 +2080,7 @@ postgresPlanForeignModify(PlannerInfo *root,
 		returningList = (List *) list_nth(plan->returningLists, subplan_index);
 
 	/*
-	 * ON CONFLICT DO UPDATE and DO NOTHING case with inference specification
+	 * ON CONFLICT DO NOTHING/SELECT/UPDATE with inference specification
 	 * should have already been rejected in the optimizer, as presently there
 	 * is no way to recognize an arbiter index on a foreign table.  Only DO
 	 * NOTHING is supported without an inference specification.
@@ -1858,19 +2097,19 @@ postgresPlanForeignModify(PlannerInfo *root,
 	switch (operation)
 	{
 		case CMD_INSERT:
-			deparseInsertSql(&sql, rte, resultRelation, rel,
+			deparseInsertSql(&sql, rte, resultRelation, targetrel,
 							 targetAttrs, doNothing,
 							 withCheckOptionList, returningList,
 							 &retrieved_attrs, &values_end_len);
 			break;
 		case CMD_UPDATE:
-			deparseUpdateSql(&sql, rte, resultRelation, rel,
+			deparseUpdateSql(&sql, rte, resultRelation, targetrel,
 							 targetAttrs,
 							 withCheckOptionList, returningList,
 							 &retrieved_attrs);
 			break;
 		case CMD_DELETE:
-			deparseDeleteSql(&sql, rte, resultRelation, rel,
+			deparseDeleteSql(&sql, rte, resultRelation, targetrel,
 							 returningList,
 							 &retrieved_attrs);
 			break;
@@ -1879,7 +2118,7 @@ postgresPlanForeignModify(PlannerInfo *root,
 			break;
 	}
 
-	table_close(rel, NoLock);
+	table_close(targetrel, NoLock);
 
 	/*
 	 * Build the fdw_private list that will be available to the executor.
@@ -2176,7 +2415,7 @@ postgresBeginForeignInsert(ModifyTableState *mtstate,
 	/* We transmit all columns that are defined in the foreign table. */
 	for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+		CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
 
 		if (!attr->attisdropped)
 			targetAttrs = lappend_int(targetAttrs, attnum);
@@ -2511,7 +2750,7 @@ postgresPlanDirectModify(PlannerInfo *root,
 			if (attno <= InvalidAttrNumber) /* shouldn't happen */
 				elog(ERROR, "system-column update is not supported");
 
-			if (!is_foreign_expr(root, foreignrel, (Expr *) tle->expr))
+			if (!is_foreign_expr(root, foreignrel, fpinfo, (Expr *) tle->expr))
 				return false;
 		}
 	}
@@ -2598,6 +2837,10 @@ postgresPlanDirectModify(PlannerInfo *root,
 									makeBoolean((retrieved_attrs != NIL)),
 									retrieved_attrs,
 									makeBoolean(plan->canSetTag));
+	fscan->fdw_private = lappend(fscan->fdw_private,
+								 get_functions_data(root, foreignrel));
+	fscan->fdw_private = lappend(fscan->fdw_private,
+								 makeInteger(get_min_base_rti(root, foreignrel)));
 
 	/*
 	 * Update the foreign-join-related fields.
@@ -2648,8 +2891,8 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
 	/*
 	 * We'll save private state in node->fdw_state.
 	 */
-	dmstate = (PgFdwDirectModifyState *) palloc0(sizeof(PgFdwDirectModifyState));
-	node->fdw_state = (void *) dmstate;
+	dmstate = palloc0_object(PgFdwDirectModifyState);
+	node->fdw_state = dmstate;
 
 	/*
 	 * Identify which user to do the remote access as.  This should match what
@@ -2711,7 +2954,26 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
 		TupleDesc	tupdesc;
 
 		if (fsplan->scan.scanrelid == 0)
-			tupdesc = get_tupdesc_for_join_scan_tuples(node);
+		{
+			/*
+			 * DirectModify on a foreign join: use the per-RTE function
+			 * metadata saved at plan time so a whole-row Var pointing at a
+			 * function RTE absorbed into the join can be rebuilt into a
+			 * usable TupleDesc (e.g. RETURNING t for a join with UNNEST(...,
+			 * ...) AS t(bx, i)).
+			 */
+			List	   *rtfuncdata = (List *) list_nth(fsplan->fdw_private,
+													   FdwDirectModifyPrivateFunctions);
+			int			min_base_rti = intVal(list_nth(fsplan->fdw_private,
+													   FdwDirectModifyPrivateMinRTIndex));
+			int			rtoffset = bms_next_member(fsplan->fs_base_relids, -1) -
+				min_base_rti;
+
+			Assert(min_base_rti > 0);
+			Assert(rtoffset >= 0);
+
+			tupdesc = get_tupdesc_for_join_scan_tuples(node, rtfuncdata, rtoffset);
+		}
 		else
 			tupdesc = RelationGetDescr(dmstate->rel);
 
@@ -2763,7 +3025,7 @@ postgresIterateDirectModify(ForeignScanState *node)
 	if (!resultRelInfo->ri_projectReturning)
 	{
 		TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-		Instrumentation *instr = node->ss.ps.instrument;
+		NodeInstrumentation *instr = node->ss.ps.instrument;
 
 		Assert(!dmstate->has_returning);
 
@@ -2824,9 +3086,10 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	 * We do that here, not when the plan is created, because we can't know
 	 * what aliases ruleutils.c will assign at plan creation time.
 	 */
-	if (list_length(fdw_private) > FdwScanPrivateRelations)
+	if (list_length(fdw_private) > FdwScanPrivateRelations &&
+		list_nth(fdw_private, FdwScanPrivateRelations) != NULL)
 	{
-		StringInfo	relations;
+		StringInfoData relations;
 		char	   *rawrelations;
 		char	   *ptr;
 		int			minrti,
@@ -2860,7 +3123,7 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 		rtoffset = bms_next_member(plan->fs_base_relids, -1) - minrti;
 
 		/* Now we can translate the string */
-		relations = makeStringInfo();
+		initStringInfo(&relations);
 		ptr = rawrelations;
 		while (*ptr)
 		{
@@ -2868,38 +3131,103 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 			{
 				int			rti = strtol(ptr, &ptr, 10);
 				RangeTblEntry *rte;
-				char	   *relname;
+				char	   *relname = NULL;
 				char	   *refname;
 
 				rti += rtoffset;
 				Assert(bms_is_member(rti, plan->fs_base_relids));
 				rte = rt_fetch(rti, es->rtable);
-				Assert(rte->rtekind == RTE_RELATION);
-				/* This logic should agree with explain.c's ExplainTargetRel */
-				relname = get_rel_name(rte->relid);
-				if (es->verbose)
-				{
-					char	   *namespace;
 
-					namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
-					appendStringInfo(relations, "%s.%s",
-									 quote_identifier(namespace),
-									 quote_identifier(relname));
+				if (rte->rtekind == RTE_FUNCTION)
+				{
+					List	   *rtfuncdata = list_nth(fdw_private, FdwScanPrivateFunctions);
+					List	   *funcdata;
+					bool		multi_func;
+					bool		first = true;
+					ListCell   *lc;
+
+					funcdata = list_nth(rtfuncdata, rti - rtoffset);
+
+					multi_func = list_length(funcdata) > 1;
+
+					if (multi_func)
+						appendStringInfoString(&relations, "ROWS FROM (");
+
+					foreach(lc, funcdata)
+					{
+						List	   *funcinfo;
+						Oid			funcid;
+
+
+						if (!first)
+							appendStringInfoString(&relations, ", ");
+
+						funcinfo = (List *) lfirst(lc);
+
+						funcid = linitial_node(Integer, funcinfo)->ival;
+						/* Checked by function_rte_pushdown_ok() */
+						Assert(OidIsValid(funcid));
+
+						/* Match RTE_RELATION behavior */
+						relname = get_func_name(funcid);
+						if (relname == NULL)
+							elog(ERROR, "cache lookup failed for function %u", funcid);
+						if (es->verbose)
+						{
+							char	   *namespace;
+							Oid			nsoid = get_func_namespace(funcid);
+
+							namespace = get_namespace_name(nsoid);
+							if (namespace == NULL)
+								elog(ERROR, "cache lookup failed for namespace %u", nsoid);
+
+							appendStringInfo(&relations, "%s.%s()",
+											 quote_identifier(namespace),
+											 quote_identifier(relname));
+						}
+						else
+							appendStringInfo(&relations, "%s()", quote_identifier(relname));
+
+						first = false;
+					}
+					/* Close ROWS FROM */
+					if (multi_func)
+						appendStringInfoChar(&relations, ')');
 				}
 				else
-					appendStringInfoString(relations,
-										   quote_identifier(relname));
+				{
+					Assert(rte->rtekind == RTE_RELATION);
+
+					/*
+					 * This logic should agree with explain.c's
+					 * ExplainTargetRel
+					 */
+					relname = get_rel_name(rte->relid);
+					if (es->verbose)
+					{
+						char	   *namespace;
+
+						namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
+						appendStringInfo(&relations, "%s.%s",
+										 quote_identifier(namespace),
+										 quote_identifier(relname));
+					}
+					else
+						appendStringInfoString(&relations,
+											   quote_identifier(relname));
+				}
+
 				refname = (char *) list_nth(es->rtable_names, rti - 1);
 				if (refname == NULL)
 					refname = rte->eref->aliasname;
-				if (strcmp(refname, relname) != 0)
-					appendStringInfo(relations, " %s",
+				if (relname == NULL || strcmp(refname, relname) != 0)
+					appendStringInfo(&relations, " %s",
 									 quote_identifier(refname));
 			}
 			else
-				appendStringInfoChar(relations, *ptr++);
+				appendStringInfoChar(&relations, *ptr++);
 		}
-		ExplainPropertyText("Relations", relations->data, es);
+		ExplainPropertyText("Relations", relations.data, es);
 	}
 
 	/*
@@ -3068,7 +3396,7 @@ postgresExecForeignTruncate(List *rels,
  * final sort and the LIMIT restriction.
  *
  * The function returns the cost and size estimates in p_rows, p_width,
- * p_startup_cost and p_total_cost variables.
+ * p_disabled_nodes, p_startup_cost and p_total_cost variables.
  */
 static void
 estimate_path_cost_size(PlannerInfo *root,
@@ -3077,12 +3405,14 @@ estimate_path_cost_size(PlannerInfo *root,
 						List *pathkeys,
 						PgFdwPathExtraData *fpextra,
 						double *p_rows, int *p_width,
+						int *p_disabled_nodes,
 						Cost *p_startup_cost, Cost *p_total_cost)
 {
 	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) foreignrel->fdw_private;
 	double		rows;
 	double		retrieved_rows;
 	int			width;
+	int			disabled_nodes = 0;
 	Cost		startup_cost;
 	Cost		total_cost;
 
@@ -3114,7 +3444,7 @@ estimate_path_cost_size(PlannerInfo *root,
 		 * param_join_conds might contain both clauses that are safe to send
 		 * across, and clauses that aren't.
 		 */
-		classifyConditions(root, foreignrel, param_join_conds,
+		classifyConditions(root, foreignrel, fpinfo, param_join_conds,
 						   &remote_param_join_conds, &local_param_join_conds);
 
 		/* Build the list of columns to be fetched from the foreign server. */
@@ -3247,8 +3577,17 @@ estimate_path_cost_size(PlannerInfo *root,
 			/* For join we expect inner and outer relations set */
 			Assert(fpinfo->innerrel && fpinfo->outerrel);
 
-			fpinfo_i = (PgFdwRelationInfo *) fpinfo->innerrel->fdw_private;
-			fpinfo_o = (PgFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+			/*
+			 * For a FUNCTION RTE absorbed into the join, use the stub fpinfo
+			 * we built in foreign_join_ok(), since the function rel itself
+			 * has no fdw_private.
+			 */
+			fpinfo_i = fpinfo->inner_func_fpinfo ?
+				fpinfo->inner_func_fpinfo :
+				(PgFdwRelationInfo *) fpinfo->innerrel->fdw_private;
+			fpinfo_o = fpinfo->outer_func_fpinfo ?
+				fpinfo->outer_func_fpinfo :
+				(PgFdwRelationInfo *) fpinfo->outerrel->fdw_private;
 
 			/* Estimate of number of rows in cross product */
 			nrows = fpinfo_i->rows * fpinfo_o->rows;
@@ -3315,7 +3654,7 @@ estimate_path_cost_size(PlannerInfo *root,
 		{
 			RelOptInfo *outerrel = fpinfo->outerrel;
 			PgFdwRelationInfo *ofpinfo;
-			AggClauseCosts aggcosts;
+			AggClauseCosts aggcosts = {0};
 			double		input_rows;
 			int			numGroupCols;
 			double		numGroups = 1;
@@ -3339,7 +3678,6 @@ estimate_path_cost_size(PlannerInfo *root,
 			input_rows = ofpinfo->rows;
 
 			/* Collect statistics about aggregates for estimating costs. */
-			MemSet(&aggcosts, 0, sizeof(AggClauseCosts));
 			if (root->parse->hasAggs)
 			{
 				get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &aggcosts);
@@ -3469,9 +3807,17 @@ estimate_path_cost_size(PlannerInfo *root,
 			{
 				Assert(foreignrel->reloptkind == RELOPT_UPPER_REL &&
 					   fpinfo->stage == UPPERREL_GROUP_AGG);
+
+				/*
+				 * We can only get here when this function is called from
+				 * add_foreign_ordered_paths() or add_foreign_final_paths();
+				 * in which cases, the passed-in fpextra should not be NULL.
+				 */
+				Assert(fpextra);
 				adjust_foreign_grouping_path_cost(root, pathkeys,
 												  retrieved_rows, width,
 												  fpextra->limit_tuples,
+												  &disabled_nodes,
 												  &startup_cost, &run_cost);
 			}
 			else
@@ -3566,6 +3912,7 @@ estimate_path_cost_size(PlannerInfo *root,
 	/* Return results. */
 	*p_rows = rows;
 	*p_width = width;
+	*p_disabled_nodes = disabled_nodes;
 	*p_startup_cost = startup_cost;
 	*p_total_cost = total_cost;
 }
@@ -3579,41 +3926,32 @@ get_remote_estimate(const char *sql, PGconn *conn,
 					double *rows, int *width,
 					Cost *startup_cost, Cost *total_cost)
 {
-	PGresult   *volatile res = NULL;
+	PGresult   *res;
+	char	   *line;
+	char	   *p;
+	int			n;
 
-	/* PGresult must be released before leaving this function. */
-	PG_TRY();
-	{
-		char	   *line;
-		char	   *p;
-		int			n;
+	/*
+	 * Execute EXPLAIN remotely.
+	 */
+	res = pgfdw_exec_query(conn, sql, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(res, conn, sql);
 
-		/*
-		 * Execute EXPLAIN remotely.
-		 */
-		res = pgfdw_exec_query(conn, sql, NULL);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			pgfdw_report_error(ERROR, res, conn, false, sql);
-
-		/*
-		 * Extract cost numbers for topmost plan node.  Note we search for a
-		 * left paren from the end of the line to avoid being confused by
-		 * other uses of parentheses.
-		 */
-		line = PQgetvalue(res, 0, 0);
-		p = strrchr(line, '(');
-		if (p == NULL)
-			elog(ERROR, "could not interpret EXPLAIN output: \"%s\"", line);
-		n = sscanf(p, "(cost=%lf..%lf rows=%lf width=%d)",
-				   startup_cost, total_cost, rows, width);
-		if (n != 4)
-			elog(ERROR, "could not interpret EXPLAIN output: \"%s\"", line);
-	}
-	PG_FINALLY();
-	{
-		PQclear(res);
-	}
-	PG_END_TRY();
+	/*
+	 * Extract cost numbers for topmost plan node.  Note we search for a left
+	 * paren from the end of the line to avoid being confused by other uses of
+	 * parentheses.
+	 */
+	line = PQgetvalue(res, 0, 0);
+	p = strrchr(line, '(');
+	if (p == NULL)
+		elog(ERROR, "could not interpret EXPLAIN output: \"%s\"", line);
+	n = sscanf(p, "(cost=%lf..%lf rows=%lf width=%d)",
+			   startup_cost, total_cost, rows, width);
+	if (n != 4)
+		elog(ERROR, "could not interpret EXPLAIN output: \"%s\"", line);
+	PQclear(res);
 }
 
 /*
@@ -3626,6 +3964,7 @@ adjust_foreign_grouping_path_cost(PlannerInfo *root,
 								  double retrieved_rows,
 								  double width,
 								  double limit_tuples,
+								  int *p_disabled_nodes,
 								  Cost *p_startup_cost,
 								  Cost *p_run_cost)
 {
@@ -3645,6 +3984,7 @@ adjust_foreign_grouping_path_cost(PlannerInfo *root,
 		cost_sort(&sort_path,
 				  root,
 				  pathkeys,
+				  0,
 				  *p_startup_cost + *p_run_cost,
 				  retrieved_rows,
 				  width,
@@ -3751,17 +4091,14 @@ create_cursor(ForeignScanState *node)
 	 */
 	if (!PQsendQueryParams(conn, buf.data, numParams,
 						   NULL, values, NULL, NULL, 0))
-		pgfdw_report_error(ERROR, NULL, conn, false, buf.data);
+		pgfdw_report_error(NULL, conn, buf.data);
 
 	/*
 	 * Get the result, and check for success.
-	 *
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(conn, buf.data);
+	res = pgfdw_get_result(conn);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, conn, true, fsstate->query);
+		pgfdw_report_error(res, conn, fsstate->query);
 	PQclear(res);
 
 	/* Mark the cursor as created, and show no tuples have been retrieved */
@@ -3783,7 +4120,10 @@ static void
 fetch_more_data(ForeignScanState *node)
 {
 	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
-	PGresult   *volatile res = NULL;
+	PGconn	   *conn = fsstate->conn;
+	PGresult   *res;
+	int			numrows;
+	int			i;
 	MemoryContext oldcontext;
 
 	/*
@@ -3794,74 +4134,63 @@ fetch_more_data(ForeignScanState *node)
 	MemoryContextReset(fsstate->batch_cxt);
 	oldcontext = MemoryContextSwitchTo(fsstate->batch_cxt);
 
-	/* PGresult must be released before leaving this function. */
-	PG_TRY();
+	if (fsstate->async_capable)
 	{
-		PGconn	   *conn = fsstate->conn;
-		int			numrows;
-		int			i;
+		Assert(fsstate->conn_state->pendingAreq);
 
-		if (fsstate->async_capable)
-		{
-			Assert(fsstate->conn_state->pendingAreq);
+		/*
+		 * The query was already sent by an earlier call to
+		 * fetch_more_data_begin.  So now we just fetch the result.
+		 */
+		res = pgfdw_get_result(conn);
+		/* On error, report the original query, not the FETCH. */
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			pgfdw_report_error(res, conn, fsstate->query);
 
-			/*
-			 * The query was already sent by an earlier call to
-			 * fetch_more_data_begin.  So now we just fetch the result.
-			 */
-			res = pgfdw_get_result(conn, fsstate->query);
-			/* On error, report the original query, not the FETCH. */
-			if (PQresultStatus(res) != PGRES_TUPLES_OK)
-				pgfdw_report_error(ERROR, res, conn, false, fsstate->query);
-
-			/* Reset per-connection state */
-			fsstate->conn_state->pendingAreq = NULL;
-		}
-		else
-		{
-			char		sql[64];
-
-			/* This is a regular synchronous fetch. */
-			snprintf(sql, sizeof(sql), "FETCH %d FROM c%u",
-					 fsstate->fetch_size, fsstate->cursor_number);
-
-			res = pgfdw_exec_query(conn, sql, fsstate->conn_state);
-			/* On error, report the original query, not the FETCH. */
-			if (PQresultStatus(res) != PGRES_TUPLES_OK)
-				pgfdw_report_error(ERROR, res, conn, false, fsstate->query);
-		}
-
-		/* Convert the data into HeapTuples */
-		numrows = PQntuples(res);
-		fsstate->tuples = (HeapTuple *) palloc0(numrows * sizeof(HeapTuple));
-		fsstate->num_tuples = numrows;
-		fsstate->next_tuple = 0;
-
-		for (i = 0; i < numrows; i++)
-		{
-			Assert(IsA(node->ss.ps.plan, ForeignScan));
-
-			fsstate->tuples[i] =
-				make_tuple_from_result_row(res, i,
-										   fsstate->rel,
-										   fsstate->attinmeta,
-										   fsstate->retrieved_attrs,
-										   node,
-										   fsstate->temp_cxt);
-		}
-
-		/* Update fetch_ct_2 */
-		if (fsstate->fetch_ct_2 < 2)
-			fsstate->fetch_ct_2++;
-
-		/* Must be EOF if we didn't get as many tuples as we asked for. */
-		fsstate->eof_reached = (numrows < fsstate->fetch_size);
+		/* Reset per-connection state */
+		fsstate->conn_state->pendingAreq = NULL;
 	}
-	PG_FINALLY();
+	else
 	{
-		PQclear(res);
+		char		sql[64];
+
+		/* This is a regular synchronous fetch. */
+		snprintf(sql, sizeof(sql), "FETCH %d FROM c%u",
+				 fsstate->fetch_size, fsstate->cursor_number);
+
+		res = pgfdw_exec_query(conn, sql, fsstate->conn_state);
+		/* On error, report the original query, not the FETCH. */
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			pgfdw_report_error(res, conn, fsstate->query);
 	}
-	PG_END_TRY();
+
+	/* Convert the data into HeapTuples */
+	numrows = PQntuples(res);
+	fsstate->tuples = palloc0_array(HeapTuple, numrows);
+	fsstate->num_tuples = numrows;
+	fsstate->next_tuple = 0;
+
+	for (i = 0; i < numrows; i++)
+	{
+		Assert(IsA(node->ss.ps.plan, ForeignScan));
+
+		fsstate->tuples[i] =
+			make_tuple_from_result_row(res, i,
+									   fsstate->rel,
+									   fsstate->attinmeta,
+									   fsstate->retrieved_attrs,
+									   node,
+									   fsstate->temp_cxt);
+	}
+
+	/* Update fetch_ct_2 */
+	if (fsstate->fetch_ct_2 < 2)
+		fsstate->fetch_ct_2++;
+
+	/* Must be EOF if we didn't get as many tuples as we asked for. */
+	fsstate->eof_reached = (numrows < fsstate->fetch_size);
+
+	PQclear(res);
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -3935,14 +4264,9 @@ close_cursor(PGconn *conn, unsigned int cursor_number,
 	PGresult   *res;
 
 	snprintf(sql, sizeof(sql), "CLOSE c%u", cursor_number);
-
-	/*
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
-	 */
 	res = pgfdw_exec_query(conn, sql, conn_state);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, conn, true, sql);
+		pgfdw_report_error(res, conn, sql);
 	PQclear(res);
 }
 
@@ -3975,7 +4299,7 @@ create_foreign_modify(EState *estate,
 	ListCell   *lc;
 
 	/* Begin constructing PgFdwModifyState. */
-	fmstate = (PgFdwModifyState *) palloc0(sizeof(PgFdwModifyState));
+	fmstate = palloc0_object(PgFdwModifyState);
 	fmstate->rel = rel;
 
 	/* Identify which user to do the remote access as. */
@@ -4012,7 +4336,7 @@ create_foreign_modify(EState *estate,
 
 	/* Prepare for output conversion of parameters used in prepared stmt. */
 	n_params = list_length(fmstate->target_attrs) + 1;
-	fmstate->p_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * n_params);
+	fmstate->p_flinfo = palloc0_array(FmgrInfo, n_params);
 	fmstate->p_nums = 0;
 
 	if (operation == CMD_UPDATE || operation == CMD_DELETE)
@@ -4150,18 +4474,15 @@ execute_foreign_modify(EState *estate,
 							 NULL,
 							 NULL,
 							 0))
-		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
+		pgfdw_report_error(NULL, fmstate->conn, fmstate->query);
 
 	/*
 	 * Get the result, and check for success.
-	 *
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(fmstate->conn, fmstate->query);
+	res = pgfdw_get_result(fmstate->conn);
 	if (PQresultStatus(res) !=
 		(fmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
+		pgfdw_report_error(res, fmstate->conn, fmstate->query);
 
 	/* Check number of rows affected, and fetch RETURNING tuple if any */
 	if (fmstate->has_returning)
@@ -4220,17 +4541,14 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
 					   fmstate->query,
 					   0,
 					   NULL))
-		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
+		pgfdw_report_error(NULL, fmstate->conn, fmstate->query);
 
 	/*
 	 * Get the result, and check for success.
-	 *
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
 	 */
-	res = pgfdw_get_result(fmstate->conn, fmstate->query);
+	res = pgfdw_get_result(fmstate->conn);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
+		pgfdw_report_error(res, fmstate->conn, fmstate->query);
 	PQclear(res);
 
 	/* This action shows that the prepare has been done. */
@@ -4260,7 +4578,7 @@ convert_prep_stmt_params(PgFdwModifyState *fmstate,
 
 	oldcontext = MemoryContextSwitchTo(fmstate->temp_cxt);
 
-	p_values = (const char **) palloc(sizeof(char *) * fmstate->p_nums * numSlots);
+	p_values = palloc_array(const char *, fmstate->p_nums * numSlots);
 
 	/* ctid is provided only for UPDATE/DELETE, which don't allow batching */
 	Assert(!(tupleid != NULL && numSlots > 1));
@@ -4290,7 +4608,7 @@ convert_prep_stmt_params(PgFdwModifyState *fmstate,
 			foreach(lc, fmstate->target_attrs)
 			{
 				int			attnum = lfirst_int(lc);
-				Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+				CompactAttribute *attr = TupleDescCompactAttr(tupdesc, attnum - 1);
 				Datum		value;
 				bool		isnull;
 
@@ -4321,37 +4639,25 @@ convert_prep_stmt_params(PgFdwModifyState *fmstate,
 /*
  * store_returning_result
  *		Store the result of a RETURNING clause
- *
- * On error, be sure to release the PGresult on the way out.  Callers do not
- * have PG_TRY blocks to ensure this happens.
  */
 static void
 store_returning_result(PgFdwModifyState *fmstate,
 					   TupleTableSlot *slot, PGresult *res)
 {
-	PG_TRY();
-	{
-		HeapTuple	newtup;
+	HeapTuple	newtup;
 
-		newtup = make_tuple_from_result_row(res, 0,
-											fmstate->rel,
-											fmstate->attinmeta,
-											fmstate->retrieved_attrs,
-											NULL,
-											fmstate->temp_cxt);
+	newtup = make_tuple_from_result_row(res, 0,
+										fmstate->rel,
+										fmstate->attinmeta,
+										fmstate->retrieved_attrs,
+										NULL,
+										fmstate->temp_cxt);
 
-		/*
-		 * The returning slot will not necessarily be suitable to store
-		 * heaptuples directly, so allow for conversion.
-		 */
-		ExecForceStoreHeapTuple(newtup, slot, true);
-	}
-	PG_CATCH();
-	{
-		PQclear(res);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	/*
+	 * The returning slot will not necessarily be suitable to store heaptuples
+	 * directly, so allow for conversion.
+	 */
+	ExecForceStoreHeapTuple(newtup, slot, true);
 }
 
 /*
@@ -4387,14 +4693,9 @@ deallocate_query(PgFdwModifyState *fmstate)
 		return;
 
 	snprintf(sql, sizeof(sql), "DEALLOCATE %s", fmstate->p_name);
-
-	/*
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
-	 */
 	res = pgfdw_exec_query(fmstate->conn, sql, fmstate->conn_state);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, sql);
+		pgfdw_report_error(res, fmstate->conn, sql);
 	PQclear(res);
 	pfree(fmstate->p_name);
 	fmstate->p_name = NULL;
@@ -4562,19 +4863,23 @@ execute_dml_stmt(ForeignScanState *node)
 	 */
 	if (!PQsendQueryParams(dmstate->conn, dmstate->query, numParams,
 						   NULL, values, NULL, NULL, 0))
-		pgfdw_report_error(ERROR, NULL, dmstate->conn, false, dmstate->query);
+		pgfdw_report_error(NULL, dmstate->conn, dmstate->query);
 
 	/*
 	 * Get the result, and check for success.
-	 *
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
 	 */
-	dmstate->result = pgfdw_get_result(dmstate->conn, dmstate->query);
+	dmstate->result = pgfdw_get_result(dmstate->conn);
 	if (PQresultStatus(dmstate->result) !=
 		(dmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
-		pgfdw_report_error(ERROR, dmstate->result, dmstate->conn, true,
+		pgfdw_report_error(dmstate->result, dmstate->conn,
 						   dmstate->query);
+
+	/*
+	 * The result potentially needs to survive across multiple executor row
+	 * cycles, so move it to the context where the dmstate is.
+	 */
+	dmstate->result = libpqsrv_PGresultSetParent(dmstate->result,
+												 GetMemoryChunkContext(dmstate));
 
 	/* Get the number of rows affected. */
 	if (dmstate->has_returning)
@@ -4617,30 +4922,16 @@ get_returning_data(ForeignScanState *node)
 	}
 	else
 	{
-		/*
-		 * On error, be sure to release the PGresult on the way out.  Callers
-		 * do not have PG_TRY blocks to ensure this happens.
-		 */
-		PG_TRY();
-		{
-			HeapTuple	newtup;
+		HeapTuple	newtup;
 
-			newtup = make_tuple_from_result_row(dmstate->result,
-												dmstate->next_tuple,
-												dmstate->rel,
-												dmstate->attinmeta,
-												dmstate->retrieved_attrs,
-												node,
-												dmstate->temp_cxt);
-			ExecStoreHeapTuple(newtup, slot, false);
-		}
-		PG_CATCH();
-		{
-			PQclear(dmstate->result);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-
+		newtup = make_tuple_from_result_row(dmstate->result,
+											dmstate->next_tuple,
+											dmstate->rel,
+											dmstate->attinmeta,
+											dmstate->retrieved_attrs,
+											node,
+											dmstate->temp_cxt);
+		ExecStoreHeapTuple(newtup, slot, false);
 		/* Get the updated/deleted tuple. */
 		if (dmstate->rel)
 			resultSlot = slot;
@@ -4680,8 +4971,7 @@ init_returning_filter(PgFdwDirectModifyState *dmstate,
 	 *
 	 * Also get the indexes of the entries for ctid and oid if any.
 	 */
-	dmstate->attnoMap = (AttrNumber *)
-		palloc0(resultTupType->natts * sizeof(AttrNumber));
+	dmstate->attnoMap = palloc0_array(AttrNumber, resultTupType->natts);
 
 	dmstate->ctidAttno = dmstate->oidAttno = 0;
 
@@ -4845,7 +5135,7 @@ prepare_query_params(PlanState *node,
 	Assert(numParams > 0);
 
 	/* Prepare for output conversion of parameters used in remote query. */
-	*param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * numParams);
+	*param_flinfo = palloc0_array(FmgrInfo, numParams);
 
 	i = 0;
 	foreach(lc, fdw_exprs)
@@ -4870,7 +5160,7 @@ prepare_query_params(PlanState *node,
 	*param_exprs = ExecInitExprList(fdw_exprs, node);
 
 	/* Allocate buffer for text form of query parameters. */
-	*param_values = (const char **) palloc0(numParams * sizeof(char *));
+	*param_values = palloc0_array(const char *, numParams);
 }
 
 /*
@@ -4926,7 +5216,7 @@ postgresAnalyzeForeignTable(Relation relation,
 	UserMapping *user;
 	PGconn	   *conn;
 	StringInfoData sql;
-	PGresult   *volatile res = NULL;
+	PGresult   *res;
 
 	/* Return the row-analysis function pointer */
 	*func = postgresAcquireSampleRowsFunc;
@@ -4952,22 +5242,14 @@ postgresAnalyzeForeignTable(Relation relation,
 	initStringInfo(&sql);
 	deparseAnalyzeSizeSql(&sql, relation);
 
-	/* In what follows, do not risk leaking any PGresults. */
-	PG_TRY();
-	{
-		res = pgfdw_exec_query(conn, sql.data, NULL);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			pgfdw_report_error(ERROR, res, conn, false, sql.data);
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(res, conn, sql.data);
 
-		if (PQntuples(res) != 1 || PQnfields(res) != 1)
-			elog(ERROR, "unexpected result from deparseAnalyzeSizeSql query");
-		*totalpages = strtoul(PQgetvalue(res, 0, 0), NULL, 10);
-	}
-	PG_FINALLY();
-	{
-		PQclear(res);
-	}
-	PG_END_TRY();
+	if (PQntuples(res) != 1 || PQnfields(res) != 1)
+		elog(ERROR, "unexpected result from deparseAnalyzeSizeSql query");
+	*totalpages = strtoul(PQgetvalue(res, 0, 0), NULL, 10);
+	PQclear(res);
 
 	ReleaseConnection(conn);
 
@@ -4988,9 +5270,9 @@ postgresGetAnalyzeInfoForForeignTable(Relation relation, bool *can_tablesample)
 	UserMapping *user;
 	PGconn	   *conn;
 	StringInfoData sql;
-	PGresult   *volatile res = NULL;
-	volatile double reltuples = -1;
-	volatile char relkind = 0;
+	PGresult   *res;
+	double		reltuples;
+	char		relkind;
 
 	/* assume the remote relation does not support TABLESAMPLE */
 	*can_tablesample = false;
@@ -5009,24 +5291,16 @@ postgresGetAnalyzeInfoForForeignTable(Relation relation, bool *can_tablesample)
 	initStringInfo(&sql);
 	deparseAnalyzeInfoSql(&sql, relation);
 
-	/* In what follows, do not risk leaking any PGresults. */
-	PG_TRY();
-	{
-		res = pgfdw_exec_query(conn, sql.data, NULL);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			pgfdw_report_error(ERROR, res, conn, false, sql.data);
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(res, conn, sql.data);
 
-		if (PQntuples(res) != 1 || PQnfields(res) != 2)
-			elog(ERROR, "unexpected result from deparseAnalyzeInfoSql query");
-		reltuples = strtod(PQgetvalue(res, 0, 0), NULL);
-		relkind = *(PQgetvalue(res, 0, 1));
-	}
-	PG_FINALLY();
-	{
-		if (res)
-			PQclear(res);
-	}
-	PG_END_TRY();
+	if (PQntuples(res) != 1 || PQnfields(res) != RELSTATS_NUM_FIELDS)
+		elog(ERROR, "unexpected result from deparseAnalyzeInfoSql query");
+	/* We don't use relpages/relhassubclass here */
+	reltuples = strtod(PQgetvalue(res, 0, RELSTATS_RELTUPLES), NULL);
+	relkind = *(PQgetvalue(res, 0, RELSTATS_RELKIND));
+	PQclear(res);
 
 	ReleaseConnection(conn);
 
@@ -5066,10 +5340,12 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 	int			server_version_num;
 	PgFdwSamplingMethod method = ANALYZE_SAMPLE_AUTO;	/* auto is default */
 	double		sample_frac = -1.0;
-	double		reltuples;
+	double		reltuples = -1.0;
 	unsigned int cursor_number;
 	StringInfoData sql;
-	PGresult   *volatile res = NULL;
+	PGresult   *res;
+	char		fetch_sql[64];
+	int			fetch_size;
 	ListCell   *lc;
 
 	/* Initialize workspace state */
@@ -5246,91 +5522,76 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
 
 	deparseAnalyzeSql(&sql, relation, method, sample_frac, &astate.retrieved_attrs);
 
-	/* In what follows, do not risk leaking any PGresults. */
-	PG_TRY();
-	{
-		char		fetch_sql[64];
-		int			fetch_size;
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(res, conn, sql.data);
+	PQclear(res);
 
-		res = pgfdw_exec_query(conn, sql.data, NULL);
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			pgfdw_report_error(ERROR, res, conn, false, sql.data);
-		PQclear(res);
-		res = NULL;
+	/*
+	 * Determine the fetch size.  The default is arbitrary, but shouldn't be
+	 * enormous.
+	 */
+	fetch_size = 100;
+	foreach(lc, server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "fetch_size") == 0)
+		{
+			(void) parse_int(defGetString(def), &fetch_size, 0, NULL);
+			break;
+		}
+	}
+	foreach(lc, table->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "fetch_size") == 0)
+		{
+			(void) parse_int(defGetString(def), &fetch_size, 0, NULL);
+			break;
+		}
+	}
+
+	/* Construct command to fetch rows from remote. */
+	snprintf(fetch_sql, sizeof(fetch_sql), "FETCH %d FROM c%u",
+			 fetch_size, cursor_number);
+
+	/* Retrieve and process rows a batch at a time. */
+	for (;;)
+	{
+		int			numrows;
+		int			i;
+
+		/* Allow users to cancel long query */
+		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * Determine the fetch size.  The default is arbitrary, but shouldn't
-		 * be enormous.
+		 * XXX possible future improvement: if rowstoskip is large, we could
+		 * issue a MOVE rather than physically fetching the rows, then just
+		 * adjust rowstoskip and samplerows appropriately.
 		 */
-		fetch_size = 100;
-		foreach(lc, server->options)
-		{
-			DefElem    *def = (DefElem *) lfirst(lc);
 
-			if (strcmp(def->defname, "fetch_size") == 0)
-			{
-				(void) parse_int(defGetString(def), &fetch_size, 0, NULL);
-				break;
-			}
-		}
-		foreach(lc, table->options)
-		{
-			DefElem    *def = (DefElem *) lfirst(lc);
+		/* Fetch some rows */
+		res = pgfdw_exec_query(conn, fetch_sql, NULL);
+		/* On error, report the original query, not the FETCH. */
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			pgfdw_report_error(res, conn, sql.data);
 
-			if (strcmp(def->defname, "fetch_size") == 0)
-			{
-				(void) parse_int(defGetString(def), &fetch_size, 0, NULL);
-				break;
-			}
-		}
+		/* Process whatever we got. */
+		numrows = PQntuples(res);
+		for (i = 0; i < numrows; i++)
+			analyze_row_processor(res, i, &astate);
 
-		/* Construct command to fetch rows from remote. */
-		snprintf(fetch_sql, sizeof(fetch_sql), "FETCH %d FROM c%u",
-				 fetch_size, cursor_number);
-
-		/* Retrieve and process rows a batch at a time. */
-		for (;;)
-		{
-			int			numrows;
-			int			i;
-
-			/* Allow users to cancel long query */
-			CHECK_FOR_INTERRUPTS();
-
-			/*
-			 * XXX possible future improvement: if rowstoskip is large, we
-			 * could issue a MOVE rather than physically fetching the rows,
-			 * then just adjust rowstoskip and samplerows appropriately.
-			 */
-
-			/* Fetch some rows */
-			res = pgfdw_exec_query(conn, fetch_sql, NULL);
-			/* On error, report the original query, not the FETCH. */
-			if (PQresultStatus(res) != PGRES_TUPLES_OK)
-				pgfdw_report_error(ERROR, res, conn, false, sql.data);
-
-			/* Process whatever we got. */
-			numrows = PQntuples(res);
-			for (i = 0; i < numrows; i++)
-				analyze_row_processor(res, i, &astate);
-
-			PQclear(res);
-			res = NULL;
-
-			/* Must be EOF if we didn't get all the rows requested. */
-			if (numrows < fetch_size)
-				break;
-		}
-
-		/* Close the cursor, just to be tidy. */
-		close_cursor(conn, cursor_number, NULL);
-	}
-	PG_CATCH();
-	{
 		PQclear(res);
-		PG_RE_THROW();
+
+		/* Must be EOF if we didn't get all the rows requested. */
+		if (numrows < fetch_size)
+			break;
 	}
-	PG_END_TRY();
+
+	/* Close the cursor, just to be tidy. */
+	close_cursor(conn, cursor_number, NULL);
 
 	ReleaseConnection(conn);
 
@@ -5428,6 +5689,830 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 }
 
 /*
+ * postgresImportForeignStatistics
+ * 		Attempt to import remote statistics instead of sampling.
+ */
+static bool
+postgresImportForeignStatistics(Relation relation, List *va_cols, int elevel)
+{
+	const char *schemaname = NULL;
+	const char *relname = NULL;
+	ForeignTable *table;
+	ForeignServer *server;
+	RemoteStatsResults remstats = {.rel = NULL, .att = NULL};
+	RemoteAttributeMapping *remattrmap = NULL;
+	int			attrcnt = 0;
+	TimestampTz starttime = 0;
+	bool		import_stats = false;
+	bool		ok = false;
+	ListCell   *lc;
+
+	schemaname = get_namespace_name(RelationGetNamespace(relation));
+	relname = RelationGetRelationName(relation);
+	table = GetForeignTable(RelationGetRelid(relation));
+	server = GetForeignServer(table->serverid);
+
+	/*
+	 * Check whether the import_stats option is enabled on the foreign table.
+	 * If not, silently ignore the foreign table.
+	 *
+	 * Server-level options can be overridden by table-level options, so check
+	 * server-level first.
+	 */
+	foreach(lc, server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "import_stats") == 0)
+		{
+			import_stats = defGetBoolean(def);
+			break;
+		}
+	}
+	foreach(lc, table->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "import_stats") == 0)
+		{
+			import_stats = defGetBoolean(def);
+			break;
+		}
+	}
+	if (!import_stats)
+		return false;
+
+	/*
+	 * We don't currently support statistics import for foreign tables with
+	 * extended statistics objects.
+	 */
+	if (HasRelationExtStatistics(relation))
+	{
+		ereport(WARNING,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot import statistics for foreign table \"%s.%s\" --- this foreign table has extended statistics objects",
+					   schemaname, relname));
+		return false;
+	}
+
+	/*
+	 * OK, let's do it.
+	 */
+	ereport(elevel,
+			(errmsg("importing statistics for foreign table \"%s.%s\"",
+					schemaname, relname)));
+
+	starttime = GetCurrentTimestamp();
+
+	ok = fetch_remote_statistics(relation, va_cols,
+								 schemaname, relname, table, server,
+								 &remstats, &remattrmap, &attrcnt);
+
+	if (ok)
+		ok = import_fetched_statistics(relation, schemaname, relname,
+									   &remstats, remattrmap, attrcnt);
+
+	if (ok)
+	{
+		pgstat_report_analyze(relation, remstats.reltuples, 0,
+							  (va_cols == NIL), starttime);
+
+		ereport(elevel,
+				(errmsg("finished importing statistics for foreign table \"%s.%s\"",
+						schemaname, relname)));
+	}
+
+	PQclear(remstats.rel);
+	PQclear(remstats.att);
+	free_remattrmap(remattrmap, attrcnt);
+
+	return ok;
+}
+
+/*
+ * Attempt to fetch statistics from a remote server.
+ */
+static bool
+fetch_remote_statistics(Relation relation,
+						List *va_cols,
+						const char *local_schemaname,
+						const char *local_relname,
+						ForeignTable *table,
+						ForeignServer *server,
+						RemoteStatsResults *remstats,
+						RemoteAttributeMapping **p_remattrmap,
+						int *p_attrcnt)
+{
+	const char *remote_schemaname = NULL;
+	const char *remote_relname = NULL;
+	UserMapping *user;
+	PGconn	   *conn;
+	PGresult   *relstats = NULL;
+	PGresult   *attstats = NULL;
+	int			server_version_num;
+	char		relkind;
+	double		reltuples;
+	bool		ok = false;
+	ListCell   *lc;
+
+	/*
+	 * Assume the remote schema/table names are the same as the local name
+	 * unless the foreign table's options tell us otherwise.
+	 */
+	remote_schemaname = local_schemaname;
+	remote_relname = local_relname;
+	foreach(lc, table->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "schema_name") == 0)
+			remote_schemaname = defGetString(def);
+		else if (strcmp(def->defname, "table_name") == 0)
+			remote_relname = defGetString(def);
+	}
+
+	/*
+	 * Get the connection to use.  We do the remote access as the table's
+	 * owner.  Note that unlike AnalyzeForeignTable(), the core code would
+	 * already have switched us to the table's owner, before we are called
+	 * from ImportForeignStatistics().
+	 */
+	user = GetUserMapping(GetUserId(), table->serverid);
+	conn = GetConnection(user, false, NULL);
+	remstats->version = server_version_num = PQserverVersion(conn);
+
+	/* Fetch relation stats. */
+	remstats->rel = relstats = fetch_relstats(conn, relation);
+
+	/*
+	 * Verify that the remote table is the sort that can have meaningful stats
+	 * in pg_stats.
+	 *
+	 * Note that while relations of kinds RELKIND_INDEX and
+	 * RELKIND_PARTITIONED_INDEX can have rows in pg_stats, they obviously
+	 * can't support a foreign table.
+	 */
+	relkind = *PQgetvalue(relstats, 0, RELSTATS_RELKIND);
+	switch (relkind)
+	{
+		case RELKIND_RELATION:
+		case RELKIND_FOREIGN_TABLE:
+		case RELKIND_MATVIEW:
+		case RELKIND_PARTITIONED_TABLE:
+			break;
+		default:
+			ereport(WARNING,
+					errmsg("could not import statistics for foreign table \"%s.%s\" --- remote table \"%s.%s\" is of relkind \"%c\" which cannot have statistics",
+						   local_schemaname, local_relname,
+						   remote_schemaname, remote_relname, relkind));
+			goto fetch_cleanup;
+	}
+
+	/*
+	 * For now, we don't support the case where the remote table is (or was
+	 * once) inherited; fallback to sampling in that case.  XXX FIXME: for the
+	 * case where it is inherited, we could also support it by fetching and
+	 * adding the relation stats for child tables as well.
+	 */
+	if ((relkind == RELKIND_RELATION || relkind == RELKIND_FOREIGN_TABLE) &&
+		strcmp(PQgetvalue(relstats, 0, RELSTATS_RELHASSUBCLASS), "t") == 0)
+	{
+		ereport(WARNING,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("could not import statistics for foreign table \"%s.%s\" --- remote table \"%s.%s\" is (or was once) inherited",
+					   local_schemaname, local_relname,
+					   remote_schemaname, remote_relname));
+		goto fetch_cleanup;
+	}
+
+	/*
+	 * If the reltuples value > 0, then we can expect to find attribute stats
+	 * for the remote table.
+	 *
+	 * In v14 or later, if the value is -1, it means the table had never been
+	 * analyzed, so we wouldn't expect to find the stats; fallback to sampling
+	 * in that case.  If the value is 0, it means it was empty, in which case
+	 * we don't need the stats, so import relation stats only.
+	 *
+	 * In versions prior to v14, a value of 0 was ambiguous; it could mean
+	 * that the table had never been analyzed, or that it was empty.  Assuming
+	 * the former, fallback to sampling.
+	 */
+	remstats->reltuples = reltuples =
+		strtod(PQgetvalue(relstats, 0, RELSTATS_RELTUPLES), NULL);
+	if (reltuples > 0)
+	{
+		RemoteAttributeMapping *remattrmap;
+		int			attrcnt;
+		StringInfoData column_list;
+
+		/* For columns to analyze, create mappings of local/remote columns. */
+		*p_remattrmap = remattrmap = build_remattrmap(relation, va_cols,
+													  &attrcnt, &column_list);
+		*p_attrcnt = attrcnt;
+
+		/* Try to get attribute stats if needed. */
+		if (attrcnt > 0)
+		{
+			/*
+			 * The fetch_attstats query sends COLLATE "C" to the remote
+			 * server; if it hasn't got it, fallback to sampling.
+			 */
+			if (server_version_num < 90100)
+			{
+				ereport(WARNING,
+						errmsg("could not import statistics for foreign table \"%s.%s\" --- foreign server \"%s\" is too old to support attribute statistics import",
+							   local_schemaname, local_relname,
+							   server->servername));
+				goto fetch_cleanup;
+			}
+
+			/* Fetch attribute stats. */
+			remstats->att = attstats = fetch_attstats(conn,
+													  server_version_num,
+													  remote_schemaname,
+													  remote_relname,
+													  column_list.data);
+
+			/* If any attribute stats are missing, fallback to sampling. */
+			if (!match_attrmap(attstats,
+							   local_schemaname, local_relname,
+							   remote_schemaname, remote_relname,
+							   remattrmap, attrcnt))
+				goto fetch_cleanup;
+		}
+	}
+	else if (((server_version_num < 140000) && (reltuples == 0)) ||
+			 ((server_version_num >= 140000) && (reltuples == -1)))
+	{
+		ereport(WARNING,
+				errmsg("could not import statistics for foreign table \"%s.%s\" --- remote table \"%s.%s\" has no relation statistics to import",
+					   local_schemaname, local_relname,
+					   remote_schemaname, remote_relname));
+		goto fetch_cleanup;
+	}
+
+	/*
+	 * If the remote table is partitioned, import relpages = 0, to match the
+	 * sampling path.  Otherwise, import the relpages value as-is, regardless
+	 * of any difference between the remote and local block sizes.  Note that
+	 * this is fine because it's only used for costing remote operations on
+	 * the foreign table.
+	 */
+	if (relkind == RELKIND_PARTITIONED_TABLE)
+		remstats->relpages = 0;
+	else
+		remstats->relpages =
+			strtoul(PQgetvalue(relstats, 0, RELSTATS_RELPAGES), NULL, 10);
+
+	ok = true;
+
+fetch_cleanup:
+	ReleaseConnection(conn);
+	return ok;
+}
+
+/*
+ * Attempt to fetch remote relation stats.
+ */
+static PGresult *
+fetch_relstats(PGconn *conn, Relation relation)
+{
+	StringInfoData sql;
+	PGresult   *res;
+
+	initStringInfo(&sql);
+	deparseAnalyzeInfoSql(&sql, relation);
+
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(res, conn, sql.data);
+
+	if (PQntuples(res) != 1 || PQnfields(res) != RELSTATS_NUM_FIELDS)
+		elog(ERROR, "unexpected result from deparseAnalyzeInfoSql query");
+
+	return res;
+}
+
+/*
+ * Attempt to fetch remote attribute stats.
+ */
+static PGresult *
+fetch_attstats(PGconn *conn, int server_version_num,
+			   const char *remote_schemaname, const char *remote_relname,
+			   const char *column_list)
+{
+	StringInfoData sql;
+	PGresult   *res;
+
+	/*
+	 * The caller guarantees the remote server is v9.1, which supported
+	 * COLLATE "C", or later
+	 */
+	Assert(server_version_num >= 90100);
+
+	initStringInfo(&sql);
+
+	/* Type name is collatable since Postgres 12 */
+	if (server_version_num >= 120000)
+		appendStringInfoString(&sql,
+							   "SELECT DISTINCT ON (attname COLLATE \"C\") attname,");
+	else
+		appendStringInfoString(&sql,
+							   "SELECT DISTINCT ON (attname::text COLLATE \"C\") attname,");
+
+	appendStringInfoString(&sql,
+						   " null_frac,"
+						   " avg_width,"
+						   " n_distinct,"
+						   " most_common_vals,"
+						   " most_common_freqs,"
+						   " histogram_bounds,"
+						   " correlation,");
+
+	/* Elements stats are supported since Postgres 9.2 */
+	if (server_version_num >= 90200)
+		appendStringInfoString(&sql,
+							   " most_common_elems,"
+							   " most_common_elem_freqs,"
+							   " elem_count_histogram,");
+	else
+		appendStringInfoString(&sql,
+							   " NULL, NULL, NULL,");
+
+	/* Range stats are supported since Postgres 17 */
+	if (server_version_num >= 170000)
+		appendStringInfoString(&sql,
+							   " range_length_histogram,"
+							   " range_empty_frac,"
+							   " range_bounds_histogram");
+	else
+		appendStringInfoString(&sql,
+							   " NULL, NULL, NULL");
+
+	appendStringInfoString(&sql,
+						   " FROM pg_catalog.pg_stats"
+						   " WHERE schemaname = ");
+	deparseStringLiteral(&sql, remote_schemaname);
+	appendStringInfoString(&sql,
+						   " AND tablename = ");
+	deparseStringLiteral(&sql, remote_relname);
+	appendStringInfo(&sql,
+					 " AND attname = ANY(%s)",
+					 column_list);
+
+	/*
+	 * Type name is collatable since Postgres 12  (inherited is supported
+	 * since Postgres 9.0)
+	 */
+	if (server_version_num >= 120000)
+		appendStringInfoString(&sql,
+							   " ORDER BY attname COLLATE \"C\", inherited DESC");
+	else
+		appendStringInfoString(&sql,
+							   " ORDER BY attname::text COLLATE \"C\", inherited DESC");
+
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(res, conn, sql.data);
+
+	if (PQnfields(res) != ATTSTATS_NUM_FIELDS)
+		elog(ERROR, "unexpected result from fetch_attstats query");
+
+	return res;
+}
+
+/*
+ * For columns to analyze, build the mappings of local columns to remote
+ * columns, and create a column list used for constructing the fetch_attstats
+ * query.
+ */
+static RemoteAttributeMapping *
+build_remattrmap(Relation relation, List *va_cols,
+				 int *p_attrcnt, StringInfo column_list)
+{
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	RemoteAttributeMapping *remattrmap = NULL;
+	int			attrcnt = 0;
+
+	remattrmap = palloc_array(RemoteAttributeMapping, tupdesc->natts);
+	initStringInfo(column_list);
+	appendStringInfoString(column_list, "ARRAY[");
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		char	   *attname = NameStr(attr->attname);
+		AttrNumber	attnum = attr->attnum;
+		char	   *colname;
+		List	   *fc_options;
+		ListCell   *lc;
+
+		/* If a list is specified, exclude any attnames not in it. */
+		if (!attname_in_list(attname, va_cols))
+			continue;
+
+		if (!attribute_is_analyzable(relation, attnum, attr, NULL))
+			continue;
+
+		/*
+		 * Assume the remote column names are the same as the local name
+		 * unless the foreign column's options tell us otherwise.
+		 */
+		colname = attname;
+		fc_options = GetForeignColumnOptions(RelationGetRelid(relation), attnum);
+		foreach(lc, fc_options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "column_name") == 0)
+			{
+				colname = defGetString(def);
+				break;
+			}
+		}
+
+		if (attrcnt > 0)
+			appendStringInfoString(column_list, ", ");
+		deparseStringLiteral(column_list, colname);
+
+		remattrmap[attrcnt].local_attnum = attnum;
+		remattrmap[attrcnt].local_attname = pstrdup(attname);
+		remattrmap[attrcnt].remote_attname = pstrdup(colname);
+		remattrmap[attrcnt].res_index = -1;
+		attrcnt++;
+	}
+	appendStringInfoChar(column_list, ']');
+
+	/* Sort the mappings by remote_attname if needed. */
+	if (attrcnt > 1)
+		qsort(remattrmap, attrcnt, sizeof(RemoteAttributeMapping), remattrmap_cmp);
+
+	*p_attrcnt = attrcnt;
+	return remattrmap;
+}
+
+/*
+ * Free the structure created by build_remattrmap().
+ */
+static void
+free_remattrmap(RemoteAttributeMapping *map, int len)
+{
+	if (!map)
+		return;
+
+	for (int i = 0; i < len; i++)
+	{
+		Assert(map[i].local_attname);
+		pfree(map[i].local_attname);
+		Assert(map[i].remote_attname);
+		pfree(map[i].remote_attname);
+	}
+
+	pfree(map);
+}
+
+/*
+ * Test if an attribute name is in the list.
+ *
+ * An empty list means that all attribute names are in the list.
+ */
+static bool
+attname_in_list(const char *attname, List *va_cols)
+{
+	ListCell   *lc;
+
+	if (va_cols == NIL)
+		return true;
+
+	foreach(lc, va_cols)
+	{
+		char	   *col = strVal(lfirst(lc));
+
+		if (strcmp(attname, col) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Compare two RemoteAttributeMappings for sorting.
+ */
+static int
+remattrmap_cmp(const void *v1, const void *v2)
+{
+	const RemoteAttributeMapping *r1 = v1;
+	const RemoteAttributeMapping *r2 = v2;
+
+	return strcmp(r1->remote_attname, r2->remote_attname);
+}
+
+/*
+ * Match local columns to result set rows.
+ *
+ * As the result set consists of the attribute stats for some/all of distinct
+ * mapped remote columns in the RemoteAttributeMapping, every entry in it
+ * should have at most one match in the result set; which is also ordered by
+ * remote_attname, so we find such pairs by doing a merge join.
+ *
+ * Returns true if every entry in it has a match, and false if not.
+ */
+static bool
+match_attrmap(PGresult *res,
+			  const char *local_schemaname,
+			  const char *local_relname,
+			  const char *remote_schemaname,
+			  const char *remote_relname,
+			  RemoteAttributeMapping *remattrmap,
+			  int attrcnt)
+{
+	int			numrows = PQntuples(res);
+	int			row = -1;
+
+	/* No work if there are no stats rows. */
+	if (numrows == 0)
+	{
+		ereport(WARNING,
+				errmsg("could not import statistics for foreign table \"%s.%s\" --- remote table \"%s.%s\" has no attribute statistics to import",
+					   local_schemaname, local_relname,
+					   remote_schemaname, remote_relname));
+		return false;
+	}
+
+	/* Scan all entries in the RemoteAttributeMapping. */
+	for (int mapidx = 0; mapidx < attrcnt; mapidx++)
+	{
+		/*
+		 * First, check whether the entry matches the current stats row, if it
+		 * is set.
+		 */
+		if (row >= 0 &&
+			strcmp(remattrmap[mapidx].remote_attname,
+				   PQgetvalue(res, row, ATTSTATS_ATTNAME)) == 0)
+		{
+			remattrmap[mapidx].res_index = row;
+			continue;
+		}
+
+		/*
+		 * If we've exhausted all stats rows, it means the stats for the entry
+		 * are missing.
+		 */
+		if (row >= numrows - 1)
+		{
+			ereport(WARNING,
+					errmsg("could not import statistics for foreign table \"%s.%s\" --- no attribute statistics found for column \"%s\" of remote table \"%s.%s\"",
+						   local_schemaname, local_relname,
+						   remattrmap[mapidx].remote_attname,
+						   remote_schemaname, remote_relname));
+			return false;
+		}
+
+		/* Advance to the next stats row. */
+		row += 1;
+
+		/*
+		 * If the attname in the entry is less than that in the next stats
+		 * row, it means the stats for the entry are missing.
+		 */
+		if (strcmp(remattrmap[mapidx].remote_attname,
+				   PQgetvalue(res, row, ATTSTATS_ATTNAME)) < 0)
+		{
+			ereport(WARNING,
+					errmsg("could not import statistics for foreign table \"%s.%s\" --- no attribute statistics found for column \"%s\" of remote table \"%s.%s\"",
+						   local_schemaname, local_relname,
+						   remattrmap[mapidx].remote_attname,
+						   remote_schemaname, remote_relname));
+			return false;
+		}
+
+		/* We should not have got a stats row we didn't expect. */
+		if (strcmp(remattrmap[mapidx].remote_attname,
+				   PQgetvalue(res, row, ATTSTATS_ATTNAME)) > 0)
+			elog(ERROR, "unexpected result from fetch_attstats query");
+
+		/* We found a match. */
+		Assert(strcmp(remattrmap[mapidx].remote_attname,
+					  PQgetvalue(res, row, ATTSTATS_ATTNAME)) == 0);
+		remattrmap[mapidx].res_index = row;
+	}
+
+	/* We should have exhausted all stats rows. */
+	if (row < numrows - 1)
+		elog(ERROR, "unexpected result from fetch_attstats query");
+
+	return true;
+}
+
+/*
+ * Import fetched statistics into the local statistics tables.
+ */
+static bool
+import_fetched_statistics(Relation relation,
+						  const char *schemaname,
+						  const char *relname,
+						  RemoteStatsResults *remstats,
+						  const RemoteAttributeMapping *remattrmap,
+						  int attrcnt)
+{
+	NullableDatum args[ATTSTATS_NUM_FIELDS];
+
+	/* Set the 'version' parameter, which is common to both statistics. */
+	args[0].value = Int32GetDatum(remstats->version);
+	args[0].isnull = false;
+
+	/*
+	 * We import attribute statistics first, if any, because those are more
+	 * prone to errors.  This avoids making a modification of pg_class that
+	 * will just get rolled back by a failed attribute import.
+	 */
+	if (remstats->att != NULL)
+	{
+		PGresult   *res = remstats->att;
+
+		Assert(PQnfields(res) == ATTSTATS_NUM_FIELDS);
+		Assert(PQntuples(res) >= 1);
+
+		for (int mapidx = 0; mapidx < attrcnt; mapidx++)
+		{
+			int			row = remattrmap[mapidx].res_index;
+			AttrNumber	attnum = remattrmap[mapidx].local_attnum;
+
+			/* All mappings should have been assigned a result set row. */
+			Assert(row >= 0);
+
+			/* Check for user-requested abort. */
+			CHECK_FOR_INTERRUPTS();
+
+			/* Clear existing attribute statistics. */
+			delete_attribute_statistics(relation, attnum, false);
+
+			/* Set the remaining parameters. */
+			set_float_arg(&args[1],
+						  get_opt_value(res, row, ATTSTATS_NULL_FRAC));
+			set_int32_arg(&args[2],
+						  get_opt_value(res, row, ATTSTATS_AVG_WIDTH));
+			set_float_arg(&args[3],
+						  get_opt_value(res, row, ATTSTATS_N_DISTINCT));
+			set_text_arg(&args[4],
+						 get_opt_value(res, row, ATTSTATS_MOST_COMMON_VALS));
+			set_floatarr_arg(&args[5],
+							 get_opt_value(res, row, ATTSTATS_MOST_COMMON_FREQS));
+			set_text_arg(&args[6],
+						 get_opt_value(res, row, ATTSTATS_HISTOGRAM_BOUNDS));
+			set_float_arg(&args[7],
+						  get_opt_value(res, row, ATTSTATS_CORRELATION));
+			set_text_arg(&args[8],
+						 get_opt_value(res, row, ATTSTATS_MOST_COMMON_ELEMS));
+			set_floatarr_arg(&args[9],
+							 get_opt_value(res, row, ATTSTATS_MOST_COMMON_ELEM_FREQS));
+			set_floatarr_arg(&args[10],
+							 get_opt_value(res, row, ATTSTATS_ELEM_COUNT_HISTOGRAM));
+			set_text_arg(&args[11],
+						 get_opt_value(res, row, ATTSTATS_RANGE_LENGTH_HISTOGRAM));
+			set_float_arg(&args[12],
+						  get_opt_value(res, row, ATTSTATS_RANGE_EMPTY_FRAC));
+			set_text_arg(&args[13],
+						 get_opt_value(res, row, ATTSTATS_RANGE_BOUNDS_HISTOGRAM));
+
+			/* Try to import the statistics. */
+			if (!import_attribute_statistics(relation, attnum, false,
+											 &args[0], &args[1], &args[2],
+											 &args[3], &args[4], &args[5],
+											 &args[6], &args[7], &args[8],
+											 &args[9], &args[10], &args[11],
+											 &args[12], &args[13]))
+			{
+				ereport(WARNING,
+						errmsg("could not import statistics for foreign table \"%s.%s\" --- attribute statistics import failed for column \"%s\" of this foreign table",
+							   schemaname, relname,
+							   remattrmap[mapidx].local_attname));
+				return false;
+			}
+		}
+	}
+
+	/*
+	 * Import relation statistics.
+	 */
+
+	/* Set the remaining parameters. */
+	args[1].value = Int32GetDatum(remstats->relpages);
+	args[1].isnull = false;
+	args[2].value = Float4GetDatum(remstats->reltuples);
+	args[2].isnull = false;
+	/* We don't import relallvisible/relallfrozen. */
+	args[3].value = (Datum) 0;
+	args[3].isnull = true;
+	args[4].value = (Datum) 0;
+	args[4].isnull = true;
+
+	/* Try to import the statistics. */
+	if (!import_relation_statistics(relation, &args[0], &args[1],
+									&args[2], &args[3], &args[4]))
+	{
+		ereport(WARNING,
+				errmsg("could not import statistics for foreign table \"%s.%s\" --- relation statistics import failed for this foreign table",
+					   schemaname, relname));
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * Convenience routine to fetch the value for the row/column of the PGresult
+ */
+static char *
+get_opt_value(PGresult *res, int row, int col)
+{
+	if (PQgetisnull(res, row, col))
+		return NULL;
+	return PQgetvalue(res, row, col);
+}
+
+/*
+ * Convenience routine for setting optional text arguments
+ */
+static void
+set_text_arg(NullableDatum *arg, const char *s)
+{
+	if (s)
+	{
+		arg->value = CStringGetTextDatum(s);
+		arg->isnull = false;
+	}
+	else
+	{
+		arg->value = (Datum) 0;
+		arg->isnull = true;
+	}
+}
+
+/*
+ * Convenience routine for setting optional int32 arguments
+ */
+static void
+set_int32_arg(NullableDatum *arg, const char *s)
+{
+	if (s)
+	{
+		int32		val = pg_strtoint32(s);
+
+		arg->value = Int32GetDatum(val);
+		arg->isnull = false;
+	}
+	else
+	{
+		arg->value = (Datum) 0;
+		arg->isnull = true;
+	}
+}
+
+/*
+ * Convenience routine for setting optional float arguments
+ */
+static void
+set_float_arg(NullableDatum *arg, const char *s)
+{
+	if (s)
+	{
+		float4		val = float4in_internal((char *) s, NULL, "float", s, NULL);
+
+		arg->value = Float4GetDatum(val);
+		arg->isnull = false;
+	}
+	else
+	{
+		arg->value = (Datum) 0;
+		arg->isnull = true;
+	}
+}
+
+/*
+ * Convenience routine for setting optional float[] arguments
+ */
+static void
+set_floatarr_arg(NullableDatum *arg, const char *s)
+{
+	if (s)
+	{
+		FmgrInfo	flinfo;
+		Datum		val;
+
+		fmgr_info(F_ARRAY_IN, &flinfo);
+		val = InputFunctionCall(&flinfo, s, FLOAT4OID, -1);
+
+		arg->value = val;
+		arg->isnull = false;
+	}
+	else
+	{
+		arg->value = (Datum) 0;
+		arg->isnull = true;
+	}
+}
+
+/*
  * Import a foreign schema
  */
 static List *
@@ -5442,7 +6527,7 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	UserMapping *mapping;
 	PGconn	   *conn;
 	StringInfoData buf;
-	PGresult   *volatile res = NULL;
+	PGresult   *res;
 	int			numrows,
 				i;
 	ListCell   *lc;
@@ -5481,247 +6566,526 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	/* Create workspace for strings */
 	initStringInfo(&buf);
 
-	/* In what follows, do not risk leaking any PGresults. */
-	PG_TRY();
+	/* Check that the schema really exists */
+	appendStringInfoString(&buf, "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = ");
+	deparseStringLiteral(&buf, stmt->remote_schema);
+
+	res = pgfdw_exec_query(conn, buf.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(res, conn, buf.data);
+
+	if (PQntuples(res) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_SCHEMA_NOT_FOUND),
+				 errmsg("schema \"%s\" is not present on foreign server \"%s\"",
+						stmt->remote_schema, server->servername)));
+
+	PQclear(res);
+	resetStringInfo(&buf);
+
+	/*
+	 * Fetch all table data from this schema, possibly restricted by EXCEPT or
+	 * LIMIT TO.  (We don't actually need to pay any attention to EXCEPT/LIMIT
+	 * TO here, because the core code will filter the statements we return
+	 * according to those lists anyway.  But it should save a few cycles to
+	 * not process excluded tables in the first place.)
+	 *
+	 * Import table data for partitions only when they are explicitly
+	 * specified in LIMIT TO clause. Otherwise ignore them and only include
+	 * the definitions of the root partitioned tables to allow access to the
+	 * complete remote data set locally in the schema imported.
+	 *
+	 * Note: because we run the connection with search_path restricted to
+	 * pg_catalog, the format_type() and pg_get_expr() outputs will always
+	 * include a schema name for types/functions in other schemas, which is
+	 * what we want.
+	 */
+	appendStringInfoString(&buf,
+						   "SELECT relname, "
+						   "  attname, "
+						   "  format_type(atttypid, atttypmod), "
+						   "  attnotnull, "
+						   "  pg_get_expr(adbin, adrelid), ");
+
+	/* Generated columns are supported since Postgres 12 */
+	if (PQserverVersion(conn) >= 120000)
+		appendStringInfoString(&buf,
+							   "  attgenerated, ");
+	else
+		appendStringInfoString(&buf,
+							   "  NULL, ");
+
+	if (import_collate)
+		appendStringInfoString(&buf,
+							   "  collname, "
+							   "  collnsp.nspname ");
+	else
+		appendStringInfoString(&buf,
+							   "  NULL, NULL ");
+
+	appendStringInfoString(&buf,
+						   "FROM pg_class c "
+						   "  JOIN pg_namespace n ON "
+						   "    relnamespace = n.oid "
+						   "  LEFT JOIN pg_attribute a ON "
+						   "    attrelid = c.oid AND attnum > 0 "
+						   "      AND NOT attisdropped "
+						   "  LEFT JOIN pg_attrdef ad ON "
+						   "    adrelid = c.oid AND adnum = attnum ");
+
+	if (import_collate)
+		appendStringInfoString(&buf,
+							   "  LEFT JOIN pg_collation coll ON "
+							   "    coll.oid = attcollation "
+							   "  LEFT JOIN pg_namespace collnsp ON "
+							   "    collnsp.oid = collnamespace ");
+
+	appendStringInfoString(&buf,
+						   "WHERE c.relkind IN ("
+						   CppAsString2(RELKIND_RELATION) ","
+						   CppAsString2(RELKIND_VIEW) ","
+						   CppAsString2(RELKIND_FOREIGN_TABLE) ","
+						   CppAsString2(RELKIND_MATVIEW) ","
+						   CppAsString2(RELKIND_PARTITIONED_TABLE) ") "
+						   "  AND n.nspname = ");
+	deparseStringLiteral(&buf, stmt->remote_schema);
+
+	/* Partitions are supported since Postgres 10 */
+	if (PQserverVersion(conn) >= 100000 &&
+		stmt->list_type != FDW_IMPORT_SCHEMA_LIMIT_TO)
+		appendStringInfoString(&buf, " AND NOT c.relispartition ");
+
+	/* Apply restrictions for LIMIT TO and EXCEPT */
+	if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO ||
+		stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
 	{
-		/* Check that the schema really exists */
-		appendStringInfoString(&buf, "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = ");
-		deparseStringLiteral(&buf, stmt->remote_schema);
+		bool		first_item = true;
 
-		res = pgfdw_exec_query(conn, buf.data, NULL);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			pgfdw_report_error(ERROR, res, conn, false, buf.data);
+		appendStringInfoString(&buf, " AND c.relname ");
+		if (stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
+			appendStringInfoString(&buf, "NOT ");
+		appendStringInfoString(&buf, "IN (");
 
-		if (PQntuples(res) != 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_SCHEMA_NOT_FOUND),
-					 errmsg("schema \"%s\" is not present on foreign server \"%s\"",
-							stmt->remote_schema, server->servername)));
-
-		PQclear(res);
-		res = NULL;
-		resetStringInfo(&buf);
-
-		/*
-		 * Fetch all table data from this schema, possibly restricted by
-		 * EXCEPT or LIMIT TO.  (We don't actually need to pay any attention
-		 * to EXCEPT/LIMIT TO here, because the core code will filter the
-		 * statements we return according to those lists anyway.  But it
-		 * should save a few cycles to not process excluded tables in the
-		 * first place.)
-		 *
-		 * Import table data for partitions only when they are explicitly
-		 * specified in LIMIT TO clause. Otherwise ignore them and only
-		 * include the definitions of the root partitioned tables to allow
-		 * access to the complete remote data set locally in the schema
-		 * imported.
-		 *
-		 * Note: because we run the connection with search_path restricted to
-		 * pg_catalog, the format_type() and pg_get_expr() outputs will always
-		 * include a schema name for types/functions in other schemas, which
-		 * is what we want.
-		 */
-		appendStringInfoString(&buf,
-							   "SELECT relname, "
-							   "  attname, "
-							   "  format_type(atttypid, atttypmod), "
-							   "  attnotnull, "
-							   "  pg_get_expr(adbin, adrelid), ");
-
-		/* Generated columns are supported since Postgres 12 */
-		if (PQserverVersion(conn) >= 120000)
-			appendStringInfoString(&buf,
-								   "  attgenerated, ");
-		else
-			appendStringInfoString(&buf,
-								   "  NULL, ");
-
-		if (import_collate)
-			appendStringInfoString(&buf,
-								   "  collname, "
-								   "  collnsp.nspname ");
-		else
-			appendStringInfoString(&buf,
-								   "  NULL, NULL ");
-
-		appendStringInfoString(&buf,
-							   "FROM pg_class c "
-							   "  JOIN pg_namespace n ON "
-							   "    relnamespace = n.oid "
-							   "  LEFT JOIN pg_attribute a ON "
-							   "    attrelid = c.oid AND attnum > 0 "
-							   "      AND NOT attisdropped "
-							   "  LEFT JOIN pg_attrdef ad ON "
-							   "    adrelid = c.oid AND adnum = attnum ");
-
-		if (import_collate)
-			appendStringInfoString(&buf,
-								   "  LEFT JOIN pg_collation coll ON "
-								   "    coll.oid = attcollation "
-								   "  LEFT JOIN pg_namespace collnsp ON "
-								   "    collnsp.oid = collnamespace ");
-
-		appendStringInfoString(&buf,
-							   "WHERE c.relkind IN ("
-							   CppAsString2(RELKIND_RELATION) ","
-							   CppAsString2(RELKIND_VIEW) ","
-							   CppAsString2(RELKIND_FOREIGN_TABLE) ","
-							   CppAsString2(RELKIND_MATVIEW) ","
-							   CppAsString2(RELKIND_PARTITIONED_TABLE) ") "
-							   "  AND n.nspname = ");
-		deparseStringLiteral(&buf, stmt->remote_schema);
-
-		/* Partitions are supported since Postgres 10 */
-		if (PQserverVersion(conn) >= 100000 &&
-			stmt->list_type != FDW_IMPORT_SCHEMA_LIMIT_TO)
-			appendStringInfoString(&buf, " AND NOT c.relispartition ");
-
-		/* Apply restrictions for LIMIT TO and EXCEPT */
-		if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO ||
-			stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
+		/* Append list of table names within IN clause */
+		foreach(lc, stmt->table_list)
 		{
-			bool		first_item = true;
+			RangeVar   *rv = (RangeVar *) lfirst(lc);
 
-			appendStringInfoString(&buf, " AND c.relname ");
-			if (stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
-				appendStringInfoString(&buf, "NOT ");
-			appendStringInfoString(&buf, "IN (");
-
-			/* Append list of table names within IN clause */
-			foreach(lc, stmt->table_list)
-			{
-				RangeVar   *rv = (RangeVar *) lfirst(lc);
-
-				if (first_item)
-					first_item = false;
-				else
-					appendStringInfoString(&buf, ", ");
-				deparseStringLiteral(&buf, rv->relname);
-			}
-			appendStringInfoChar(&buf, ')');
+			if (first_item)
+				first_item = false;
+			else
+				appendStringInfoString(&buf, ", ");
+			deparseStringLiteral(&buf, rv->relname);
 		}
+		appendStringInfoChar(&buf, ')');
+	}
 
-		/* Append ORDER BY at the end of query to ensure output ordering */
-		appendStringInfoString(&buf, " ORDER BY c.relname, a.attnum");
+	/* Append ORDER BY at the end of query to ensure output ordering */
+	appendStringInfoString(&buf, " ORDER BY c.relname, a.attnum");
 
-		/* Fetch the data */
-		res = pgfdw_exec_query(conn, buf.data, NULL);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			pgfdw_report_error(ERROR, res, conn, false, buf.data);
+	/* Fetch the data */
+	res = pgfdw_exec_query(conn, buf.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(res, conn, buf.data);
 
-		/* Process results */
-		numrows = PQntuples(res);
-		/* note: incrementation of i happens in inner loop's while() test */
-		for (i = 0; i < numrows;)
+	/* Process results */
+	numrows = PQntuples(res);
+	/* note: incrementation of i happens in inner loop's while() test */
+	for (i = 0; i < numrows;)
+	{
+		char	   *tablename = PQgetvalue(res, i, 0);
+		bool		first_item = true;
+
+		resetStringInfo(&buf);
+		appendStringInfo(&buf, "CREATE FOREIGN TABLE %s (\n",
+						 quote_identifier(tablename));
+
+		/* Scan all rows for this table */
+		do
 		{
-			char	   *tablename = PQgetvalue(res, i, 0);
-			bool		first_item = true;
+			char	   *attname;
+			char	   *typename;
+			char	   *attnotnull;
+			char	   *attgenerated;
+			char	   *attdefault;
+			char	   *collname;
+			char	   *collnamespace;
 
-			resetStringInfo(&buf);
-			appendStringInfo(&buf, "CREATE FOREIGN TABLE %s (\n",
-							 quote_identifier(tablename));
+			/* If table has no columns, we'll see nulls here */
+			if (PQgetisnull(res, i, 1))
+				continue;
 
-			/* Scan all rows for this table */
-			do
-			{
-				char	   *attname;
-				char	   *typename;
-				char	   *attnotnull;
-				char	   *attgenerated;
-				char	   *attdefault;
-				char	   *collname;
-				char	   *collnamespace;
+			attname = PQgetvalue(res, i, 1);
+			typename = PQgetvalue(res, i, 2);
+			attnotnull = PQgetvalue(res, i, 3);
+			attdefault = PQgetisnull(res, i, 4) ? NULL :
+				PQgetvalue(res, i, 4);
+			attgenerated = PQgetisnull(res, i, 5) ? NULL :
+				PQgetvalue(res, i, 5);
+			collname = PQgetisnull(res, i, 6) ? NULL :
+				PQgetvalue(res, i, 6);
+			collnamespace = PQgetisnull(res, i, 7) ? NULL :
+				PQgetvalue(res, i, 7);
 
-				/* If table has no columns, we'll see nulls here */
-				if (PQgetisnull(res, i, 1))
-					continue;
+			if (first_item)
+				first_item = false;
+			else
+				appendStringInfoString(&buf, ",\n");
 
-				attname = PQgetvalue(res, i, 1);
-				typename = PQgetvalue(res, i, 2);
-				attnotnull = PQgetvalue(res, i, 3);
-				attdefault = PQgetisnull(res, i, 4) ? (char *) NULL :
-					PQgetvalue(res, i, 4);
-				attgenerated = PQgetisnull(res, i, 5) ? (char *) NULL :
-					PQgetvalue(res, i, 5);
-				collname = PQgetisnull(res, i, 6) ? (char *) NULL :
-					PQgetvalue(res, i, 6);
-				collnamespace = PQgetisnull(res, i, 7) ? (char *) NULL :
-					PQgetvalue(res, i, 7);
-
-				if (first_item)
-					first_item = false;
-				else
-					appendStringInfoString(&buf, ",\n");
-
-				/* Print column name and type */
-				appendStringInfo(&buf, "  %s %s",
-								 quote_identifier(attname),
-								 typename);
-
-				/*
-				 * Add column_name option so that renaming the foreign table's
-				 * column doesn't break the association to the underlying
-				 * column.
-				 */
-				appendStringInfoString(&buf, " OPTIONS (column_name ");
-				deparseStringLiteral(&buf, attname);
-				appendStringInfoChar(&buf, ')');
-
-				/* Add COLLATE if needed */
-				if (import_collate && collname != NULL && collnamespace != NULL)
-					appendStringInfo(&buf, " COLLATE %s.%s",
-									 quote_identifier(collnamespace),
-									 quote_identifier(collname));
-
-				/* Add DEFAULT if needed */
-				if (import_default && attdefault != NULL &&
-					(!attgenerated || !attgenerated[0]))
-					appendStringInfo(&buf, " DEFAULT %s", attdefault);
-
-				/* Add GENERATED if needed */
-				if (import_generated && attgenerated != NULL &&
-					attgenerated[0] == ATTRIBUTE_GENERATED_STORED)
-				{
-					Assert(attdefault != NULL);
-					appendStringInfo(&buf,
-									 " GENERATED ALWAYS AS (%s) STORED",
-									 attdefault);
-				}
-
-				/* Add NOT NULL if needed */
-				if (import_not_null && attnotnull[0] == 't')
-					appendStringInfoString(&buf, " NOT NULL");
-			}
-			while (++i < numrows &&
-				   strcmp(PQgetvalue(res, i, 0), tablename) == 0);
+			/* Print column name and type */
+			appendStringInfo(&buf, "  %s %s",
+							 quote_identifier(attname),
+							 typename);
 
 			/*
-			 * Add server name and table-level options.  We specify remote
-			 * schema and table name as options (the latter to ensure that
-			 * renaming the foreign table doesn't break the association).
+			 * Add column_name option so that renaming the foreign table's
+			 * column doesn't break the association to the underlying column.
 			 */
-			appendStringInfo(&buf, "\n) SERVER %s\nOPTIONS (",
-							 quote_identifier(server->servername));
+			appendStringInfoString(&buf, " OPTIONS (column_name ");
+			deparseStringLiteral(&buf, attname);
+			appendStringInfoChar(&buf, ')');
 
-			appendStringInfoString(&buf, "schema_name ");
-			deparseStringLiteral(&buf, stmt->remote_schema);
-			appendStringInfoString(&buf, ", table_name ");
-			deparseStringLiteral(&buf, tablename);
+			/* Add COLLATE if needed */
+			if (import_collate && collname != NULL && collnamespace != NULL)
+				appendStringInfo(&buf, " COLLATE %s.%s",
+								 quote_identifier(collnamespace),
+								 quote_identifier(collname));
 
-			appendStringInfoString(&buf, ");");
+			/* Add DEFAULT if needed */
+			if (import_default && attdefault != NULL &&
+				(!attgenerated || !attgenerated[0]))
+				appendStringInfo(&buf, " DEFAULT %s", attdefault);
 
-			commands = lappend(commands, pstrdup(buf.data));
+			/* Add GENERATED if needed */
+			if (import_generated && attgenerated != NULL &&
+				attgenerated[0] == ATTRIBUTE_GENERATED_STORED)
+			{
+				Assert(attdefault != NULL);
+				appendStringInfo(&buf,
+								 " GENERATED ALWAYS AS (%s) STORED",
+								 attdefault);
+			}
+
+			/* Add NOT NULL if needed */
+			if (import_not_null && attnotnull[0] == 't')
+				appendStringInfoString(&buf, " NOT NULL");
 		}
+		while (++i < numrows &&
+			   strcmp(PQgetvalue(res, i, 0), tablename) == 0);
+
+		/*
+		 * Add server name and table-level options.  We specify remote schema
+		 * and table name as options (the latter to ensure that renaming the
+		 * foreign table doesn't break the association).
+		 */
+		appendStringInfo(&buf, "\n) SERVER %s\nOPTIONS (",
+						 quote_identifier(server->servername));
+
+		appendStringInfoString(&buf, "schema_name ");
+		deparseStringLiteral(&buf, stmt->remote_schema);
+		appendStringInfoString(&buf, ", table_name ");
+		deparseStringLiteral(&buf, tablename);
+
+		appendStringInfoString(&buf, ");");
+
+		commands = lappend(commands, pstrdup(buf.data));
 	}
-	PG_FINALLY();
-	{
-		PQclear(res);
-	}
-	PG_END_TRY();
+	PQclear(res);
 
 	ReleaseConnection(conn);
 
 	return commands;
+}
+
+/*
+ * Check if reltarget is safe enough to push down semi-join.  Reltarget is not
+ * safe, if it contains references to inner rel relids, which do not belong to
+ * outer rel.
+ */
+static bool
+semijoin_target_ok(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel)
+{
+	List	   *vars;
+	ListCell   *lc;
+	bool		ok = true;
+
+	Assert(joinrel->reltarget);
+
+	vars = pull_var_clause((Node *) joinrel->reltarget->exprs, PVC_INCLUDE_PLACEHOLDERS);
+
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (!IsA(var, Var))
+			continue;
+
+		if (bms_is_member(var->varno, innerrel->relids))
+		{
+			/*
+			 * The planner can create semi-join, which refers to inner rel
+			 * vars in its target list. However, we deparse semi-join as an
+			 * exists() subquery, so can't handle references to inner rel in
+			 * the target list.
+			 */
+			Assert(!bms_is_member(var->varno, outerrel->relids));
+			ok = false;
+			break;
+		}
+	}
+	return ok;
+}
+
+/*
+ * get_base_relids
+ *		Return the set of base relids referenced by a foreign scan rel.
+ *
+ * For an upper rel we use the all-query relids minus the outer joins;
+ * otherwise the rel's own relids minus the outer joins.  The result matches
+ * the relids that create_foreignscan_plan() ultimately uses for
+ * ForeignScan.fs_base_relids, so it is suitable for any tagging we want to
+ * store via plan-private state.
+ */
+static Relids
+get_base_relids(PlannerInfo *root, RelOptInfo *rel)
+{
+	Relids		relids;
+
+	if (rel->reloptkind == RELOPT_UPPER_REL)
+		relids = root->all_query_rels;
+	else
+		relids = rel->relids;
+
+	return bms_difference(relids, root->outer_join_rels);
+}
+
+/*
+ * get_min_base_rti
+ *		Lowest base RT index in the foreign scan rel.
+ *
+ * After setrefs.c flattens the rtable, the scan-local indexes saved in
+ * plan-private data can be translated to estate indexes by adding
+ * (ForeignScan.fs_base_relids min - this value).  Captured at plan time
+ * because create_foreignscan_plan() computes the same value internally.
+ */
+static int
+get_min_base_rti(PlannerInfo *root, RelOptInfo *rel)
+{
+	Relids		relids = get_base_relids(root, rel);
+
+	return bms_next_member(relids, -1);
+}
+
+/*
+ * get_functions_data
+ *		Build the per-RTE function metadata list saved as
+ *		FdwScanPrivateFunctions.
+ *
+ * The result list is indexed by base RT index relative to the lowest base
+ * RT index of the scan.  Each element is either NULL (for non-RTE_FUNCTION
+ * base rels in this scan) or a List of List of two Integer nodes:
+ * (funcrettype, funccollation) -- one inner list per RangeTblFunction.
+ *
+ * Only RTE_FUNCTION relids actually appearing in the foreign scan's
+ * fs_base_relids contribute; others are placeholders so that the consumer
+ * can index into the result by RTI offset.
+ */
+static List *
+get_functions_data(PlannerInfo *root, RelOptInfo *rel)
+{
+	List	   *rtfuncdata = NIL;
+	Relids		fscan_relids = get_base_relids(root, rel);
+	int			i;
+
+	for (i = 0; i < root->simple_rel_array_size; i++)
+	{
+		RangeTblEntry *rte = root->simple_rte_array[i];
+		List	   *funcdata = NIL;
+		ListCell   *lc;
+
+		if (rte == NULL || i == 0 ||
+			!bms_is_member(i, fscan_relids) ||
+			rte->rtekind != RTE_FUNCTION)
+		{
+			rtfuncdata = lappend(rtfuncdata, NULL);
+			continue;
+		}
+
+		foreach(lc, rte->functions)
+		{
+			RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+			Oid			funcrettype;
+			Oid			funccollation;
+			TupleDesc	tupdesc;
+			Oid			funcid;
+
+			get_expr_result_type(rtfunc->funcexpr, &funcrettype, &tupdesc);
+
+			/*
+			 * function_rte_pushdown_ok() already rejected any function that
+			 * doesn't return a well-defined scalar type, so this is a mere
+			 * cross-check.
+			 */
+			Assert(OidIsValid(funcrettype) && funcrettype != RECORDOID);
+
+			funccollation = exprCollation(rtfunc->funcexpr);
+
+			funcid = ((FuncExpr *) rtfunc->funcexpr)->funcid;
+
+			funcdata = lappend(funcdata,
+							   list_make3(makeInteger(funcid),
+										  makeInteger(funcrettype),
+										  makeInteger(funccollation)));
+		}
+
+		rtfuncdata = lappend(rtfuncdata, funcdata);
+	}
+
+	return rtfuncdata;
+}
+
+/*
+ * init_func_stub_fpinfo
+ *		Build a stub PgFdwRelationInfo for a FUNCTION RTE that is being
+ *		absorbed into a foreign join.
+ *
+ * A function RTE has no fdw_private of its own, but the joinrel-level cost
+ * estimator, deparser and merge_fdw_options() all read server-level options
+ * from the "outer" fpinfo unconditionally.  So the stub must carry the same
+ * server, shippable_extensions, and cost-related options as the real foreign
+ * side of the join; otherwise the pushdown path is judged against zeroed
+ * fdw_startup_cost/fdw_tuple_cost/etc. and looks artificially cheap.
+ *
+ * The stub is meaningful only for the specific (foreign, function) pairing
+ * that produced it; it must live on the joinrel's PgFdwRelationInfo, never
+ * on the function rel's fdw_private, since the same function RTE may pair
+ * with different foreign servers in sibling joinrels.
+ */
+static PgFdwRelationInfo *
+init_func_stub_fpinfo(const PgFdwRelationInfo *fpinfo_foreign,
+					  RelOptInfo *funcrel)
+{
+	PgFdwRelationInfo *stub = palloc0_object(PgFdwRelationInfo);
+
+	stub->pushdown_safe = true;
+
+	/* Connection information and options, inherited from the foreign side */
+	stub->server = fpinfo_foreign->server;
+	stub->user = fpinfo_foreign->user;
+	stub->shippable_extensions = fpinfo_foreign->shippable_extensions;
+	stub->fdw_startup_cost = fpinfo_foreign->fdw_startup_cost;
+	stub->fdw_tuple_cost = fpinfo_foreign->fdw_tuple_cost;
+	stub->use_remote_estimate = fpinfo_foreign->use_remote_estimate;
+	stub->fetch_size = fpinfo_foreign->fetch_size;
+	stub->async_capable = fpinfo_foreign->async_capable;
+
+	/* Function-side identity and estimates from the local planner. */
+	stub->relation_name = psprintf("%u", funcrel->relid);
+	stub->rows = funcrel->rows;
+	stub->width = funcrel->reltarget->width;
+	stub->retrieved_rows = funcrel->rows;
+
+	/*
+	 * The function is executed on the remote server, so these must carry its
+	 * cost the same way a foreign rel's do: what producing the rows costs the
+	 * far side, before connection setup and data transfer are added.  The
+	 * local path for the same function is our best estimate of that.
+	 */
+	stub->rel_startup_cost = funcrel->cheapest_total_path->startup_cost;
+	stub->rel_total_cost = funcrel->cheapest_total_path->total_cost;
+
+	return stub;
+}
+
+/*
+ * Check if a relation is a FUNCTION RTE that can be absorbed into a remote
+ * join.  Every function in the RTE must
+ *
+ *   - return a well-defined scalar type -- we don't ship records/composite
+ *     since the remote server cannot reconstruct a column definition list
+ *     and our deparser does not emit one;
+ *   - have a shippable expression with no mutable subnodes -- is_foreign_expr()
+ *     rejects volatile/stable functions through contain_mutable_functions(),
+ *     so the IMMUTABLE-only restriction is implicit;
+ *   - not contain SubPlans -- we'd otherwise need to ship sub-results to
+ *     the remote, which we do not implement.
+ *
+ * WITH ORDINALITY is not supported yet.
+ */
+static bool
+function_rte_pushdown_ok(PlannerInfo *root, RelOptInfo *rel,
+						 RelOptInfo *fdwrel)
+{
+	RangeTblEntry *rte;
+	ListCell   *lc;
+
+	if (rel->rtekind != RTE_FUNCTION)
+		return false;
+	rte = planner_rt_fetch(rel->relid, root);
+
+	/*
+	 * build_simple_rel() copies rtekind straight from the RTE, so for a base
+	 * rel rel->rtekind always matches the RTE's; the check above is therefore
+	 * sufficient.
+	 */
+	Assert(rte->rtekind == RTE_FUNCTION);
+
+	if (rte->funcordinality)
+		return false;
+
+	/*
+	 * Reject up-front any function RTE that lateral-references another
+	 * relation: foreign-join push-down would need to parameterise the remote
+	 * query per outer row, which we don't support, and even considering the
+	 * path is expensive on the planner side.  The surrounding lateral_relids
+	 * check in postgresGetForeignJoinPaths() would normally bail out for the
+	 * joinrel, but doing the check here avoids walking the function
+	 * expression entirely.
+	 *
+	 * Note this rejects only lateral references to another relation at the
+	 * same query level.  A function argument referencing an outer query level
+	 * (e.g. f(outer.col) inside a subquery) is a different case: it becomes a
+	 * PARAM_EXEC Param, the function rel's lateral_relids is empty, and
+	 * foreign_expr_walker() intentionally treats PARAM_EXEC as shippable. The
+	 * remote query then carries a parameter placeholder, and postgres_fdw's
+	 * ordinary parameter machinery re-sends it on each rescan -- i.e. it
+	 * works as a normal parameterized foreign scan, which is fine.
+	 */
+	if (!bms_is_empty(rel->lateral_relids))
+		return false;
+
+	Assert(list_length(rte->functions) >= 1);
+
+	foreach(lc, rte->functions)
+	{
+		RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+		TypeFuncClass functypclass;
+		Oid			funcrettype;
+		TupleDesc	tupdesc;
+
+		/* Refuse to deal with strange funcexprs */
+		if (!IsA(rtfunc->funcexpr, FuncExpr))
+			return false;
+
+		if (!OidIsValid(((FuncExpr *) rtfunc->funcexpr)->funcid))
+			return false;
+
+		functypclass = get_expr_result_type(rtfunc->funcexpr,
+											&funcrettype, &tupdesc);
+		if (functypclass != TYPEFUNC_SCALAR)
+			return false;
+		if (!OidIsValid(funcrettype) ||
+			funcrettype == RECORDOID ||
+			funcrettype == VOIDOID)
+			return false;
+
+		if (contain_subplans(rtfunc->funcexpr))
+			return false;
+		if (!is_foreign_expr(root, fdwrel, fdwrel->fdw_private, (Expr *) rtfunc->funcexpr))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -5741,23 +7105,70 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	List	   *joinclauses;
 
 	/*
-	 * We support pushing down INNER, LEFT, RIGHT and FULL OUTER joins.
-	 * Constructing queries representing SEMI and ANTI joins is hard, hence
-	 * not considered right now.
+	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER and SEMI joins.
+	 * Constructing queries representing ANTI joins is hard, hence not
+	 * considered right now.
 	 */
 	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
-		jointype != JOIN_RIGHT && jointype != JOIN_FULL)
+		jointype != JOIN_RIGHT && jointype != JOIN_FULL &&
+		jointype != JOIN_SEMI)
 		return false;
 
 	/*
-	 * If either of the joining relations is marked as unsafe to pushdown, the
-	 * join can not be pushed down.
+	 * We can't push down semi-join if its reltarget is not safe
+	 */
+	if ((jointype == JOIN_SEMI) && !semijoin_target_ok(root, joinrel, outerrel, innerrel))
+		return false;
+
+	/*
+	 * Detect mixed (foreign x function-RTE) cases.  Only INNER joins are
+	 * supported initially.  We dispatch on rtekind here so that the same
+	 * function RTE can be absorbed into joins on multiple foreign servers
+	 * (each call gets its own stub fpinfo and rechecks shippability for the
+	 * specific server).
+	 *
+	 * A function rel has no fdw_private of its own, so when one side is a
+	 * function RTE we replace its NULL fpinfo with a stub, and the rest of
+	 * this function and the cost estimator can then treat both sides
+	 * uniformly.  We hand the stub to the joinrel's deparser via the same
+	 * path the foreign side uses, but we never permanently attach it to the
+	 * function rel's fdw_private (different joinrels may pair the same
+	 * function RTE with different foreign servers).
 	 */
 	fpinfo = (PgFdwRelationInfo *) joinrel->fdw_private;
 	fpinfo_o = (PgFdwRelationInfo *) outerrel->fdw_private;
 	fpinfo_i = (PgFdwRelationInfo *) innerrel->fdw_private;
-	if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
-		!fpinfo_i || !fpinfo_i->pushdown_safe)
+
+	if (jointype == JOIN_INNER && innerrel->rtekind == RTE_FUNCTION &&
+		fpinfo_o && fpinfo_o->pushdown_safe &&
+		function_rte_pushdown_ok(root, innerrel, outerrel))
+	{
+		fpinfo_i = init_func_stub_fpinfo(fpinfo_o, innerrel);
+
+		/*
+		 * Classify the function rel's own baserestrictinfo now, so that the
+		 * local_conds check below can bail out if any of it is unshippable.
+		 * We classify against the stub, not the joinrel's fpinfo, because the
+		 * latter's server/shippable_extensions aren't populated until
+		 * merge_fdw_options() runs further down.
+		 */
+		classifyConditions(root, innerrel, fpinfo_i, innerrel->baserestrictinfo,
+						   &fpinfo_i->remote_conds, &fpinfo_i->local_conds);
+		fpinfo->inner_func_fpinfo = fpinfo_i;
+	}
+	else if (jointype == JOIN_INNER && outerrel->rtekind == RTE_FUNCTION &&
+			 fpinfo_i && fpinfo_i->pushdown_safe &&
+			 function_rte_pushdown_ok(root, outerrel, innerrel))
+	{
+		fpinfo_o = init_func_stub_fpinfo(fpinfo_i, outerrel);
+
+		/* See the comment in the branch above. */
+		classifyConditions(root, outerrel, fpinfo_o, outerrel->baserestrictinfo,
+						   &fpinfo_o->remote_conds, &fpinfo_o->local_conds);
+		fpinfo->outer_func_fpinfo = fpinfo_o;
+	}
+	else if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
+			 !fpinfo_i || !fpinfo_i->pushdown_safe)
 		return false;
 
 	/*
@@ -5796,7 +7207,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	foreach(lc, extra->restrictlist)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-		bool		is_remote_clause = is_foreign_expr(root, joinrel,
+		bool		is_remote_clause = is_foreign_expr(root, joinrel, fpinfo,
 													   rinfo->clause);
 
 		if (IS_OUTER_JOIN(jointype) &&
@@ -5858,6 +7269,8 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	Assert(bms_is_subset(fpinfo_i->lower_subquery_rels, innerrel->relids));
 	fpinfo->lower_subquery_rels = bms_union(fpinfo_o->lower_subquery_rels,
 											fpinfo_i->lower_subquery_rels);
+	fpinfo->hidden_subquery_rels = bms_union(fpinfo_o->hidden_subquery_rels,
+											 fpinfo_i->hidden_subquery_rels);
 
 	/*
 	 * Pull the other remote conditions from the joining relations into join
@@ -5870,6 +7283,12 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	 * after the join is evaluated. The clauses from inner side are added to
 	 * the joinclauses, since they need to be evaluated while constructing the
 	 * join.
+	 *
+	 * For SEMI-JOIN clauses from inner relation can not be added to
+	 * remote_conds, but should be treated as join clauses (as they are
+	 * deparsed to EXISTS subquery, where inner relation can be referred). A
+	 * list of relation ids, which can't be referred to from higher levels, is
+	 * preserved as a hidden_subquery_rels list.
 	 *
 	 * For a FULL OUTER JOIN, the other clauses from either relation can not
 	 * be added to the joinclauses or remote_conds, since each relation acts
@@ -5888,17 +7307,43 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			break;
 
 		case JOIN_LEFT:
-			fpinfo->joinclauses = list_concat(fpinfo->joinclauses,
-											  fpinfo_i->remote_conds);
-			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
-											   fpinfo_o->remote_conds);
+
+			/*
+			 * When semi-join is involved in the inner or outer part of the
+			 * left join, it's deparsed as a subquery, and we can't refer to
+			 * its vars on the upper level.
+			 */
+			if (bms_is_empty(fpinfo_i->hidden_subquery_rels))
+				fpinfo->joinclauses = list_concat(fpinfo->joinclauses,
+												  fpinfo_i->remote_conds);
+			if (bms_is_empty(fpinfo_o->hidden_subquery_rels))
+				fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+												   fpinfo_o->remote_conds);
 			break;
 
 		case JOIN_RIGHT:
+
+			/*
+			 * When semi-join is involved in the inner or outer part of the
+			 * right join, it's deparsed as a subquery, and we can't refer to
+			 * its vars on the upper level.
+			 */
+			if (bms_is_empty(fpinfo_o->hidden_subquery_rels))
+				fpinfo->joinclauses = list_concat(fpinfo->joinclauses,
+												  fpinfo_o->remote_conds);
+			if (bms_is_empty(fpinfo_i->hidden_subquery_rels))
+				fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+												   fpinfo_i->remote_conds);
+			break;
+
+		case JOIN_SEMI:
 			fpinfo->joinclauses = list_concat(fpinfo->joinclauses,
-											  fpinfo_o->remote_conds);
-			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
-											   fpinfo_i->remote_conds);
+											  fpinfo_i->remote_conds);
+			fpinfo->joinclauses = list_concat(fpinfo->joinclauses,
+											  fpinfo->remote_conds);
+			fpinfo->remote_conds = list_copy(fpinfo_o->remote_conds);
+			fpinfo->hidden_subquery_rels = bms_union(fpinfo->hidden_subquery_rels,
+													 innerrel->relids);
 			break;
 
 		case JOIN_FULL:
@@ -5942,6 +7387,24 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		Assert(!fpinfo->joinclauses);
 		fpinfo->joinclauses = fpinfo->remote_conds;
 		fpinfo->remote_conds = NIL;
+	}
+	else if (jointype == JOIN_LEFT || jointype == JOIN_RIGHT || jointype == JOIN_FULL)
+	{
+		/*
+		 * Conditions, generated from semi-joins, should be evaluated before
+		 * LEFT/RIGHT/FULL join.
+		 */
+		if (!bms_is_empty(fpinfo_o->hidden_subquery_rels))
+		{
+			fpinfo->make_outerrel_subquery = true;
+			fpinfo->lower_subquery_rels = bms_add_members(fpinfo->lower_subquery_rels, outerrel->relids);
+		}
+
+		if (!bms_is_empty(fpinfo_i->hidden_subquery_rels))
+		{
+			fpinfo->make_innerrel_subquery = true;
+			fpinfo->lower_subquery_rels = bms_add_members(fpinfo->lower_subquery_rels, innerrel->relids);
+		}
 	}
 
 	/* Mark that this join can be pushed down safely */
@@ -6054,13 +7517,15 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 	{
 		double		rows;
 		int			width;
+		int			disabled_nodes;
 		Cost		startup_cost;
 		Cost		total_cost;
 		List	   *useful_pathkeys = lfirst(lc);
 		Path	   *sorted_epq_path;
 
 		estimate_path_cost_size(root, rel, NIL, useful_pathkeys, NULL,
-								&rows, &width, &startup_cost, &total_cost);
+								&rows, &width, &disabled_nodes,
+								&startup_cost, &total_cost);
 
 		/*
 		 * The EPQ path must be at least as well sorted as the path itself, in
@@ -6082,6 +7547,7 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 					 create_foreignscan_path(root, rel,
 											 NULL,
 											 rows,
+											 disabled_nodes,
 											 startup_cost,
 											 total_cost,
 											 useful_pathkeys,
@@ -6095,6 +7561,7 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 					 create_foreign_join_path(root, rel,
 											  NULL,
 											  rows,
+											  disabled_nodes,
 											  startup_cost,
 											  total_cost,
 											  useful_pathkeys,
@@ -6242,6 +7709,7 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	ForeignPath *joinpath;
 	double		rows;
 	int			width;
+	int			disabled_nodes;
 	Cost		startup_cost;
 	Cost		total_cost;
 	Path	   *epq_path;		/* Path to create plan to be executed when
@@ -6267,7 +7735,7 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	 * if found safe. Once we know that this join can be pushed down, we fill
 	 * the entry.
 	 */
-	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
+	fpinfo = palloc0_object(PgFdwRelationInfo);
 	fpinfo->pushdown_safe = false;
 	joinrel->fdw_private = fpinfo;
 	/* attrs_used is only for base relations. */
@@ -6331,12 +7799,14 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 
 	/* Estimate costs for bare join relation */
 	estimate_path_cost_size(root, joinrel, NIL, NIL, NULL,
-							&rows, &width, &startup_cost, &total_cost);
+							&rows, &width, &disabled_nodes,
+							&startup_cost, &total_cost);
 	/* Now update this information in the joinrel */
 	joinrel->rows = rows;
 	joinrel->reltarget->width = width;
 	fpinfo->rows = rows;
 	fpinfo->width = width;
+	fpinfo->disabled_nodes = disabled_nodes;
 	fpinfo->startup_cost = startup_cost;
 	fpinfo->total_cost = total_cost;
 
@@ -6348,6 +7818,7 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 										joinrel,
 										NULL,	/* default pathtarget */
 										rows,
+										disabled_nodes,
 										startup_cost,
 										total_cost,
 										NIL,	/* no pathkeys */
@@ -6434,7 +7905,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 			 * If any GROUP BY expression is not shippable, then we cannot
 			 * push down aggregation to the foreign server.
 			 */
-			if (!is_foreign_expr(root, grouped_rel, expr))
+			if (!is_foreign_expr(root, grouped_rel, fpinfo, expr))
 				return false;
 
 			/*
@@ -6462,7 +7933,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 			 * Non-grouping expression we need to compute.  Can we ship it
 			 * as-is to the foreign server?
 			 */
-			if (is_foreign_expr(root, grouped_rel, expr) &&
+			if (is_foreign_expr(root, grouped_rel, fpinfo, expr) &&
 				!is_foreign_param(root, grouped_rel, expr))
 			{
 				/* Yes, so add to tlist as-is; OK to suppress duplicates */
@@ -6482,7 +7953,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 				 * don't have to check is_foreign_param, since that certainly
 				 * won't return true for any such expression.)
 				 */
-				if (!is_foreign_expr(root, grouped_rel, (Expr *) aggvars))
+				if (!is_foreign_expr(root, grouped_rel, fpinfo, (Expr *) aggvars))
 					return false;
 
 				/*
@@ -6534,7 +8005,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 									  grouped_rel->relids,
 									  NULL,
 									  NULL);
-			if (is_foreign_expr(root, grouped_rel, expr))
+			if (is_foreign_expr(root, grouped_rel, fpinfo, expr))
 				fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
 			else
 				fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
@@ -6571,7 +8042,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 			 */
 			if (IsA(expr, Aggref))
 			{
-				if (!is_foreign_expr(root, grouped_rel, expr))
+				if (!is_foreign_expr(root, grouped_rel, fpinfo, expr))
 					return false;
 
 				tlist = add_to_flat_tlist(tlist, list_make1(expr));
@@ -6633,7 +8104,7 @@ postgresGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		output_rel->fdw_private)
 		return;
 
-	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
+	fpinfo = palloc0_object(PgFdwRelationInfo);
 	fpinfo->pushdown_safe = false;
 	fpinfo->stage = stage;
 	output_rel->fdw_private = fpinfo;
@@ -6675,6 +8146,7 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	ForeignPath *grouppath;
 	double		rows;
 	int			width;
+	int			disabled_nodes;
 	Cost		startup_cost;
 	Cost		total_cost;
 
@@ -6725,11 +8197,13 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 
 	/* Estimate the cost of push down */
 	estimate_path_cost_size(root, grouped_rel, NIL, NIL, NULL,
-							&rows, &width, &startup_cost, &total_cost);
+							&rows, &width, &disabled_nodes,
+							&startup_cost, &total_cost);
 
 	/* Now update this information in the fpinfo */
 	fpinfo->rows = rows;
 	fpinfo->width = width;
+	fpinfo->disabled_nodes = disabled_nodes;
 	fpinfo->startup_cost = startup_cost;
 	fpinfo->total_cost = total_cost;
 
@@ -6738,6 +8212,7 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 										  grouped_rel,
 										  grouped_rel->reltarget,
 										  rows,
+										  disabled_nodes,
 										  startup_cost,
 										  total_cost,
 										  NIL,	/* no pathkeys */
@@ -6766,6 +8241,7 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	PgFdwPathExtraData *fpextra;
 	double		rows;
 	int			width;
+	int			disabled_nodes;
 	Cost		startup_cost;
 	Cost		total_cost;
 	List	   *fdw_private;
@@ -6853,13 +8329,14 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	fpinfo->pushdown_safe = true;
 
 	/* Construct PgFdwPathExtraData */
-	fpextra = (PgFdwPathExtraData *) palloc0(sizeof(PgFdwPathExtraData));
+	fpextra = palloc0_object(PgFdwPathExtraData);
 	fpextra->target = root->upper_targets[UPPERREL_ORDERED];
 	fpextra->has_final_sort = true;
 
 	/* Estimate the costs of performing the final sort remotely */
 	estimate_path_cost_size(root, input_rel, NIL, root->sort_pathkeys, fpextra,
-							&rows, &width, &startup_cost, &total_cost);
+							&rows, &width, &disabled_nodes,
+							&startup_cost, &total_cost);
 
 	/*
 	 * Build the fdw_private list that will be used by postgresGetForeignPlan.
@@ -6872,6 +8349,7 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 											 input_rel,
 											 root->upper_targets[UPPERREL_ORDERED],
 											 rows,
+											 disabled_nodes,
 											 startup_cost,
 											 total_cost,
 											 root->sort_pathkeys,
@@ -6905,6 +8383,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		save_use_remote_estimate = false;
 	double		rows;
 	int			width;
+	int			disabled_nodes;
 	Cost		startup_cost;
 	Cost		total_cost;
 	List	   *fdw_private;
@@ -6989,6 +8468,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 													   path->parent,
 													   path->pathtarget,
 													   path->rows,
+													   path->disabled_nodes,
 													   path->startup_cost,
 													   path->total_cost,
 													   path->pathkeys,
@@ -7058,18 +8538,32 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 
 	/*
+	 * If the query has FETCH FIRST .. WITH TIES, 1) it must have ORDER BY as
+	 * well, which is used to determine which additional rows tie for the last
+	 * place in the result set, and 2) ORDER BY must already have been
+	 * determined to be safe to push down before we get here.  So in that case
+	 * the FETCH clause is safe to push down with ORDER BY if the remote
+	 * server is v13 or later, but if not, the remote query will fail entirely
+	 * for lack of support for it.  Since we do not currently have a way to do
+	 * a remote-version check (without accessing the remote server), disable
+	 * pushing the FETCH clause for now.
+	 */
+	if (parse->limitOption == LIMIT_OPTION_WITH_TIES)
+		return;
+
+	/*
 	 * Also, the LIMIT/OFFSET cannot be pushed down, if their expressions are
 	 * not safe to remote.
 	 */
-	if (!is_foreign_expr(root, input_rel, (Expr *) parse->limitOffset) ||
-		!is_foreign_expr(root, input_rel, (Expr *) parse->limitCount))
+	if (!is_foreign_expr(root, input_rel, ifpinfo, (Expr *) parse->limitOffset) ||
+		!is_foreign_expr(root, input_rel, ifpinfo, (Expr *) parse->limitCount))
 		return;
 
 	/* Safe to push down */
 	fpinfo->pushdown_safe = true;
 
 	/* Construct PgFdwPathExtraData */
-	fpextra = (PgFdwPathExtraData *) palloc0(sizeof(PgFdwPathExtraData));
+	fpextra = palloc0_object(PgFdwPathExtraData);
 	fpextra->target = root->upper_targets[UPPERREL_FINAL];
 	fpextra->has_final_sort = has_final_sort;
 	fpextra->has_limit = extra->limit_needed;
@@ -7092,7 +8586,8 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		ifpinfo->use_remote_estimate = false;
 	}
 	estimate_path_cost_size(root, input_rel, NIL, pathkeys, fpextra,
-							&rows, &width, &startup_cost, &total_cost);
+							&rows, &width, &disabled_nodes,
+							&startup_cost, &total_cost);
 	if (!fpextra->has_final_sort)
 		ifpinfo->use_remote_estimate = save_use_remote_estimate;
 
@@ -7111,6 +8606,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 										   input_rel,
 										   root->upper_targets[UPPERREL_FINAL],
 										   rows,
+										   disabled_nodes,
 										   startup_cost,
 										   total_cost,
 										   pathkeys,
@@ -7187,14 +8683,16 @@ postgresForeignAsyncConfigureWait(AsyncRequest *areq)
 	{
 		/*
 		 * This is the case when the in-process request was made by another
-		 * Append.  Note that it might be useless to process the request,
-		 * because the query might not need tuples from that Append anymore.
-		 * If there are any child subplans of the same parent that are ready
-		 * for new requests, skip the given request.  Likewise, if there are
-		 * any configured events other than the postmaster death event, skip
-		 * it.  Otherwise, process the in-process request, then begin a fetch
-		 * to configure the event below, because we might otherwise end up
-		 * with no configured events other than the postmaster death event.
+		 * Append.  Note that it might be useless to process the request made
+		 * by that Append, because the query might not need tuples from that
+		 * Append anymore; so we avoid processing it to begin a fetch for the
+		 * given request if possible.  If there are any child subplans of the
+		 * same parent that are ready for new requests, skip the given
+		 * request.  Likewise, if there are any configured events other than
+		 * the postmaster death event, skip it.  Otherwise, process the
+		 * in-process request, then begin a fetch to configure the event
+		 * below, because we might otherwise end up with no configured events
+		 * other than the postmaster death event.
 		 */
 		if (!bms_is_empty(requestor->as_needrequest))
 			return;
@@ -7252,7 +8750,7 @@ postgresForeignAsyncNotify(AsyncRequest *areq)
 
 	/* On error, report the original query, not the FETCH. */
 	if (!PQconsumeInput(fsstate->conn))
-		pgfdw_report_error(ERROR, NULL, fsstate->conn, false, fsstate->query);
+		pgfdw_report_error(NULL, fsstate->conn, fsstate->query);
 
 	fetch_more_data(node);
 
@@ -7351,7 +8849,7 @@ fetch_more_data_begin(AsyncRequest *areq)
 			 fsstate->fetch_size, fsstate->cursor_number);
 
 	if (!PQsendQuery(fsstate->conn, sql))
-		pgfdw_report_error(ERROR, NULL, fsstate->conn, false, fsstate->query);
+		pgfdw_report_error(NULL, fsstate->conn, fsstate->query);
 
 	/* Remember that the request is in process */
 	fsstate->conn_state->pendingAreq = areq;
@@ -7468,8 +8966,8 @@ make_tuple_from_result_row(PGresult *res,
 		tupdesc = fsstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	}
 
-	values = (Datum *) palloc0(tupdesc->natts * sizeof(Datum));
-	nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
+	values = palloc0_array(Datum, tupdesc->natts);
+	nulls = palloc_array(bool, tupdesc->natts);
 	/* Initialize to nulls for any columns not present in result */
 	memset(nulls, true, tupdesc->natts * sizeof(bool));
 
@@ -7480,7 +8978,7 @@ make_tuple_from_result_row(PGresult *res,
 	errpos.rel = rel;
 	errpos.fsstate = fsstate;
 	errcallback.callback = conversion_error_callback;
-	errcallback.arg = (void *) &errpos;
+	errcallback.arg = &errpos;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
@@ -7491,7 +8989,7 @@ make_tuple_from_result_row(PGresult *res,
 	foreach(lc, retrieved_attrs)
 	{
 		int			i = lfirst_int(lc);
-		char	   *valstr;
+		const char *valstr;
 
 		/* fetch next column's textual value */
 		if (PQgetisnull(res, row, j))
@@ -7690,19 +9188,21 @@ conversion_error_callback(void *arg)
 EquivalenceMember *
 find_em_for_rel(PlannerInfo *root, EquivalenceClass *ec, RelOptInfo *rel)
 {
-	ListCell   *lc;
+	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) rel->fdw_private;
+	EquivalenceMemberIterator it;
+	EquivalenceMember *em;
 
-	foreach(lc, ec->ec_members)
+	setup_eclass_member_iterator(&it, ec, rel->relids);
+	while ((em = eclass_member_iterator_next(&it)) != NULL)
 	{
-		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
-
 		/*
 		 * Note we require !bms_is_empty, else we'd accept constant
 		 * expressions which are not suitable for the purpose.
 		 */
 		if (bms_is_subset(em->em_relids, rel->relids) &&
 			!bms_is_empty(em->em_relids) &&
-			is_foreign_expr(root, rel, em->em_expr))
+			bms_is_empty(bms_intersect(em->em_relids, fpinfo->hidden_subquery_rels)) &&
+			is_foreign_expr(root, rel, fpinfo, em->em_expr))
 			return em;
 	}
 
@@ -7724,6 +9224,7 @@ EquivalenceMember *
 find_em_for_rel_target(PlannerInfo *root, EquivalenceClass *ec,
 					   RelOptInfo *rel)
 {
+	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) rel->fdw_private;
 	PathTarget *target = rel->reltarget;
 	ListCell   *lc1;
 	int			i;
@@ -7748,7 +9249,10 @@ find_em_for_rel_target(PlannerInfo *root, EquivalenceClass *ec,
 		while (expr && IsA(expr, RelabelType))
 			expr = ((RelabelType *) expr)->arg;
 
-		/* Locate an EquivalenceClass member matching this expr, if any */
+		/*
+		 * Locate an EquivalenceClass member matching this expr, if any.
+		 * Ignore child members.
+		 */
 		foreach(lc2, ec->ec_members)
 		{
 			EquivalenceMember *em = (EquivalenceMember *) lfirst(lc2);
@@ -7758,9 +9262,8 @@ find_em_for_rel_target(PlannerInfo *root, EquivalenceClass *ec,
 			if (em->em_is_const)
 				continue;
 
-			/* Ignore child members */
-			if (em->em_is_child)
-				continue;
+			/* Child members should not exist in ec_members */
+			Assert(!em->em_is_child);
 
 			/* Match if same expression (after stripping relabel) */
 			em_expr = em->em_expr;
@@ -7771,7 +9274,7 @@ find_em_for_rel_target(PlannerInfo *root, EquivalenceClass *ec,
 				continue;
 
 			/* Check that expression (including relabels!) is shippable */
-			if (is_foreign_expr(root, rel, em->em_expr))
+			if (is_foreign_expr(root, rel, fpinfo, em->em_expr))
 				return em;
 		}
 

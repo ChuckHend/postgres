@@ -13,7 +13,7 @@
  * "delta" type.  Delta rows will be deleted by this worker and their values
  * aggregated into the total.
  *
- * Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/worker_spi/worker_spi.c
@@ -26,29 +26,26 @@
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
-#include "storage/ipc.h"
 #include "storage/latch.h"
-#include "storage/lwlock.h"
-#include "storage/proc.h"
-#include "storage/shmem.h"
 
 /* these headers are used by this particular worker's code */
 #include "access/xact.h"
-#include "commands/dbcommands.h"
+#include "catalog/pg_database.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "pgstat.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
-#include "tcop/utility.h"
+#include "utils/wait_event.h"
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(worker_spi_launch);
 
-PGDLLEXPORT void worker_spi_main(Datum main_arg) pg_attribute_noreturn();
+pg_noreturn PGDLLEXPORT void worker_spi_main(Datum main_arg);
 
 /* GUC variables */
 static int	worker_spi_naptime = 10;
@@ -144,9 +141,9 @@ worker_spi_main(Datum main_arg)
 	Oid			dboid;
 	Oid			roleoid;
 	char	   *p;
-	bits32		flags = 0;
+	uint32		flags = 0;
 
-	table = palloc(sizeof(worktable));
+	table = palloc_object(worktable);
 	sprintf(name, "schema%d", index);
 	table->schema = pstrdup(name);
 	table->name = pstrdup("counted");
@@ -157,7 +154,7 @@ worker_spi_main(Datum main_arg)
 	p += sizeof(Oid);
 	memcpy(&roleoid, p, sizeof(Oid));
 	p += sizeof(Oid);
-	memcpy(&flags, p, sizeof(bits32));
+	memcpy(&flags, p, sizeof(uint32));
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -375,7 +372,7 @@ _PG_init(void)
 	/*
 	 * Now fill in worker-specific data, and do the actual registrations.
 	 *
-	 * bgw_extra can optionally include a dabatase OID, a role OID and a set
+	 * bgw_extra can optionally include a database OID, a role OID and a set
 	 * of flags.  This is left empty here to fallback to the related GUCs at
 	 * startup (0 for the bgworker flags).
 	 */
@@ -403,15 +400,20 @@ worker_spi_launch(PG_FUNCTION_ARGS)
 	BgwHandleStatus status;
 	pid_t		pid;
 	char	   *p;
-	bits32		flags = 0;
+	uint32		flags = 0;
 	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(3);
 	Size		ndim;
 	int			nelems;
 	Datum	   *datum_flags;
+	bool		interruptible = PG_GETARG_BOOL(4);
 
 	memset(&worker, 0, sizeof(worker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
+
+	if (interruptible)
+		worker.bgw_flags |= BGWORKER_INTERRUPTIBLE;
+
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	sprintf(worker.bgw_library_name, "worker_spi");
@@ -443,6 +445,8 @@ worker_spi_launch(PG_FUNCTION_ARGS)
 
 		if (strcmp(optname, "ALLOWCONN") == 0)
 			flags |= BGWORKER_BYPASS_ALLOWCONN;
+		else if (strcmp(optname, "ROLELOGINCHECK") == 0)
+			flags |= BGWORKER_BYPASS_ROLELOGINCHECK;
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -468,7 +472,7 @@ worker_spi_launch(PG_FUNCTION_ARGS)
 	p += sizeof(Oid);
 	memcpy(p, &roleoid, sizeof(Oid));
 	p += sizeof(Oid);
-	memcpy(p, &flags, sizeof(bits32));
+	memcpy(p, &flags, sizeof(uint32));
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 		PG_RETURN_NULL();

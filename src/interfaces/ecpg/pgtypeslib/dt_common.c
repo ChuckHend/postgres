@@ -528,7 +528,8 @@ datebsearch(const char *key, const datetkn *base, unsigned int nel)
 	return NULL;
 }
 
-/* DecodeUnits()
+/*
+ * DecodeUnits()
  * Decode text string using lookup table.
  * This routine supports time interval decoding.
  */
@@ -626,7 +627,8 @@ j2date(int jd, int *year, int *month, int *day)
 	*month = (quad + 10) % 12 + 1;
 }								/* j2date() */
 
-/* DecodeSpecial()
+/*
+ * DecodeSpecial()
  * Decode text string using lookup table.
  * Implement a cache lookup since it is likely that dates
  *	will be related in format.
@@ -662,7 +664,8 @@ DecodeSpecial(int field, char *lowtoken, int *val)
 	return type;
 }								/* DecodeSpecial() */
 
-/* EncodeDateOnly()
+/*
+ * EncodeDateOnly()
  * Encode date as local time.
  */
 void
@@ -731,7 +734,8 @@ TrimTrailingZeros(char *str)
 	}
 }
 
-/* EncodeDateTime()
+/*
+ * EncodeDateTime()
  * Encode date and time interpreted as local time.
  *
  * tm and fsec are the value to encode, print_tz determines whether to include
@@ -949,9 +953,10 @@ int
 GetEpochTime(struct tm *tm)
 {
 	struct tm  *t0;
+	struct tm	tmbuf;
 	time_t		epoch = 0;
 
-	t0 = gmtime(&epoch);
+	t0 = gmtime_r(&epoch, &tmbuf);
 
 	if (t0)
 	{
@@ -973,12 +978,13 @@ abstime2tm(AbsoluteTime _time, int *tzp, struct tm *tm, char **tzn)
 {
 	time_t		time = (time_t) _time;
 	struct tm  *tx;
+	struct tm	tmbuf;
 
 	errno = 0;
 	if (tzp != NULL)
-		tx = localtime((time_t *) &time);
+		tx = localtime_r(&time, &tmbuf);
 	else
-		tx = gmtime((time_t *) &time);
+		tx = gmtime_r(&time, &tmbuf);
 
 	if (!tx)
 	{
@@ -1078,7 +1084,8 @@ dt2time(double jd, int *hour, int *min, int *sec, fsec_t *fsec)
 
 
 
-/* DecodeNumberField()
+/*
+ * DecodeNumberField()
  * Interpret numeric string as a concatenated date or time field.
  * Use the context of previously decoded fields to help with
  * the interpretation.
@@ -1190,7 +1197,8 @@ DecodeNumberField(int len, char *str, int fmask,
 }								/* DecodeNumberField() */
 
 
-/* DecodeNumber()
+/*
+ * DecodeNumber()
  * Interpret plain numeric field as a date value in context.
  */
 static int
@@ -1298,7 +1306,8 @@ DecodeNumber(int flen, char *str, int fmask,
 	return 0;
 }								/* DecodeNumber() */
 
-/* DecodeDate()
+/*
+ * DecodeDate()
  * Decode date string which includes delimiters.
  * Insist on a complete set of fields.
  */
@@ -1426,7 +1435,8 @@ DecodeDate(char *str, int fmask, int *tmask, struct tm *tm, bool EuroDates)
 }								/* DecodeDate() */
 
 
-/* DecodeTime()
+/*
+ * DecodeTime()
  * Decode time string which includes delimiters.
  * Only check the lower limit on hours, since this same code
  *	can be used to represent time spans.
@@ -1490,7 +1500,8 @@ DecodeTime(char *str, int *tmask, struct tm *tm, fsec_t *fsec)
 	return 0;
 }								/* DecodeTime() */
 
-/* DecodeTimezone()
+/*
+ * DecodeTimezone()
  * Interpret string as a numeric timezone.
  *
  * Note: we allow timezone offsets up to 13:59.  There are places that
@@ -1535,7 +1546,8 @@ DecodeTimezone(char *str, int *tzp)
 }								/* DecodeTimezone() */
 
 
-/* DecodePosixTimezone()
+/*
+ * DecodePosixTimezone()
  * Interpret string as a POSIX-compatible timezone:
  *	PST-hh:mm
  *	PST+h
@@ -1576,7 +1588,8 @@ DecodePosixTimezone(char *str, int *tzp)
 	return 0;
 }								/* DecodePosixTimezone() */
 
-/* ParseDateTime()
+/*
+ * ParseDateTime()
  * Break string into tokens based on a date/time context.
  * Several field types are assigned:
  *	DTK_NUMBER - digits and (possibly) a decimal point
@@ -1756,7 +1769,8 @@ ParseDateTime(char *timestr, char *lowstr,
 }								/* ParseDateTime() */
 
 
-/* DecodeDateTime()
+/*
+ * DecodeDateTime()
  * Interpret previously parsed fields for general date and time.
  * Return 0 if full date, 1 if only time, and -1 if problems.
  *		External format(s):
@@ -2325,10 +2339,10 @@ DecodeDateTime(char **field, int *ftype, int nf,
 			return ((fmask & DTK_TIME_M) == DTK_TIME_M) ? 1 : -1;
 
 		/*
-		 * check for valid day of month, now that we know for sure the month
-		 * and year...
+		 * check for valid day of month and month, now that we know for sure
+		 * the month and year...
 		 */
-		if (tm->tm_mday < 1 || tm->tm_mday > day_tab[isleap(tm->tm_year)][tm->tm_mon - 1])
+		if (tm->tm_mon < 1 || tm->tm_mday < 1 || tm->tm_mday > day_tab[isleap(tm->tm_year)][tm->tm_mon - 1])
 			return -1;
 
 		/*
@@ -2343,10 +2357,12 @@ DecodeDateTime(char **field, int *ftype, int nf,
 	return 0;
 }								/* DecodeDateTime() */
 
-/* Function works as follows:
+/*
+ * Function works as follows:
  *
  *
- * */
+ *
+ */
 
 static char *
 find_end_token(char *str, char *fmt)
@@ -2659,6 +2675,8 @@ PGTYPEStimestamp_defmt_scan(char **str, char *fmt, timestamp * d,
 				 */
 				pfmt++;
 				tmp = pgtypes_alloc(strlen("%m/%d/%y") + strlen(pstr) + 1);
+				if (!tmp)
+					return 1;
 				strcpy(tmp, "%m/%d/%y");
 				strcat(tmp, pfmt);
 				err = PGTYPEStimestamp_defmt_scan(&pstr, tmp, d, year, month, day, hour, minute, second, tz);
@@ -2784,6 +2802,8 @@ PGTYPEStimestamp_defmt_scan(char **str, char *fmt, timestamp * d,
 			case 'r':
 				pfmt++;
 				tmp = pgtypes_alloc(strlen("%I:%M:%S %p") + strlen(pstr) + 1);
+				if (!tmp)
+					return 1;
 				strcpy(tmp, "%I:%M:%S %p");
 				strcat(tmp, pfmt);
 				err = PGTYPEStimestamp_defmt_scan(&pstr, tmp, d, year, month, day, hour, minute, second, tz);
@@ -2792,6 +2812,8 @@ PGTYPEStimestamp_defmt_scan(char **str, char *fmt, timestamp * d,
 			case 'R':
 				pfmt++;
 				tmp = pgtypes_alloc(strlen("%H:%M") + strlen(pstr) + 1);
+				if (!tmp)
+					return 1;
 				strcpy(tmp, "%H:%M");
 				strcat(tmp, pfmt);
 				err = PGTYPEStimestamp_defmt_scan(&pstr, tmp, d, year, month, day, hour, minute, second, tz);
@@ -2804,9 +2826,10 @@ PGTYPEStimestamp_defmt_scan(char **str, char *fmt, timestamp * d,
 				/* number of seconds in scan_val.luint_val */
 				{
 					struct tm  *tms;
+					struct tm	tmbuf;
 					time_t		et = (time_t) scan_val.luint_val;
 
-					tms = gmtime(&et);
+					tms = gmtime_r(&et, &tmbuf);
 
 					if (tms)
 					{
@@ -2837,6 +2860,8 @@ PGTYPEStimestamp_defmt_scan(char **str, char *fmt, timestamp * d,
 			case 'T':
 				pfmt++;
 				tmp = pgtypes_alloc(strlen("%H:%M:%S") + strlen(pstr) + 1);
+				if (!tmp)
+					return 1;
 				strcpy(tmp, "%H:%M:%S");
 				strcat(tmp, pfmt);
 				err = PGTYPEStimestamp_defmt_scan(&pstr, tmp, d, year, month, day, hour, minute, second, tz);

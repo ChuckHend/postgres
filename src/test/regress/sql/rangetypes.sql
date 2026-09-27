@@ -107,6 +107,16 @@ select numrange(1.1, 2.2,'[]') - numrange(2.0, 3.0);
 select range_minus(numrange(10.1,12.2,'[]'), numrange(110.0,120.2,'(]'));
 select range_minus(numrange(10.1,12.2,'[]'), numrange(0.0,120.2,'(]'));
 
+select range_minus_multi('empty'::numrange, numrange(2.0, 3.0));
+select range_minus_multi(numrange(1.1, 2.2), 'empty'::numrange);
+select range_minus_multi(numrange(1.1, 2.2), numrange(2.0, 3.0));
+select range_minus_multi(numrange(1.1, 2.2), numrange(2.2, 3.0));
+select range_minus_multi(numrange(1.1, 2.2,'[]'), numrange(2.0, 3.0));
+select range_minus_multi(numrange(1.0, 3.0), numrange(1.5, 2.0));
+select range_minus_multi(numrange(10.1,12.2,'[]'), numrange(110.0,120.2,'(]'));
+select range_minus_multi(numrange(10.1,12.2,'[]'), numrange(0.0,120.2,'(]'));
+select range_minus_multi(numrange(1.0,3.0,'[]'), numrange(1.5,2.0,'(]'));
+
 select numrange(4.5, 5.5, '[]') && numrange(5.5, 6.5);
 select numrange(1.0, 2.0) << numrange(3.0, 4.0);
 select numrange(1.0, 3.0,'[]') << numrange(3.0, 4.0,'[]');
@@ -434,6 +444,20 @@ select '[2010-01-01 01:00:00 -05, 2010-01-01 02:00:00 -08)'::tstzrange;
 select '[2010-01-01 01:00:00 -08, 2010-01-01 02:00:00 -05)'::tstzrange;
 set timezone to default;
 
+-- CREATE TYPE AS RANGE checks for USAGE on subtype
+CREATE ROLE regress_subtype;
+CREATE TYPE mytype AS (a INT, b INT);
+REVOKE USAGE ON TYPE mytype FROM PUBLIC;
+SET ROLE regress_subtype;
+CREATE TYPE myrange AS RANGE (subtype = mytype);
+RESET ROLE;
+GRANT USAGE ON TYPE mytype TO regress_subtype;
+SET ROLE regress_subtype;
+CREATE TYPE myrange AS RANGE (subtype = mytype);
+RESET ROLE;
+DROP TYPE mytype CASCADE;
+DROP ROLE regress_subtype;
+
 --
 -- Test user-defined range of floats
 -- (type float8range was already made in test_setup.sql)
@@ -575,13 +599,13 @@ drop type two_ints cascade;
 -- Check behavior when subtype lacks a hash function
 --
 
-create type cashrange as range (subtype = money);
+create type varbitrange as range (subtype = varbit);
 
-set enable_sort = off;  -- try to make it pick a hash setop implementation
+set enable_groupagg = off;  -- try to make it pick a hash setop implementation
 
-select '(2,5)'::cashrange except select '(5,6)'::cashrange;
+select '(01,10)'::varbitrange except select '(10,11)'::varbitrange;
 
-reset enable_sort;
+reset enable_groupagg;
 
 --
 -- OUT/INOUT/TABLE functions
@@ -629,3 +653,72 @@ create function inoutparam_fail(inout i anyelement, out r anyrange)
 --should fail
 create function table_fail(i anyelement) returns table(i anyelement, r anyrange)
   as $$ select $1, '[1,10]' $$ language sql;
+
+--
+-- Test support functions
+--
+
+-- empty range
+explain (verbose, costs off)
+select current_date <@ daterange 'empty';
+
+-- unbounded range
+explain (verbose, costs off)
+select current_date <@ daterange(NULL, NULL);
+
+-- only lower bound present
+explain (verbose, costs off)
+select current_date <@ daterange('2000-01-01', NULL, '[)');
+
+-- only upper bound present
+explain (verbose, costs off)
+select current_date <@ daterange(NULL, '2000-01-01', '(]');
+
+-- lower range "-Infinity" excluded
+explain (verbose, costs off)
+select current_date <@ daterange('-Infinity', '1997-04-10'::date, '()');
+
+-- lower range "-Infinity" included
+explain (verbose, costs off)
+select current_date <@ daterange('-Infinity', '1997-04-10'::date, '[)');
+
+-- upper range "Infinity" excluded
+explain (verbose, costs off)
+select current_date <@ daterange('2002-09-25'::date, 'Infinity', '[)');
+
+-- upper range "Infinity" included
+explain (verbose, costs off)
+select current_date <@ daterange('2002-09-25'::date, 'Infinity', '[]');
+
+-- should also work if we use "@>"
+explain (verbose, costs off)
+select daterange('-Infinity', '1997-04-10'::date, '()') @> current_date;
+
+explain (verbose, costs off)
+select daterange('2002-09-25'::date, 'Infinity', '[]') @> current_date;
+
+-- Check that volatile cases are not optimized
+explain (verbose, costs off)
+select now() <@ tstzrange('2024-01-20 00:00', '2024-01-21 00:00');
+explain (verbose, costs off)  -- unsafe!
+select clock_timestamp() <@ tstzrange('2024-01-20 00:00', '2024-01-21 00:00');
+explain (verbose, costs off)
+select clock_timestamp() <@ tstzrange('2024-01-20 00:00', NULL);
+
+-- test a custom range type with a non-default operator class
+create type textrange_supp as range (
+   subtype = text,
+   subtype_opclass = text_pattern_ops
+);
+
+create temp table text_support_test (t text collate "C");
+
+insert into text_support_test values ('a'), ('c'), ('d'), ('ch');
+
+explain (costs off)
+select * from text_support_test where t <@ textrange_supp('a', 'd');
+select * from text_support_test where t <@ textrange_supp('a', 'd');
+
+drop table text_support_test;
+
+drop type textrange_supp;

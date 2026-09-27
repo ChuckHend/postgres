@@ -23,6 +23,7 @@ OBJS = \
 	arrayutils.o \
 	ascii.o \
 	bool.o \
+	bytea.o \
 	cash.o \
 	char.o \
 	cryptohashfuncs.o \
@@ -30,6 +31,7 @@ OBJS = \
 	datetime.o \
 	datum.o \
 	dbsize.o \
+	ddlutils.o \
 	domains.o \
 	encode.o \
 	enum.o \
@@ -67,6 +69,7 @@ OBJS = \
 	misc.o \
 	multirangetypes.o \
 	multirangetypes_selfuncs.o \
+	multixactfuncs.o \
 	name.o \
 	network.o \
 	network_gist.o \
@@ -75,13 +78,20 @@ OBJS = \
 	numeric.o \
 	numutils.o \
 	oid.o \
+	oid8.o \
 	oracle_compat.o \
 	orderedsetaggs.o \
 	partitionfuncs.o \
+	pg_dependencies.o \
 	pg_locale.o \
+	pg_locale_builtin.o \
+	pg_locale_icu.o \
+	pg_locale_libc.o \
 	pg_lsn.o \
+	pg_ndistinct.o \
 	pg_upgrade_support.o \
 	pgstatfuncs.o \
+	pseudorandomfuncs.o \
 	pseudotypes.o \
 	quote.o \
 	rangetypes.o \
@@ -95,6 +105,7 @@ OBJS = \
 	rowtypes.o \
 	ruleutils.o \
 	selfuncs.o \
+	skipsupport.o \
 	tid.o \
 	timestamp.o \
 	trigfuncs.o \
@@ -115,6 +126,7 @@ OBJS = \
 	varchar.o \
 	varlena.o \
 	version.o \
+	waitfuncs.o \
 	windowfuncs.o \
 	xid.o \
 	xid8funcs.o \
@@ -132,15 +144,15 @@ jsonpath_scan.c: FLEX_NO_BACKUP=yes
 # Force these dependencies to be known even without dependency info built:
 jsonpath_gram.o jsonpath_scan.o: jsonpath_gram.h
 
-# jsonpath_gram.c and jsonpath_scan.c are in the distribution tarball,
-# so they are not cleaned here.
-clean distclean maintainer-clean:
+clean:
 	rm -f lex.backup
+	rm -f jsonpath_gram.c jsonpath_gram.h jsonpath_scan.c
 
 like.o: like.c like_match.c
 
-# Some code in numeric.c benefits from auto-vectorization
+# Some code benefits from auto-vectorization
 numeric.o: CFLAGS += ${CFLAGS_VECTORIZE}
+varbit.o: CFLAGS += ${CFLAGS_VECTORIZE}
 
 varlena.o: varlena.c levenshtein.c
 

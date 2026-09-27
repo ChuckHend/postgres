@@ -5,7 +5,7 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,7 +22,6 @@
 
 #include "access/genam.h"
 #include "access/htup_details.h"
-#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "catalog/catalog.h"
@@ -35,6 +34,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_parameter_acl.h"
 #include "catalog/pg_replication_origin.h"
+#include "catalog/pg_seclabel.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_shseclabel.h"
@@ -42,7 +42,6 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
-#include "storage/fd.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
@@ -87,7 +86,9 @@ bool
 IsSystemClass(Oid relid, Form_pg_class reltuple)
 {
 	/* IsCatalogRelationOid is a bit faster, so test that first */
-	return (IsCatalogRelationOid(relid) || IsToastClass(reltuple));
+	return (IsCatalogRelationOid(relid) ||
+			IsToastClass(reltuple) ||
+			IsConflictLogTableClass(reltuple));
 }
 
 /*
@@ -138,6 +139,66 @@ IsCatalogRelationOid(Oid relid)
 }
 
 /*
+ * IsCatalogTextUniqueIndexOid
+ *		True iff the relation identified by this OID is a catalog UNIQUE index
+ *		having a column of type "text".
+ *
+ *		The relcache must not use these indexes.  Inserting into any UNIQUE
+ *		index compares index keys while holding BUFFER_LOCK_EXCLUSIVE.
+ *		bttextcmp() can search the COLLOID catcache.  Depending on concurrent
+ *		invalidation traffic, catcache can reach relcache builds.  A backend
+ *		would self-deadlock on LWLocks if the relcache build read the
+ *		exclusive-locked buffer.
+ *
+ *		To avoid being itself the cause of self-deadlock, this doesn't read
+ *		catalogs.  Instead, it uses a hard-coded list with a supporting
+ *		regression test.
+ */
+bool
+IsCatalogTextUniqueIndexOid(Oid relid)
+{
+	switch (relid)
+	{
+		case ParameterAclParnameIndexId:
+		case ReplicationOriginNameIndex:
+		case SecLabelObjectIndexId:
+		case SharedSecLabelObjectIndexId:
+			return true;
+	}
+	return false;
+}
+
+/*
+ * IsInplaceUpdateRelation
+ *		True iff core code performs inplace updates on the relation.
+ *
+ *		This is used for assertions and for making the executor follow the
+ *		locking protocol described at README.tuplock section "Locking to write
+ *		inplace-updated tables".  Extensions may inplace-update other heap
+ *		tables, but concurrent SQL UPDATE on the same table may overwrite
+ *		those modifications.
+ *
+ *		The executor can assume these are not partitions or partitioned and
+ *		have no triggers.
+ */
+bool
+IsInplaceUpdateRelation(Relation relation)
+{
+	return IsInplaceUpdateOid(RelationGetRelid(relation));
+}
+
+/*
+ * IsInplaceUpdateOid
+ *		Like the above, but takes an OID as argument.
+ */
+bool
+IsInplaceUpdateOid(Oid relid)
+{
+	return (relid == RelationRelationId ||
+			relid == DatabaseRelationId);
+}
+
+/*
  * IsToastRelation
  *		True iff relation is a TOAST support relation (or index).
  *
@@ -169,6 +230,20 @@ IsToastClass(Form_pg_class reltuple)
 	Oid			relnamespace = reltuple->relnamespace;
 
 	return IsToastNamespace(relnamespace);
+}
+
+/*
+ * IsConflictLogTableClass
+ *		True iff pg_class tuple represents a Conflict Log Table.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsConflictLogTableClass(Form_pg_class reltuple)
+{
+	Oid			relnamespace = reltuple->relnamespace;
+
+	return IsConflictLogTableNamespace(relnamespace);
 }
 
 /*
@@ -205,6 +280,17 @@ IsToastNamespace(Oid namespaceId)
 		isTempToastNamespace(namespaceId);
 }
 
+/*
+ * IsConflictLogTableNamespace
+ *		True iff namespace is pg_conflict.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsConflictLogTableNamespace(Oid namespaceId)
+{
+	return namespaceId == PG_CONFLICT_NAMESPACE;
+}
 
 /*
  * IsReservedName
@@ -281,16 +367,12 @@ IsSharedRelation(Oid relationId)
 		relationId == TablespaceOidIndexId)
 		return true;
 	/* These are their toast tables and toast indexes */
-	if (relationId == PgAuthidToastTable ||
-		relationId == PgAuthidToastIndex ||
-		relationId == PgDatabaseToastTable ||
+	if (relationId == PgDatabaseToastTable ||
 		relationId == PgDatabaseToastIndex ||
 		relationId == PgDbRoleSettingToastTable ||
 		relationId == PgDbRoleSettingToastIndex ||
 		relationId == PgParameterAclToastTable ||
 		relationId == PgParameterAclToastIndex ||
-		relationId == PgReplicationOriginToastTable ||
-		relationId == PgReplicationOriginToastIndex ||
 		relationId == PgShdescriptionToastTable ||
 		relationId == PgShdescriptionToastIndex ||
 		relationId == PgShseclabelToastTable ||
@@ -448,10 +530,10 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 			ereport(LOG,
 					(errmsg("still searching for an unused OID in relation \"%s\"",
 							RelationGetRelationName(relation)),
-					 errdetail_plural("OID candidates have been checked %llu time, but no unused OID has been found yet.",
-									  "OID candidates have been checked %llu times, but no unused OID has been found yet.",
+					 errdetail_plural("OID candidates have been checked %" PRIu64 " time, but no unused OID has been found yet.",
+									  "OID candidates have been checked %" PRIu64 " times, but no unused OID has been found yet.",
 									  retries,
-									  (unsigned long long) retries)));
+									  retries)));
 
 			/*
 			 * Double the number of retries to do before logging next until it
@@ -473,10 +555,10 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	if (retries > GETNEWOID_LOG_THRESHOLD)
 	{
 		ereport(LOG,
-				(errmsg_plural("new OID has been assigned in relation \"%s\" after %llu retry",
-							   "new OID has been assigned in relation \"%s\" after %llu retries",
+				(errmsg_plural("new OID has been assigned in relation \"%s\" after %" PRIu64 " retry",
+							   "new OID has been assigned in relation \"%s\" after %" PRIu64 " retries",
 							   retries,
-							   RelationGetRelationName(relation), (unsigned long long) retries)));
+							   RelationGetRelationName(relation), retries)));
 	}
 
 	return newOid;
@@ -502,9 +584,9 @@ RelFileNumber
 GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 {
 	RelFileLocatorBackend rlocator;
-	char	   *rpath;
+	RelPathStr	rpath;
 	bool		collides;
-	BackendId	backend;
+	ProcNumber	procNumber;
 
 	/*
 	 * If we ever get here during pg_upgrade, there's something wrong; all
@@ -516,11 +598,11 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 	switch (relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
-			backend = BackendIdForTempRelations();
+			procNumber = ProcNumberForTempRelations();
 			break;
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-			backend = InvalidBackendId;
+			procNumber = INVALID_PROC_NUMBER;
 			break;
 		default:
 			elog(ERROR, "invalid relpersistence: %c", relpersistence);
@@ -534,11 +616,11 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		InvalidOid : MyDatabaseId;
 
 	/*
-	 * The relpath will vary based on the backend ID, so we must initialize
-	 * that properly here to make sure that any collisions based on filename
-	 * are properly detected.
+	 * The relpath will vary based on the backend number, so we must
+	 * initialize that properly here to make sure that any collisions based on
+	 * filename are properly detected.
 	 */
-	rlocator.backend = backend;
+	rlocator.backend = procNumber;
 
 	do
 	{
@@ -554,7 +636,7 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		/* Check for existing file of same name */
 		rpath = relpath(rlocator, MAIN_FORKNUM);
 
-		if (access(rpath, F_OK) == 0)
+		if (access(rpath.str, F_OK) == 0)
 		{
 			/* definite collision */
 			collides = true;
@@ -570,8 +652,6 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 			 */
 			collides = false;
 		}
-
-		pfree(rpath);
 	} while (collides);
 
 	return rlocator.locator.relNumber;
@@ -637,8 +717,8 @@ pg_nextoid(PG_FUNCTION_ARGS)
 	if (attform->atttypid != OIDOID)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("column \"%s\" is not of type oid",
-						NameStr(*attname))));
+				 errmsg("column \"%s\" is not of type %s",
+						NameStr(*attname), "oid")));
 
 	if (IndexRelationGetNumberOfKeyAttributes(idx) != 1 ||
 		idx->rd_index->indkey.values[0] != attno)
